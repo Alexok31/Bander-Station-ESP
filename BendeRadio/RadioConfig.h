@@ -32,12 +32,16 @@ class RadioConfig {
     static constexpr int analyzWidth = 3 * 8;
     static constexpr int radioBuffer = 1600 * 25;  // default 1600*5 — мало для потока
 
-    // Режим 2: столбцы 1 px через 1 px зазор → половина ширины матрицы.
-    static constexpr int pcmWaveBarCount = analyzWidth / 2;
-    // Сколько столбцов сдвинуть за один кадр визуализации (быстрее «бег» влево).
-    static constexpr uint8_t pcmWaveScrollStepsPerFrame = 1;
-    // Половина высоты столбца 0…pcmWaveHalfMax (симметрия вокруг строк 3–4 на матрице 8 px).
-    static constexpr uint8_t pcmWaveHalfMax = 4;
+    // Режим 0 / 2: синусоида «струна» — полных периодов на ширину рта, амплитуда и скорость от vol (PCM).
+    static constexpr float analyzSinePeriodsAcross = 1.5f;
+    // Скорость фазы (рад/кадр матрицы): vol=0 → min, vol=100 → max (чем больше разрыв, тем сильнее «газ» от музыки).
+    static constexpr float analyzSineOmegaMin = 0.018f;
+    static constexpr float analyzSineOmegaMax = 0.36f;
+    // 0.15…1.0 — насколько плавно подстраивается скорость под скачки vol (1 = без сглаживания).
+    static constexpr float analyzSineOmegaEase = 0.22f;
+    static constexpr float analyzSineAmpMax = 3.2f;
+    // Сдвиг центра по Y (строки): +1 — волна ниже.
+    static constexpr int8_t analyzWaveRowOffset = 0;
 
     // Пока заряжаются входные конденсаторы, 5V может проседать — разнос нагрузки во времени.
     static constexpr uint32_t coldStartBootMs = 250;
@@ -63,11 +67,11 @@ class RadioConfig {
     static constexpr uint32_t pcmAnalyzerRefCeil = 30000;
     // Каждый буфер, если m_viz < ref: ref = max(floor, ref - ref * release / 256). Больше — быстрее подстраивается под тихие фрагменты.
     static constexpr uint8_t pcmAnalyzerRefRelease = 5;
-    // Рост ref к пику не мгновенно: шаг = max(1, (m_viz - ref) >> attackShift). Иначе ref≈m → inst≈const, рот замирает.
+    // Рост ref к пику не мгновенно: шаг = max(1, (m_viz - ref) >> attackShift). Иначе ref≈m → inst≈const.
     static constexpr uint8_t pcmAnalyzerRefAttackShift = 2;
     // Ниже — тишина (те же единицы, что m_src).
     static constexpr uint32_t pcmSilenceAbs = 400;
-    // Сглаживание уровня: ema = (ema * ((1<<shift)-1) + target) >> shift. 4 было слишком «каше» для рта.
+    // Сглаживание уровня: ema = (ema * ((1<<shift)-1) + target) >> shift.
     static constexpr uint8_t pcmInstSmoothShift = 2;
 
     // При vol==0 или выкл. радио включает сон модема Wi‑Fi — иногда слабее слышен ВЧ-писк в усилителе.

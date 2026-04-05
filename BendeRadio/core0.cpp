@@ -1,5 +1,6 @@
 #include "core0.h"
 
+#include <math.h>
 #include <WiFi.h>
 
 #include <EEManager.h>
@@ -161,46 +162,37 @@ static uint8_t pcm_wave_level_after_gate() {
 }
 
 void analyz0(uint8_t vol) {
-    static uint32_t wave_phase;
-    // Фаза всегда растёт (время + громкость) — иначе при vol≈0 шум визуально «мертвый».
-    wave_phase += 10u + (uint32_t)vol * 6u;
-    const uint16_t offs = (uint16_t)(wave_phase >> 1);
-    for (uint8_t i = 0; i < RadioConfig::analyzWidth; i++) {
-        int16_t val = inoise8(i * 50, offs);
-        val -= 128;
-        val = val * vol / 100;
-        val += 128;
-        val = map(val, 45, 255 - 45, 0, 7);
-        mtrx.dot(i, val);
-    }
-}
+    static float phi;
+    static float omega_filt;
+    constexpr float two_pi = 6.2831853f;
 
-// Режим 2: бегущая волна — каждый кадр сдвиг влево, справа уровень из g_pcm_wave_latest_half (обновляет PCM-колбэк).
-static void pcm_wave_scroll_running() {
-    const uint8_t n = (uint8_t)RadioConfig::pcmWaveBarCount;
-    const uint8_t steps = RadioConfig::pcmWaveScrollStepsPerFrame;
-    const uint8_t edge = g_pcm_wave_latest_half;
-    for (uint8_t st = 0; st < steps; st++) {
-        for (uint8_t i = 0; i < n - 1u; i++) {
-            g_pcm_wave_amp[i] = g_pcm_wave_amp[i + 1u];
-        }
-        g_pcm_wave_amp[n - 1u] = edge;
+    const float omega_tgt = RadioConfig::analyzSineOmegaMin +
+                            (float)vol / 100.f * (RadioConfig::analyzSineOmegaMax - RadioConfig::analyzSineOmegaMin);
+    const float ease = RadioConfig::analyzSineOmegaEase;
+    omega_filt += (omega_tgt - omega_filt) * ease;
+    phi += omega_filt;
+    while (phi > two_pi * 16.f) {
+        phi -= two_pi * 16.f;
     }
-}
 
-static void analyz_pcm_wave() {
-    constexpr int8_t c0 = 3;
-    constexpr int8_t c1 = 4;
-    pcm_wave_scroll_running();
-    const uint8_t n = (uint8_t)RadioConfig::pcmWaveBarCount;
-    for (uint8_t i = 0; i < n; i++) {
-        const uint8_t half = g_pcm_wave_amp[i];
-        int16_t y0 = c0 - (int16_t)half;
-        int16_t y1 = c1 + (int16_t)half;
-        y0 = (int16_t)constrain((int32_t)y0, 0, 7);
-        y1 = (int16_t)constrain((int32_t)y1, 0, 7);
-        const int16_t x = (int16_t)i * 2;
-        mtrx.lineV((int)x, (int)y0, (int)y1, GFX_FILL);
+    const int W = RadioConfig::analyzWidth;
+    const float k = two_pi * RadioConfig::analyzSinePeriodsAcross / (float)W;
+    const float mid = 3.5f + (float)RadioConfig::analyzWaveRowOffset;
+    const float amp = (float)vol / 100.f * RadioConfig::analyzSineAmpMax;
+
+    int8_t rows[32];
+    for (int i = 0; i < W; i++) {
+        const float y = mid + amp * sinf(phi + k * (float)i);
+        int r = (int)roundf(y);
+        rows[i] = (int8_t)constrain(r, 0, 7);
+    }
+
+    if (W <= 1) {
+        mtrx.dot(0, (uint8_t)rows[0], GFX_FILL);
+        return;
+    }
+    for (int i = 0; i < W - 1; i++) {
+        mtrx.line(i, (int)rows[i], i + 1, (int)rows[i + 1], GFX_FILL);
     }
 }
 
@@ -353,13 +345,10 @@ void core0(void* p) {
                 mtrx.rect(0, 0, RadioConfig::analyzWidth - 1, 7, GFX_CLEAR);
                 switch (data.mode) {
                     case 0:
+                    case 2:
                         analyz0(pcm_wave_level_after_gate());
                         break;
-                    case 2:
-                        analyz_pcm_wave();
-                        break;
                     default:
-                        // Был режим 1 (удалён) или мусор в EEPROM — сброс на волну.
                         data.mode = 0;
                         analyz0(pcm_wave_level_after_gate());
                         break;

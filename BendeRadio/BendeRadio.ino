@@ -12,42 +12,18 @@ extern Data data;
 
 volatile uint16_t g_pcm_level_adc = 0;
 volatile uint8_t g_pcm_vis = 0;
-volatile uint8_t g_pcm_vis_inst = 0;
-volatile int8_t g_pcm_bend_exc = 0;
-volatile uint8_t g_pcm_wave_amp[RadioConfig::pcmWaveBarCount];
-volatile uint8_t g_pcm_wave_latest_half = 0;
 
 // Не рисовать волну до этого времени (мс millis) — после смены потока / старта буфера.
 static volatile uint32_t s_pcm_viz_unblock_ms = 0;
-// Медленная огибающая для рта: inst − slow даёт «удар»; EMA должна быть медленной — иначе за один кадр матрицы буферов много и exc→0.
-static uint8_t s_bend_slow = 0;
-// Пик |exc| с затуханием на буфер — на экране «подпрыгнул и оседает», а не залипание.
-static uint16_t s_bend_hold = 0;
-static int8_t s_bend_sign = 1;
 static uint8_t s_inst_ema = 0;
-// Опора для inst = 100 * m_viz / ref (адаптивный «недавний максимум»).
 static uint32_t s_mviz_ref = RadioConfig::pcmAnalyzerRefFloor;
 
-// PCM перед I2S (MAX98357A). VolAnalyzer с одним обновлением на кадр даёт max≈min в окне → getVol()=0;
-// Виз (волна, рот): m_src → m_viz → tgt = 100*m_viz/ref (ref — адаптивный пик, RadioConfig) → EMA → inst.
-static void pcm_wave_buffer_reset() {
-    for (uint16_t i = 0; i < (uint16_t)RadioConfig::pcmWaveBarCount; i++) {
-        g_pcm_wave_amp[i] = 0;
-    }
-    g_pcm_wave_latest_half = 0;
-}
-
+// PCM из декодера: m_src → m_viz → inst (0…100) → g_pcm_vis / g_pcm_level_adc.
 static void pcm_vis_reset() {
     g_pcm_vis = 0;
-    g_pcm_vis_inst = 0;
-    g_pcm_bend_exc = 0;
     g_pcm_level_adc = 0;
-    s_bend_slow = 0;
-    s_bend_hold = 0;
-    s_bend_sign = 1;
     s_inst_ema = 0;
     s_mviz_ref = RadioConfig::pcmAnalyzerRefFloor;
-    pcm_wave_buffer_reset();
 }
 
 static void pcm_vis_begin_stream_settle() {
@@ -62,10 +38,6 @@ static void pcm_serial_debug_line(const char* tag,
                                   uint32_t inst_tgt,
                                   uint32_t inst_ema,
                                   uint8_t gv,
-                                  uint8_t slow,
-                                  int16_t raw,
-                                  uint16_t hold,
-                                  int8_t exc,
                                   uint16_t adc) {
     if (!RadioConfig::debugAudioPcmSerial) {
         return;
@@ -76,12 +48,10 @@ static void pcm_serial_debug_line(const char* tag,
         return;
     }
     s_pcm_dbg_ms = now;
-    // m — уровень буфера (m_src / m_viz); ref — опора анализатора; inst_tgt до EMA, inst_ema после.
     Serial.printf(
-        "[PCM] %s len=%u m=%lu ref=%lu tgt=%lu ema=%lu gv=%u slow=%u raw=%d hold=%u exc=%d adc=%u run=%d\n", tag,
-        (unsigned)len, (unsigned long)m, (unsigned long)ref, (unsigned long)inst_tgt, (unsigned long)inst_ema,
-        (unsigned)gv, (unsigned)slow, (int)raw, (unsigned)hold, (int)exc, (unsigned)adc,
-        audio.isRunning() ? 1 : 0);
+        "[PCM] %s len=%u m=%lu ref=%lu tgt=%lu ema=%lu gv=%u adc=%u run=%d\n", tag, (unsigned)len,
+        (unsigned long)m, (unsigned long)ref, (unsigned long)inst_tgt, (unsigned long)inst_ema, (unsigned)gv,
+        (unsigned)adc, audio.isRunning() ? 1 : 0);
 }
 
 void audio_process_extern(int16_t* buff, uint16_t len, bool* continueI2S) {
@@ -197,51 +167,9 @@ void audio_process_extern(int16_t* buff, uint16_t len, bool* continueI2S) {
     const uint8_t gv = g_pcm_vis;
     if (inst == 0) {
         g_pcm_vis = (uint8_t)((gv * 5u) >> 3);
-        g_pcm_vis_inst = (uint8_t)((g_pcm_vis_inst * 5u) >> 3);
-        s_bend_slow = (uint8_t)((s_bend_slow * 7u) >> 3);
-        s_bend_hold = (s_bend_hold * 7u) >> 3;
-        {
-            int16_t out = (int16_t)s_bend_hold * (int16_t)s_bend_sign;
-            if (s_bend_hold < 3u) {
-                out = 0;
-            }
-            g_pcm_bend_exc = (int8_t)constrain(out, -100, 100);
-        }
         g_pcm_level_adc = (uint16_t)((g_pcm_level_adc * 5u) >> 3);
-        g_pcm_wave_latest_half = 0;
-        pcm_serial_debug_line("silent", len, m_src, ref_dbg, 0u, 0u, gv, s_bend_slow, 0, s_bend_hold,
-                              g_pcm_bend_exc, g_pcm_level_adc);
+        pcm_serial_debug_line("silent", len, m_src, ref_dbg, 0u, 0u, gv, g_pcm_level_adc);
         return;
-    }
-
-    g_pcm_vis_inst = (uint8_t)inst;
-
-    {
-        const int32_t d = (int32_t)inst - (int32_t)s_bend_slow;
-        s_bend_slow = (uint8_t)constrain((int32_t)s_bend_slow + d / 10, 0, 100);
-    }
-    int16_t raw_for_dbg = 0;
-    {
-        int16_t raw = (int16_t)inst - (int16_t)s_bend_slow;
-        raw_for_dbg = raw;
-        if (raw > 100) {
-            raw = 100;
-        }
-        if (raw < -100) {
-            raw = -100;
-        }
-        const uint16_t am = (uint16_t)(raw >= 0 ? raw : -raw);
-        if (am > s_bend_hold) {
-            s_bend_hold = am;
-            s_bend_sign = (raw >= 0) ? (int8_t)1 : (int8_t)-1;
-        } else {
-            s_bend_hold = (s_bend_hold * 13u) >> 4;
-        }
-        int16_t out = (int16_t)s_bend_hold * (int16_t)s_bend_sign;
-        if (s_bend_hold < 3u) {
-            out = 0;
-        }
-        g_pcm_bend_exc = (int8_t)constrain(out, -100, 100);
     }
 
     if (inst >= gv) {
@@ -256,16 +184,7 @@ void audio_process_extern(int16_t* buff, uint16_t len, bool* continueI2S) {
     }
     g_pcm_level_adc = (uint16_t)adc;
 
-    {
-        const uint32_t scale = (ref_div / 4u > 2000u) ? ref_div / 4u : 2000u;
-        const uint8_t mx = RadioConfig::pcmWaveHalfMax;
-        const uint32_t src = (m_viz > 0u) ? m_src : 0u;
-        const uint32_t h = (src * (uint32_t)mx) / scale;
-        g_pcm_wave_latest_half = (uint8_t)min(h, (uint32_t)mx);
-    }
-
-    pcm_serial_debug_line("ok", len, m_viz, ref_dbg, inst_target, inst, g_pcm_vis, s_bend_slow, raw_for_dbg,
-                          s_bend_hold, g_pcm_bend_exc, g_pcm_level_adc);
+    pcm_serial_debug_line("ok", len, m_viz, ref_dbg, inst_target, inst, g_pcm_vis, g_pcm_level_adc);
 }
 
 void setup() {
