@@ -11,7 +11,7 @@ struct Data {
     int8_t bright_mouth = 2;
     // Порог «тишины» для PCM-метра (после смены с АЦП сделайте 3 клика на тихой паузе).
     uint16_t trsh = 24;
-    // 0 и 2 — одна и та же визуализация рта (пока резерв под второй режим); значение 1 в EEPROM → 0.
+    // 0 — волна; 1 — эквалайзер; 2 — рот робота (две линии). Прочие → 0 при отрисовке.
     uint8_t mode = 0;
     int8_t station = 0;
 };
@@ -22,6 +22,7 @@ extern volatile bool wifiConnecting;
 // Уровень из PCM (audio_process_extern): шкала 0…100 и «АЦП» для порога тишины на матрице.
 extern volatile uint16_t g_pcm_level_adc;
 extern volatile uint8_t g_pcm_vis;
+extern volatile uint8_t g_pcm_eq_band[RadioConfig::pcmEqBandCount];
 
 void change_state();
 void anim_search();

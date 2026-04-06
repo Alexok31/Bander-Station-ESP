@@ -149,20 +149,75 @@ void change_state() {
 }
 
 // ========================= ANALYZ =========================
-// Уровень волны: как «vol» в цикле матрицы, но g_pcm_vis читаем здесь — совпадает с тем, что в PCM-дебаге.
-static uint8_t pcm_wave_level_after_gate() {
-    uint8_t vw = g_pcm_vis;
-    if (g_pcm_level_adc <= data.trsh) {
+// g_pcm_level_adc в 0…4095 (inst*4095/100 в BendeRadio.ino). Порог тишины data.trsh — в тех же единицах.
+// Раньше нарастание было +120 счётчиков ADC — при полной шкале 4095 это ~3% над порогом → «рот» почти всегда 1 px.
+static uint8_t pcm_vis_after_noise_gate(uint8_t vw) {
+    const uint16_t adc = g_pcm_level_adc;
+    if (adc <= data.trsh || vw == 0) {
         return 0;
     }
-    if (g_pcm_level_adc < data.trsh + 120) {
-        return (uint8_t)((uint32_t)vw * (uint32_t)(g_pcm_level_adc - data.trsh) / 120u);
+    if (RadioConfig::pcmNoiseGateBinary) {
+        return vw;
+    }
+    const uint32_t above = (uint32_t)adc - (uint32_t)data.trsh;
+    const uint32_t head = (uint32_t)RadioConfig::pcmLevelAdcMax - (uint32_t)data.trsh;
+    uint32_t ramp = head / 3u;
+    if (ramp < 200u) {
+        ramp = 200u;
+    }
+    if (ramp > 1200u) {
+        ramp = 1200u;
+    }
+    if (above < ramp) {
+        return (uint8_t)((uint32_t)vw * above / ramp);
     }
     return vw;
 }
 
+static uint8_t pcm_wave_level_after_gate() {
+    return pcm_vis_after_noise_gate(g_pcm_vis);
+}
+
+// Режим 1: колонки 1 px; фиксированные веса по X (две «горки» sin, произведение) — без бегущей фазы, движение только от PCM.
+static void analyz_eq_bars(uint8_t v_gate) {
+    const float floor = RadioConfig::pcmEqShapeFloor;
+    const float span = 1.f - floor;
+    const float deep = RadioConfig::pcmEqShapeDeep;
+    const float k1 = RadioConfig::pcmEqShapeK1;
+    const float k2 = RadioConfig::pcmEqShapeK2;
+    const float p1 = RadioConfig::pcmEqShapeP1;
+    const float p2 = RadioConfig::pcmEqShapeP2;
+
+    const int W = RadioConfig::analyzWidth;
+    const int B = RadioConfig::pcmEqBandCount;
+    const int n = (W < B) ? W : B;
+    for (int col = 0; col < n; col++) {
+        const uint8_t raw = g_pcm_eq_band[col];
+        const uint32_t gated = (uint32_t)raw * (uint32_t)v_gate / 100u;
+        const float c = (float)col;
+        const float w1 = 0.5f + 0.5f * sinf(k1 * c + p1);
+        const float w2 = 0.5f + 0.5f * sinf(k2 * c + p2);
+        const float t = fmaxf(w1 * w2, RadioConfig::pcmEqShapeTMin);
+        const float env = floor + span * (deep + (1.f - deep) * t);
+        uint32_t shaped = (uint32_t)((float)gated * env + 0.5f);
+        if (shaped > 100u) {
+            shaped = 100u;
+        }
+        int h = (int)((shaped * 8u + 99u) / 100u);
+        if (h > 8) {
+            h = 8;
+        }
+        if (h <= 0) {
+            continue;
+        }
+        const int yTop = 8 - h;
+        mtrx.rect(col, yTop, col, 7, GFX_FILL);
+    }
+}
+
 void analyz0(uint8_t vol) {
     static float phi;
+    static float phi_chaos;
     static float omega_filt;
     constexpr float two_pi = 6.2831853f;
 
@@ -171,18 +226,30 @@ void analyz0(uint8_t vol) {
     const float ease = RadioConfig::analyzSineOmegaEase;
     omega_filt += (omega_tgt - omega_filt) * ease;
     phi += omega_filt;
+    phi_chaos += omega_filt * RadioConfig::analyzWaveChaosOmegaRatio;
     while (phi > two_pi * 16.f) {
         phi -= two_pi * 16.f;
+    }
+    while (phi_chaos > two_pi * 24.f) {
+        phi_chaos -= two_pi * 24.f;
     }
 
     const int W = RadioConfig::analyzWidth;
     const float k = two_pi * RadioConfig::analyzSinePeriodsAcross / (float)W;
+    const float k2 = RadioConfig::analyzWaveChaosK2;
+    const float fm = RadioConfig::analyzWaveFmDepth;
+    const float nmix = RadioConfig::analyzWaveNoiseMix;
     const float mid = 3.5f + (float)RadioConfig::analyzWaveRowOffset;
     const float amp = (float)vol / 100.f * RadioConfig::analyzSineAmpMax;
 
     int8_t rows[32];
     for (int i = 0; i < W; i++) {
-        const float y = mid + amp * sinf(phi + k * (float)i);
+        const float inner = sinf(phi_chaos + k2 * (float)i);
+        float y = mid + amp * sinf(phi + k * (float)i + fm * inner);
+        if (nmix > 0.f && amp > 0.05f) {
+            const uint8_t nz = inoise8((uint8_t)(i * 19 + 7), (uint8_t)(phi * 40.f + phi_chaos * 13.f));
+            y += ((float)nz / 255.f - 0.5f) * 2.f * amp * nmix;
+        }
         int r = (int)roundf(y);
         rows[i] = (int8_t)constrain(r, 0, 7);
     }
@@ -193,6 +260,146 @@ void analyz0(uint8_t vol) {
     }
     for (int i = 0; i < W - 1; i++) {
         mtrx.line(i, (int)rows[i], i + 1, (int)rows[i + 1], GFX_FILL);
+    }
+}
+
+// Режим 2: крайні analyzMouthEdgeCols колонок — фіксовані рядки «губ»; посередині open_mask(t) додає зев від музики.
+void analyz_mouth_robot(uint8_t vol) {
+    static float phi;
+    static float phi2;
+    static float phi_slow;
+    constexpr float two_pi = 6.2831853f;
+
+    const float v = (float)vol / 100.f;
+    const float omega = RadioConfig::analyzMouthPhiOmegaMin +
+                        v * (RadioConfig::analyzMouthPhiOmegaMax - RadioConfig::analyzMouthPhiOmegaMin);
+    phi += omega;
+    while (phi > two_pi * 8.f) {
+        phi -= two_pi * 8.f;
+    }
+    const float o2 = RadioConfig::analyzMouthPhi2OmegaMin +
+                     v * (RadioConfig::analyzMouthPhi2OmegaMax - RadioConfig::analyzMouthPhi2OmegaMin);
+    const float nz = (float)inoise8((uint8_t)(phi2 * 37.f + phi * 11.f), (uint8_t)(millis() >> 5)) / 255.f;
+    const float na = fminf(0.95f, fmaxf(0.f, RadioConfig::analyzMouthOmegaNoiseAmp));
+    phi2 += o2 * (1.f - na + na * (0.38f + 0.62f * nz));
+    while (phi2 > two_pi * 8.f) {
+        phi2 -= two_pi * 8.f;
+    }
+    const float o_s = RadioConfig::analyzMouthSlowOmegaMin +
+                      v * (RadioConfig::analyzMouthSlowOmegaMax - RadioConfig::analyzMouthSlowOmegaMin);
+    phi_slow += o_s * (0.82f + 0.18f * nz);
+    while (phi_slow > two_pi * 8.f) {
+        phi_slow -= two_pi * 8.f;
+    }
+
+    const float a = 0.5f + 0.5f * sinf(phi2);
+    const float b = 0.5f + 0.5f * sinf(phi2 * RadioConfig::analyzMouthChompHarm + phi_slow);
+    const float chomp_s = sqrtf(fmaxf(0.f, a * b));
+    const float cf = fminf(0.98f, fmaxf(0.f, RadioConfig::analyzMouthChompFloor));
+    const float chomp = cf + (1.f - cf) * chomp_s;
+
+    const int W = RadioConfig::analyzWidth;
+    const int L = (int)RadioConfig::analyzMouthEdgeCols;
+    const int row_off = (int)RadioConfig::analyzWaveRowOffset;
+    int u_fix = (int)RadioConfig::analyzMouthEdgeUpperRow + row_off;
+    int l_fix = (int)RadioConfig::analyzMouthEdgeLowerRow + row_off;
+    u_fix = constrain(u_fix, 0, 7);
+    l_fix = constrain(l_fix, 0, 7);
+
+    const float extra_base = RadioConfig::analyzMouthHalfSepMin +
+                             v * (RadioConfig::analyzMouthHalfSepMax - RadioConfig::analyzMouthHalfSepMin);
+    const float lip_wobble =
+        0.5f + 0.5f * sinf(phi_slow * 1.47f + phi * 1.9f + nz * 4.f);
+    const float extra_open = extra_base * chomp * (0.74f + 0.26f * lip_wobble);
+    const float ripple = fminf(0.35f, fmaxf(0.f, RadioConfig::analyzMouthMaskRipple));
+    const float bob =
+        RadioConfig::analyzMouthAnchorNoBob
+            ? 0.f
+            : (RadioConfig::analyzMouthBobAmp * fmaxf(0.35f, v) * sinf(phi));
+    const float kk = fmaxf(0.15f, RadioConfig::analyzMouthHyperK);
+
+    const float sep_base = 0.5f * (float)(l_fix - u_fix);
+    const float mid = 0.5f * (float)(u_fix + l_fix) + bob;
+
+    const int min_gap = (int)RadioConfig::analyzMouthMinPixelGap;
+    const int iw = W - 2 * L;
+
+    int8_t up[32];
+    int8_t lo[32];
+    for (int i = 0; i < W; i++) {
+        if (L > 0 && (i < L || i >= W - L)) {
+            int u = u_fix;
+            int l = l_fix;
+            if (min_gap > 0 && l < u + min_gap) {
+                l = u + min_gap;
+                if (l > 7) {
+                    l = 7;
+                    u = l - min_gap;
+                    if (u < 0) {
+                        u = 0;
+                        l = min_gap > 7 ? 7 : min_gap;
+                    }
+                }
+            }
+            up[i] = (int8_t)u;
+            lo[i] = (int8_t)l;
+            continue;
+        }
+
+        float t = 0.f;
+        if (iw > 1) {
+            t = 2.f * (float)(i - L) / (float)(iw - 1) - 1.f;
+        }
+        float open_mask;
+        if (RadioConfig::analyzMouthCurveKind != 0) {
+            const float raw = 1.f / (1.f + kk * t * t);
+            const float r_edge = 1.f / (1.f + kk);
+            open_mask = (raw - r_edge) / fmaxf(1e-4f, 1.f - r_edge);
+        } else {
+            open_mask = 1.f - t * t;
+        }
+        if (open_mask < 0.f) {
+            open_mask = 0.f;
+        } else if (open_mask > 1.f) {
+            open_mask = 1.f;
+        }
+        if (ripple > 0.f && open_mask > 0.f) {
+            const float rip = 0.5f + 0.5f * sinf(phi2 * 2.71f + phi_slow * 0.89f + (float)i * 0.51f);
+            open_mask *= 1.f - ripple + ripple * rip;
+            if (open_mask < 0.f) {
+                open_mask = 0.f;
+            } else if (open_mask > 1.f) {
+                open_mask = 1.f;
+            }
+        }
+        const float sep = sep_base + extra_open * open_mask;
+        const float yu = mid - sep;
+        const float yl = mid + sep;
+        int u = constrain((int)roundf(yu), 0, 7);
+        int l = constrain((int)roundf(yl), 0, 7);
+        if (min_gap > 0 && l < u + min_gap) {
+            l = u + min_gap;
+            if (l > 7) {
+                l = 7;
+                u = l - min_gap;
+                if (u < 0) {
+                    u = 0;
+                    l = min_gap > 7 ? 7 : min_gap;
+                }
+            }
+        }
+        up[i] = (int8_t)u;
+        lo[i] = (int8_t)l;
+    }
+
+    if (W <= 1) {
+        mtrx.dot(0, (uint8_t)up[0], GFX_FILL);
+        mtrx.dot(0, (uint8_t)lo[0], GFX_FILL);
+        return;
+    }
+    for (int i = 0; i < W - 1; i++) {
+        mtrx.line(i, (int)up[i], i + 1, (int)up[i + 1], GFX_FILL);
+        mtrx.line(i, (int)lo[i], i + 1, (int)lo[i + 1], GFX_FILL);
     }
 }
 
@@ -329,28 +536,32 @@ void core0(void* p) {
                 }
             }
 
-            // Режим 2 — при выкл. радио; режим 0 (волна) тоже без data.state — иначе при state==0 кадр не идёт и волна замирает.
-            if (viz_tmr && !matrix_tmr.state() && (data.state || data.mode == 2 || data.mode == 0)) {
-                uint8_t vol = g_pcm_vis;
-                if (g_pcm_level_adc <= data.trsh) {
-                    vol = 0;
-                } else if (g_pcm_level_adc < data.trsh + 120) {
-                    vol = (uint8_t)((uint32_t)vol * (uint32_t)(g_pcm_level_adc - data.trsh) / 120u);
-                }
+            // Режимы рта 0/1/2 — при выкл. радио кадр всё равно нужен, иначе картинка замирает.
+            if (data.mode > 2) {
+                data.mode = 0;
+            }
+            if (viz_tmr && !matrix_tmr.state() && (data.state || data.mode <= 2)) {
+                const uint8_t vol = pcm_vis_after_noise_gate(g_pcm_vis);
                 if (vol > pcm_pulse_l + 12) {
                     pulse = 1;
                 }
                 pcm_pulse_l = (uint8_t)((pcm_pulse_l * 3u + vol) / 4u);
 
                 mtrx.rect(0, 0, RadioConfig::analyzWidth - 1, 7, GFX_CLEAR);
+                const uint8_t v_mouth = pcm_wave_level_after_gate();
                 switch (data.mode) {
                     case 0:
+                        analyz0(v_mouth);
+                        break;
+                    case 1:
+                        analyz_eq_bars(v_mouth);
+                        break;
                     case 2:
-                        analyz0(pcm_wave_level_after_gate());
+                        analyz_mouth_robot(v_mouth);
                         break;
                     default:
                         data.mode = 0;
-                        analyz0(pcm_wave_level_after_gate());
+                        analyz0(v_mouth);
                         break;
                 }
                 mtrx.update();
@@ -409,9 +620,7 @@ void core0(void* p) {
                             change_state();
                             break;
                         case 2:
-                            data.mode = (data.mode == 0) ? 2 : 0;
-                            print_val('m', data.mode);
-                            matrix_tmr.start();
+                            data.mode = (uint8_t)(((unsigned)data.mode + 1u) % 3u);
                             break;
                         case 3:
                             data.trsh = (uint16_t)constrain((int)g_pcm_level_adc * 2 / 3, 4, 3800);

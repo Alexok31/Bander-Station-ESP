@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <math.h>
 
 #include "NvsConfig.h"
 #include "RadioConfig.h"
@@ -12,23 +13,40 @@ extern Data data;
 
 volatile uint16_t g_pcm_level_adc = 0;
 volatile uint8_t g_pcm_vis = 0;
+volatile uint8_t g_pcm_eq_band[RadioConfig::pcmEqBandCount];
 
 // Не рисовать волну до этого времени (мс millis) — после смены потока / старта буфера.
 static volatile uint32_t s_pcm_viz_unblock_ms = 0;
 static uint8_t s_inst_ema = 0;
 static uint32_t s_mviz_ref = RadioConfig::pcmAnalyzerRefFloor;
+static uint8_t s_eq_ema[RadioConfig::pcmEqBandCount];
+static float s_eq_decorrel_phase = 0.f;
 
-// PCM из декодера: m_src → m_viz → inst (0…100) → g_pcm_vis / g_pcm_level_adc.
+// PCM из декодера: m_src → m_viz → inst (0…100) → g_pcm_vis / g_pcm_level_adc; сегменты буфера → g_pcm_eq_band.
 static void pcm_vis_reset() {
     g_pcm_vis = 0;
     g_pcm_level_adc = 0;
     s_inst_ema = 0;
     s_mviz_ref = RadioConfig::pcmAnalyzerRefFloor;
+    s_eq_decorrel_phase = 0.f;
+    for (uint8_t b = 0; b < (uint8_t)RadioConfig::pcmEqBandCount; b++) {
+        s_eq_ema[b] = 0;
+        g_pcm_eq_band[b] = 0;
+    }
 }
 
 static void pcm_vis_begin_stream_settle() {
     s_pcm_viz_unblock_ms = millis() + RadioConfig::pcmVizStreamSettleMs;
     pcm_vis_reset();
+}
+
+// Усиливает малые значения уровня (после AGC inst часто 5…25 из 100).
+static uint8_t pcm_vis_stretch(uint8_t x) {
+    if (!RadioConfig::pcmVisSqrtStretch || x == 0) {
+        return x;
+    }
+    const uint32_t y = (uint32_t)(10.f * sqrtf((float)x));
+    return (uint8_t)min(100u, y);
 }
 
 static void pcm_serial_debug_line(const char* tag,
@@ -168,21 +186,81 @@ void audio_process_extern(int16_t* buff, uint16_t len, bool* continueI2S) {
     if (inst == 0) {
         g_pcm_vis = (uint8_t)((gv * 5u) >> 3);
         g_pcm_level_adc = (uint16_t)((g_pcm_level_adc * 5u) >> 3);
+        for (uint8_t b = 0; b < (uint8_t)RadioConfig::pcmEqBandCount; b++) {
+            s_eq_ema[b] = (uint8_t)(((uint32_t)s_eq_ema[b] * 5u) >> 3);
+            g_pcm_eq_band[b] = s_eq_ema[b];
+        }
         pcm_serial_debug_line("silent", len, m_src, ref_dbg, 0u, 0u, gv, g_pcm_level_adc);
         return;
     }
 
+    uint8_t vis_blend;
     if (inst >= gv) {
-        g_pcm_vis = (uint8_t)((gv * 2u + inst * 6u) >> 3);
+        vis_blend = (uint8_t)((gv * 2u + inst * 6u) >> 3);
     } else {
-        g_pcm_vis = (uint8_t)((gv * 11u + inst * 5u) >> 4);
+        vis_blend = (uint8_t)((gv * 11u + inst * 5u) >> 4);
     }
+    g_pcm_vis = pcm_vis_stretch(vis_blend);
 
-    uint32_t adc = (uint32_t)inst * 4095u / 100u;
-    if (adc > 4095u) {
-        adc = 4095u;
+    const uint32_t adc_full = (uint32_t)RadioConfig::pcmLevelAdcMax;
+    uint32_t adc = (uint32_t)inst * adc_full / 100u;
+    if (adc > adc_full) {
+        adc = adc_full;
     }
     g_pcm_level_adc = (uint16_t)adc;
+
+    {
+        const int B = RadioConfig::pcmEqBandCount;
+        if (RadioConfig::pcmEqDecorrelAmount > 0.f) {
+            s_eq_decorrel_phase +=
+                RadioConfig::pcmEqDecorrelOmega * (1.f + (float)len / 1536.f);
+            while (s_eq_decorrel_phase > 6.2831855f) {
+                s_eq_decorrel_phase -= 6.2831855f;
+            }
+        }
+        for (int b = 0; b < B; b++) {
+            const uint8_t sh = (uint8_t)min(
+                7, (int)RadioConfig::pcmEqBandSmoothShift + (int)((unsigned)b * 7u & 3u) +
+                         (int)(RadioConfig::pcmEqBandStaggerSmooth & (uint8_t)(b & 1)));
+            const uint32_t num = (1u << sh) - 1u;
+            uint32_t pkb = 0;
+            for (uint32_t ii = (uint32_t)b; ii < (uint32_t)len; ii += (uint32_t)B) {
+                int32_t mono;
+                if (ch >= 2) {
+                    mono = ((int32_t)buff[ii * 2] + (int32_t)buff[ii * 2 + 1]) >> 1;
+                } else {
+                    mono = buff[ii];
+                }
+                const uint32_t a = (uint32_t)(mono >= 0 ? mono : -mono);
+                if (a > pkb) {
+                    pkb = a;
+                }
+            }
+            uint8_t tgt = 0;
+            if (m_viz > 0u && ref_div > 0u) {
+                tgt = (uint8_t)min(100u, pkb * 100u / ref_div);
+            }
+            if (RadioConfig::pcmEqDecorrelAmount > 0.f && tgt > 0u) {
+                const float a = RadioConfig::pcmEqDecorrelAmount;
+                const float bf = (float)b;
+                const float u =
+                    0.5f +
+                    0.25f * (sinf(s_eq_decorrel_phase + bf * RadioConfig::pcmEqDecorrelColSpread) +
+                             sinf(s_eq_decorrel_phase * 1.618f + bf * RadioConfig::pcmEqDecorrelColSpread2));
+                float clamped = u;
+                if (clamped < 0.f) {
+                    clamped = 0.f;
+                } else if (clamped > 1.f) {
+                    clamped = 1.f;
+                }
+                const float mul = (1.f - a) + a * clamped;
+                tgt = (uint8_t)min(100u, (uint32_t)((float)tgt * mul + 0.5f));
+            }
+            const uint32_t acc = (uint32_t)s_eq_ema[b] * num + (uint32_t)tgt;
+            s_eq_ema[b] = (uint8_t)(acc >> sh);
+            g_pcm_eq_band[b] = s_eq_ema[b];
+        }
+    }
 
     pcm_serial_debug_line("ok", len, m_viz, ref_dbg, inst_target, inst, g_pcm_vis, g_pcm_level_adc);
 }
