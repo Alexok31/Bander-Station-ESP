@@ -48,7 +48,7 @@ class RadioConfig {
     // Сдвиг центра по Y (строки): −1 — вся «полоска» рота/волни на 1 піксель вгору; +1 — нижче.
     static constexpr int8_t analyzWaveRowOffset = -1;
 
-    // Режим 2: «рот» — края закреплены, середина открывается под музыку.
+    // Рот робота (у прошивці data.mode 3 і 4): параметри губ; див. core0 mouth_robot_*.
     // Перші та останні analyzMouthEdgeCols колонок: верх/низ завжди на цих рядках (+ analyzWaveRowOffset).
     static constexpr uint8_t analyzMouthEdgeCols = 3;
     static constexpr int8_t analyzMouthEdgeUpperRow = 3;
@@ -79,7 +79,7 @@ class RadioConfig {
     // Мінімальний відступ між верхньою і нижньою лініями (рядки матриці).
     static constexpr uint8_t analyzMouthMinPixelGap = 1;
 
-    // Режим 1: по одной колонке на пиксель ширины рта; уровень из «решётки» по буферу + лёгкий разброс EMA.
+    // EQ (у прошивці data.mode 2): по колонке на пиксель ширины рта; уровень из буфера + лёгкий разброс EMA.
     static constexpr int pcmEqBandCount = analyzWidth;
     static constexpr uint8_t pcmEqBandSmoothShift = 3;
     // Доп. сглаживание по индексу полосы (см. BendeRadio.ino): было чёт/нечёт, теперь 4 фазы — столбики не в такт.
