@@ -683,6 +683,8 @@ void core0(void* p) {
 
                 if (eb.turn()) {
                     if (eb.pressing()) {
+                        // getClicks() при удержании = число уже завершённых кликов в серии:
+                        // 0 — первое нажатие; 1 — второе нажатие (двойной клик + поворот); 2 — третье (тройной + поворот).
                         switch (eb.getClicks()) {
                             case 0:
                                 data.station += eb.dir();
@@ -691,6 +693,13 @@ void core0(void* p) {
                                 matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
                                 station_changed = 1;
                                 break;
+                            case 1: {
+                                const int8_t d = eb.dir();
+                                int m = (int)data.mode + (int)d;
+                                m = (m % 5 + 5) % 5;
+                                data.mode = (uint8_t)m;
+                                break;
+                            }
                             case 2: {
                                 const int8_t d = eb.dir();
                                 data.bright_mouth += d;
@@ -731,7 +740,6 @@ void core0(void* p) {
                             change_state();
                             break;
                         case 2:
-                            data.mode = (uint8_t)(((unsigned)data.mode + 1u) % 5u);
                             break;
                         case 3:
                             data.trsh = (uint16_t)constrain((int)g_pcm_level_adc * 2 / 3, 4, 3800);
