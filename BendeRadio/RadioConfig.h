@@ -25,6 +25,8 @@ class RadioConfig {
     static constexpr uint8_t encS1 = 19;
     static constexpr uint8_t encS2 = 18;
     static constexpr uint8_t encBtn = 5;
+    // Удержание кнопки энкодера без отпускания: программная перезагрузка ESP (ESP.restart).
+    static constexpr uint16_t encoderHardResetHoldMs = 5000;
 
     // Раньше: АЦП для VolAnalyzer. Сейчас уровень берётся из PCM в audio_process_extern (см. BendeRadio.ino).
     static constexpr uint8_t analyzPin = 34;

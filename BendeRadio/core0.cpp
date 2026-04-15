@@ -1,6 +1,7 @@
 #include "core0.h"
 
 #include <math.h>
+#include <ESP.h>
 #include <WiFi.h>
 
 #include <EEManager.h>
@@ -561,7 +562,11 @@ void core0(void* p) {
         angry_tmr.tick();
         memory.tick();
 
-        const bool eb_e = (!wifiConnecting && eb.tick());
+        const bool eb_tick = eb.tick();
+        if (eb_tick && eb.pressing() && eb.pressFor() >= RadioConfig::encoderHardResetHoldMs) {
+            ESP.restart();
+        }
+        const bool eb_e = (!wifiConnecting && eb_tick);
 
         // Только core0 трогает MAX7219: вызов anim_search с core1 в setup() давал гонку и мигание при Wi‑Fi.
         if (wifiConnecting) {
