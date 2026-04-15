@@ -8,6 +8,7 @@
 #include <FastLED.h>
 #include <GyverMAX7219.h>
 
+#include "battery.h"
 #include "pong.h"
 #include "soc/timer_group_reg.h"
 #include "soc/timer_group_struct.h"
@@ -71,6 +72,40 @@ void print_val(char c, uint8_t v) {
     mtrx.print(v % 10);
     mtrx.update();
 }
+
+static void draw_batt_lightning_glyph() {
+    // Тонкий зигзаг (1 px), біт 7 = лівий стовпчик x=0. Увесь гліф опущено на 1 рядок вниз.
+    static const uint8_t kRows[8] = {
+        0x00,
+        0x08,  // верхня діагональ (зсув вліво на 1)
+        0x10,
+        0x20,
+        0x3C,  // x=2…5 горизонталь
+        0x04,  // x=5
+        0x08,  // x=4
+        0x10,  // x=3
+    };
+    for (int y = 0; y < 8; y++) {
+        uint8_t b = kRows[y];
+        for (int x = 0; x < 8; x++) {
+            if (b & (uint8_t)(1 << (7 - x))) {
+                mtrx.dot((uint8_t)x, (uint8_t)y, GFX_FILL);
+            }
+        }
+    }
+}
+
+void print_batt(uint8_t pct) {
+    const uint8_t v = (pct > 99u) ? 99u : pct;
+    mtrx.rect(0, 0, RadioConfig::analyzWidth - 1, 7, GFX_CLEAR);
+    draw_batt_lightning_glyph();
+    mtrx.setCursor(8 * 1 + 2, 1);
+    mtrx.print((char)('0' + (v / 10)));
+    mtrx.setCursor(8 * 2 + 2, 1);
+    mtrx.print((char)('0' + (v % 10)));
+    mtrx.update();
+}
+
 // ========================= EYES =========================
 void draw_eye(uint8_t i) {
     uint8_t x = RadioConfig::analyzWidth + i * 8;
@@ -516,8 +551,11 @@ void core0(void* p) {
     reconnect = stations[data.station];
     syncWifiWithAudioSilence();
 
+    battery_init();
+
     // ========================= LOOP =========================
     for (;;) {
+        battery_update();
         square_tmr.tick();
         matrix_tmr.tick();
         angry_tmr.tick();
@@ -553,7 +591,7 @@ void core0(void* p) {
                         draw_eyes_follow_ball(pong_ball_x(), pong_ball_y());
                         pong_sync_matrix_brightness();
                         mtrx.update();
-                    } else if (n == 4) {
+                    } else if (n == 5) {
                         pong_set_active(false);
                         upd_bright();
                         mtrx.update();
@@ -650,7 +688,7 @@ void core0(void* p) {
                                 data.station += eb.dir();
                                 data.station = constrain(data.station, 0, sizeof(stations) / sizeof(char*) - 1);
                                 print_val('s', data.station);
-                                matrix_tmr.start();
+                                matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
                                 station_changed = 1;
                                 break;
                             case 2: {
@@ -673,7 +711,7 @@ void core0(void* p) {
                             audio.setVolume(data.vol);
                             syncWifiWithAudioSilence();
                             print_val('v', data.vol);
-                            matrix_tmr.start();
+                            matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
                         }
                     }
                 }
@@ -699,6 +737,12 @@ void core0(void* p) {
                             data.trsh = (uint16_t)constrain((int)g_pcm_level_adc * 2 / 3, 4, 3800);
                             break;
                         case 4:
+                            if (RadioConfig::batteryMonitorEnable) {
+                                print_batt(battery_percent());
+                                matrix_tmr.start((uint16_t)RadioConfig::batteryPercentShowDurationMs);
+                            }
+                            break;
+                        case 5:
                             pong_start();
                             pong_tmr.start();
                             pong_draw();

@@ -29,6 +29,24 @@ class RadioConfig {
     // Раньше: АЦП для VolAnalyzer. Сейчас уровень берётся из PCM в audio_process_extern (см. BendeRadio.ino).
     static constexpr uint8_t analyzPin = 34;
 
+    // АКБ 2S Li-ion через делитель на ADC1 (тільки input-only), напр. GPIO 35:
+    // Ubat —[Rверх 100k]— вузол —[Rниз 47k]— GND; ratio = (100+47)/47.
+    // Якщо у тебе навпаки (47k до батареї, 100k до землі), постав ratio = (47+100)/100.
+    static constexpr bool batteryMonitorEnable = true;
+    static constexpr uint8_t batteryAdcPin = 35;
+    static constexpr float batteryDividerRatio = (100.0f + 47.0f) / 47.0f;
+    // Калібрування % під мультиметр на клемах пакета (після BMS).
+    static constexpr uint16_t batteryEmptyMv = 6200;
+    static constexpr uint16_t batteryFullMv = 8300;
+    // Пороги для battery_eye_mood() (якщо підключиш настрій очей за АКБ).
+    static constexpr uint8_t batteryMoodCheerfulMinPct = 70;
+    static constexpr uint8_t batteryMoodNormalMinPct = 30;
+    static constexpr uint32_t batterySampleIntervalMs = 500;
+    // 4 кліки: % АКБ на «роті»; тривалість паузи волни/EQ — стільки мс.
+    static constexpr uint32_t batteryPercentShowDurationMs = 2000;
+    // Станція / гучність на роті — фіксований період matrix_tmr (не залишати 2 с після батареї).
+    static constexpr uint16_t matrixOverlayDigitsMs = 1000;
+
     static constexpr int analyzWidth = 3 * 8;
     static constexpr int radioBuffer = 1600 * 25;  // default 1600*5 — мало для потока
 
