@@ -3,6 +3,7 @@
 #include <math.h>
 #include <ESP.h>
 #include <WiFi.h>
+#include <esp_sleep.h>
 
 #include <EEManager.h>
 #include <EncButton.h>
@@ -531,6 +532,7 @@ void core0(void* p) {
     angry_tmr.timerMode(1);
     bool pulse = 0;
     uint8_t pcm_pulse_l = 0;
+    static uint32_t enc_btn_press_ms = 0;
 
     EEPROM.begin(memory.blockSize());
     memory.begin(0, 'b');
@@ -563,8 +565,31 @@ void core0(void* p) {
         memory.tick();
 
         const bool eb_tick = eb.tick();
+        if (eb_tick && eb.press()) {
+            enc_btn_press_ms = millis();
+        }
         if (eb_tick && eb.pressing() && eb.pressFor() >= RadioConfig::encoderHardResetHoldMs) {
             ESP.restart();
+        }
+        if (eb_tick && eb.release()) {
+            const uint32_t dur = millis() - enc_btn_press_ms;
+            if (dur >= RadioConfig::encoderSleepHoldMs && dur < RadioConfig::encoderHardResetHoldMs) {
+                memory.update();
+                if (data.state) {
+                    audio.setVolume(0);
+                    audio.stopSong();
+                }
+                syncWifiWithAudioSilence();
+                {
+                    uint8_t br_off[] = {0, 0, 0, 0, 0};
+                    mtrx.setBright(br_off);
+                    mtrx.clear();
+                    mtrx.update();
+                }
+                // ext0: RTC GPIO encBtn, пробуждение при нажатии кнопки (LOW к GND, подтяжка вверх).
+                esp_sleep_enable_ext0_wakeup((gpio_num_t)RadioConfig::encBtn, 0);
+                esp_deep_sleep_start();
+            }
         }
         const bool eb_e = (!wifiConnecting && eb_tick);
 
