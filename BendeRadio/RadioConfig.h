@@ -25,7 +25,7 @@ class RadioConfig {
     static constexpr uint8_t encS1 = 19;
     static constexpr uint8_t encS2 = 18;
     static constexpr uint8_t encBtn = 4;
-    // Кнопка энкодера (GPIO 4 = RTC): отпустить после 5–9 с — deep sleep, пробуждение нажатием (ext0, уровень LOW);
+    // Кнопка энкодера (GPIO 4 = RTC): отпустить после 5–9 с удержания — deep sleep, пробуждение нажатием (ext0, уровень LOW);
     // держать ≥10 с без отпускания — ESP.restart().
     static constexpr uint16_t encoderSleepHoldMs = 5000;
     static constexpr uint16_t encoderHardResetHoldMs = 10000;
@@ -159,9 +159,22 @@ class RadioConfig {
     // Сглаживание уровня: ema = (ema * ((1<<shift)-1) + target) >> shift.
     static constexpr uint8_t pcmInstSmoothShift = 2;
 
-    // При vol==0 или выкл. радио включает сон модема Wi‑Fi — иногда слабее слышен ВЧ-писк в усилителе.
-    // Если обрывается поток — выставьте false.
+    // Wi‑Fi в экономичный режим только после wifiIdleSleepAfterMs без активности (не сразу при паузе).
+    // Активность: воспроизведение, энкодер, открытие веб‑страницы. Если обрывается поток — выставьте false.
     static constexpr bool wifiSleepWhenSilent = true;
+    // 0 = не переводить Wi‑Fi в сон по таймеру. Иначе мс бездействия до WiFi.setSleep + WIFI_PS_MAX_MODEM.
+    // Тест: 10 с; в бою поставьте обратно 300000 (5 мин).
+    static constexpr uint32_t wifiIdleSleepAfterMs = 10000;
+    // После таймера бездействия — MAX_MODEM; иначе NONE (без задержки при возобновлении стрима).
+    static constexpr bool wifiPsMaxModemWhenSilent = true;
+    // Пауза в конце цикла core0 — уступка CPU и лёгкий idle (0 = выкл.).
+    static constexpr uint8_t core0LoopDelayMs = 1;
+    // Радио выкл.: реже опрашивать делитель АКБ (0 = всегда batterySampleIntervalMs).
+    static constexpr uint32_t batterySampleIntervalIdleMs = 4000;
+    // loop(): при выкл. радио — короткая пауза, меньше кручение CPU в ожидании.
+    static constexpr uint8_t loopDelayMsWhenRadioOff = 2;
+    // После пробуждения из deep sleep (ext0): «бегающие глаза» как при поиске Wi‑Fi (0 = выкл.).
+    static constexpr uint32_t wakeAfterSleepAnimMs = 3500;
 
     // Отладка PCM в audio_process_extern: редкие строки в Serial (не на каждый буфер — иначе глотает аудио/Wi‑Fi).
     static constexpr bool debugAudioPcmSerial = false;

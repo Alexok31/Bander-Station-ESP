@@ -28,3 +28,4 @@ void change_state();
 void anim_search();
 void core0(void *p);
 void syncWifiWithAudioSilence();
+void wifi_touch_activity();

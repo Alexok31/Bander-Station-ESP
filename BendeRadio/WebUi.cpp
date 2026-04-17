@@ -5,10 +5,12 @@
 
 #include "NvsConfig.h"
 #include "RadioConfig.h"
+#include "core0.h"
 
 static WebServer server(80);
 
 static void sendPage() {
+    wifi_touch_activity();
     const bool staOk = (WiFi.status() == WL_CONNECTED);
     String ipSta = staOk ? WiFi.localIP().toString() : String("—");
     String rssi = staOk ? String(WiFi.RSSI()) : String("—");
@@ -85,6 +87,7 @@ static void sendPage() {
 }
 
 static void handleSave() {
+    wifi_touch_activity();
     if (server.method() != HTTP_POST) {
         server.send(405, "text/plain", "Method Not Allowed");
         return;

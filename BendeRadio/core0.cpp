@@ -4,6 +4,7 @@
 #include <ESP.h>
 #include <WiFi.h>
 #include <esp_sleep.h>
+#include <esp_wifi.h>
 
 #include <EEManager.h>
 #include <EncButton.h>
@@ -39,6 +40,9 @@ Audio audio;
 String streamname;
 const char* reconnect = nullptr;
 volatile bool wifiConnecting = false;
+
+static uint32_t s_wake_after_sleep_anim_until_ms = 0;
+static bool s_pending_change_state_after_wake = false;
 
 // func
 // ========================= MATRIX =========================
@@ -507,15 +511,26 @@ void analyz_mouth_robot_backup(uint8_t vol, bool invert) {
 }
 
 // ========================= SYSTEM =========================
+static uint32_t s_wifi_last_activity_ms = 0;
+
 void audio_showstreamtitle(const char* info) {
+}
+
+void wifi_touch_activity() {
+    s_wifi_last_activity_ms = millis();
 }
 
 void syncWifiWithAudioSilence() {
     if (!RadioConfig::wifiSleepWhenSilent) {
         return;
     }
-    const bool silent = !data.state || data.vol <= 0;
-    WiFi.setSleep(silent);
+    const bool wifiIdleLong =
+        (RadioConfig::wifiIdleSleepAfterMs > 0) &&
+        ((uint32_t)(millis() - s_wifi_last_activity_ms) >= RadioConfig::wifiIdleSleepAfterMs);
+    WiFi.setSleep(wifiIdleLong);
+    if (RadioConfig::wifiPsMaxModemWhenSilent && WiFi.getMode() != WIFI_OFF) {
+        esp_wifi_set_ps(wifiIdleLong ? WIFI_PS_MAX_MODEM : WIFI_PS_NONE);
+    }
 }
 
 void core0(void* p) {
@@ -552,9 +567,15 @@ void core0(void* p) {
     audio.setVolume(data.state ? data.vol : 0);
     data.station = constrain(data.station, 0, sizeof(stations) / sizeof(char*) - 1);
     reconnect = stations[data.station];
-    syncWifiWithAudioSilence();
 
     battery_init();
+
+    s_wifi_last_activity_ms = millis();
+    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 && RadioConfig::wakeAfterSleepAnimMs > 0) {
+        s_wake_after_sleep_anim_until_ms = millis() + RadioConfig::wakeAfterSleepAnimMs;
+        s_pending_change_state_after_wake = true;
+    }
+    syncWifiWithAudioSilence();
 
     // ========================= LOOP =========================
     for (;;) {
@@ -564,7 +585,23 @@ void core0(void* p) {
         angry_tmr.tick();
         memory.tick();
 
+        if (s_pending_change_state_after_wake) {
+            if ((int32_t)(millis() - s_wake_after_sleep_anim_until_ms) >= 0) {
+                s_pending_change_state_after_wake = false;
+                s_wake_after_sleep_anim_until_ms = 0;
+                change_state();
+            }
+        }
+        const bool show_wake_after_sleep_anim =
+            s_pending_change_state_after_wake &&
+            (int32_t)(millis() - s_wake_after_sleep_anim_until_ms) < 0;
+
         const bool eb_tick = eb.tick();
+        if (data.state) {
+            s_wifi_last_activity_ms = millis();
+        } else if (eb_tick && (eb.press() || eb.release() || eb.turn())) {
+            s_wifi_last_activity_ms = millis();
+        }
         if (eb_tick && eb.press()) {
             enc_btn_press_ms = millis();
         }
@@ -579,7 +616,6 @@ void core0(void* p) {
                     audio.setVolume(0);
                     audio.stopSong();
                 }
-                syncWifiWithAudioSilence();
                 {
                     uint8_t br_off[] = {0, 0, 0, 0, 0};
                     mtrx.setBright(br_off);
@@ -591,10 +627,10 @@ void core0(void* p) {
                 esp_deep_sleep_start();
             }
         }
-        const bool eb_e = (!wifiConnecting && eb_tick);
+        const bool eb_e = (!wifiConnecting && !show_wake_after_sleep_anim && eb_tick);
 
         // Только core0 трогает MAX7219: вызов anim_search с core1 в setup() давал гонку и мигание при Wi‑Fi.
-        if (wifiConnecting) {
+        if (wifiConnecting || show_wake_after_sleep_anim) {
             anim_search();
         } else if (pong_active()) {
             if (pong_tmr.tick()) {
@@ -801,7 +837,11 @@ void core0(void* p) {
             }
         }
 
-        // vTaskDelay(1);
+        syncWifiWithAudioSilence();
+
+        if (RadioConfig::core0LoopDelayMs > 0) {
+            delay(RadioConfig::core0LoopDelayMs);
+        }
         TIMERG0.wdt_wprotect = TIMG_WDT_WKEY_VALUE;  // write enable
         TIMERG0.wdt_feed = 1;                        // feed dog
         TIMERG0.wdt_wprotect = 0;                    // write protect

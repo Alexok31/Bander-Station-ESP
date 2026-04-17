@@ -3,6 +3,9 @@
 #include <Arduino.h>
 
 #include "RadioConfig.h"
+#include "core0.h"
+
+extern Data data;
 
 static uint32_t s_last_sample_ms;
 static uint16_t s_smooth_mv;
@@ -33,7 +36,10 @@ void battery_update() {
         return;
     }
     const uint32_t now = millis();
-    if ((uint32_t)(now - s_last_sample_ms) < RadioConfig::batterySampleIntervalMs) {
+    const uint32_t interval = (!data.state && RadioConfig::batterySampleIntervalIdleMs > 0)
+                                  ? RadioConfig::batterySampleIntervalIdleMs
+                                  : RadioConfig::batterySampleIntervalMs;
+    if ((uint32_t)(now - s_last_sample_ms) < interval) {
         return;
     }
     s_last_sample_ms = now;

@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_sleep.h>
 #include <math.h>
 
 #include "NvsConfig.h"
@@ -307,7 +308,9 @@ void setup() {
 
     webUiBegin();
 
-    change_state();
+    if (!(esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 && RadioConfig::wakeAfterSleepAnimMs > 0)) {
+        change_state();
+    }
     syncWifiWithAudioSilence();
 }
 
@@ -346,5 +349,9 @@ void loop() {
             audio.stopSong();
         }
         syncWifiWithAudioSilence();
+    }
+
+    if (!data.state && RadioConfig::loopDelayMsWhenRadioOff > 0) {
+        delay(RadioConfig::loopDelayMsWhenRadioOff);
     }
 }
