@@ -281,13 +281,7 @@ void setup() {
     String apSsid = nvsEffectiveApSsid(w);
     String apPwd = nvsEffectiveApPass(w);
 
-    WiFi.mode(WIFI_AP_STA);
-    if (apPwd.length() >= 8) {
-        WiFi.softAP(apSsid.c_str(), apPwd.c_str());
-    } else {
-        WiFi.softAP(apSsid.c_str());
-    }
-
+    WiFi.mode(WIFI_STA);
     wifiConnecting = true;
     WiFi.begin(staSsid.c_str(), staPass.c_str());
 
@@ -297,14 +291,26 @@ void setup() {
     }
     wifiConnecting = false;
 
+    if (WiFi.status() != WL_CONNECTED) {
+        WiFi.mode(WIFI_AP_STA);
+        if (apPwd.length() >= 8) {
+            WiFi.softAP(apSsid.c_str(), apPwd.c_str());
+        } else {
+            WiFi.softAP(apSsid.c_str());
+        }
+    }
+
     Serial.println();
     if (WiFi.status() == WL_CONNECTED) {
         Serial.println(WiFi.localIP());
+        Serial.println(F("SoftAP: off (6 clicks to enable AP for setup)"));
     } else {
         Serial.println(F("STA: not connected (use SoftAP for setup)"));
     }
-    Serial.print(F("Config AP http://"));
-    Serial.println(WiFi.softAPIP());
+    if (WiFi.getMode() != WIFI_STA) {
+        Serial.print(F("Config AP http://"));
+        Serial.println(WiFi.softAPIP());
+    }
 
     webUiBegin();
 

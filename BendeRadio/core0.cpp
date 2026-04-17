@@ -12,6 +12,7 @@
 #include <GyverMAX7219.h>
 
 #include "battery.h"
+#include "NvsConfig.h"
 #include "pong.h"
 #include "soc/timer_group_reg.h"
 #include "soc/timer_group_struct.h"
@@ -533,6 +534,55 @@ void syncWifiWithAudioSilence() {
     }
 }
 
+void wifi_ap_toggle_from_core0() {
+    if (wifiConnecting) {
+        return;
+    }
+    WifiStored w;
+    nvsLoadWifi(w);
+    const String apSsid = nvsEffectiveApSsid(w);
+    const String apPwd = nvsEffectiveApPass(w);
+
+    const bool sta_ok = (WiFi.status() == WL_CONNECTED);
+    const wifi_mode_t mode = WiFi.getMode();
+    const bool ap_mode = (mode == WIFI_AP_STA || mode == WIFI_AP);
+
+    if (!sta_ok && ap_mode) {
+        return;
+    }
+    if (sta_ok && ap_mode) {
+        WiFi.softAPdisconnect(true);
+        WiFi.mode(WIFI_STA);
+        wifi_touch_activity();
+        syncWifiWithAudioSilence();
+        print_val('A', 0);
+        return;
+    }
+    if (sta_ok && mode == WIFI_STA) {
+        WiFi.mode(WIFI_AP_STA);
+        if (apPwd.length() >= 8) {
+            WiFi.softAP(apSsid.c_str(), apPwd.c_str());
+        } else {
+            WiFi.softAP(apSsid.c_str());
+        }
+        wifi_touch_activity();
+        syncWifiWithAudioSilence();
+        print_val('A', 1);
+        return;
+    }
+    if (!sta_ok && mode == WIFI_STA) {
+        WiFi.mode(WIFI_AP_STA);
+        if (apPwd.length() >= 8) {
+            WiFi.softAP(apSsid.c_str(), apPwd.c_str());
+        } else {
+            WiFi.softAP(apSsid.c_str());
+        }
+        wifi_touch_activity();
+        syncWifiWithAudioSilence();
+        print_val('A', 1);
+    }
+}
+
 void core0(void* p) {
     // ========================= SETUP =========================
     EncButton eb(RadioConfig::encS1, RadioConfig::encS2, RadioConfig::encBtn);
@@ -661,6 +711,9 @@ void core0(void* p) {
                         pong_set_active(false);
                         upd_bright();
                         mtrx.update();
+                    } else if (n == 6) {
+                        wifi_ap_toggle_from_core0();
+                        matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
                     }
                 }
                 memory.update();
@@ -823,6 +876,10 @@ void core0(void* p) {
                             draw_eyes_follow_ball(pong_ball_x(), pong_ball_y());
                             pong_sync_matrix_brightness();
                             mtrx.update();
+                            break;
+                        case 6:
+                            wifi_ap_toggle_from_core0();
+                            matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
                             break;
                     }
                 }
