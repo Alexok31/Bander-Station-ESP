@@ -67,13 +67,14 @@ void battery_update() {
     const int32_t hi = (int32_t)RadioConfig::batteryFullMv;
     int32_t p = 0;
     if (hi > lo) {
-        p = ((int32_t)s_smooth_mv - lo) * 100 / (hi - lo);
+        // 0…99 %: на двух цифрах матрицы 100% виглядало як «00» (десятки 10 → некоректний гліф).
+        p = ((int32_t)s_smooth_mv - lo) * 99 / (hi - lo);
     }
     if (p < 0) {
         p = 0;
     }
-    if (p > 100) {
-        p = 100;
+    if (p > 99) {
+        p = 99;
     }
     s_percent = (uint8_t)p;
 }

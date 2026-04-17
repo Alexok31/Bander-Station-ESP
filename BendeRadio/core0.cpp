@@ -841,6 +841,10 @@ void core0(void* p) {
                 }
             } else {
                 if (eye_tmr) {
+                    // Радио выкл.: рот не визуализируется — после оверлея батареи (matrix_tmr) цифры иначе не снимаются.
+                    if (!matrix_tmr.state()) {
+                        mtrx.rect(0, 0, RadioConfig::analyzWidth - 1, 7, GFX_CLEAR);
+                    }
                     draw_eyes_radio_idle_off();
                     mtrx.update();
                 }

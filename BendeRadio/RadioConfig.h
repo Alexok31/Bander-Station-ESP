@@ -46,10 +46,10 @@ class RadioConfig {
     static constexpr uint8_t batteryMoodCheerfulMinPct = 70;
     static constexpr uint8_t batteryMoodNormalMinPct = 30;
     static constexpr uint32_t batterySampleIntervalMs = 60000;  // 1 мин
-    // 4 кліки: % АКБ на «роті»; тривалість паузи волни/EQ — стільки мс.
-    static constexpr uint32_t batteryPercentShowDurationMs = 2000;
+    // 4 кліки: % АКБ на «роті»; скільки мс показувати (потім зникає).
+    static constexpr uint32_t batteryPercentShowDurationMs = 3000;
     // 6 кликов: вкл/выкл точку доступа (SoftAP) для веб-настройки, если STA уже подключён; без STA при работающем AP не отключается.
-    // Станція / гучність на роті — фіксований період matrix_tmr (не залишати 2 с після батареї).
+    // Станція / гучність на роті — фіксований період matrix_tmr (не довше за batteryPercentShowDurationMs після батареї).
     static constexpr uint16_t matrixOverlayDigitsMs = 1000;
 
     static constexpr int analyzWidth = 3 * 8;
