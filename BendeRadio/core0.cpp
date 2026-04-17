@@ -34,7 +34,6 @@ const char* stations[] = {
 
 // data
 MAX7219<5, 1, RadioConfig::mtrxCs, RadioConfig::mtrxDat, RadioConfig::mtrxClk> mtrx;
-Tmr square_tmr;
 Data data;
 EEManager memory(data);
 Audio audio;
@@ -44,6 +43,17 @@ volatile bool wifiConnecting = false;
 
 static uint32_t s_wake_after_sleep_anim_until_ms = 0;
 static bool s_pending_change_state_after_wake = false;
+
+// Время millis(), с которого разрешена подсветка и отрисовка (после matrixDisplayEnableDelayMs).
+static uint32_t g_matrix_display_enable_ms = 0xFFFFFFFFu;
+static bool s_matrix_ui_started = false;
+
+static inline bool matrix_display_ready() {
+    if (g_matrix_display_enable_ms == 0xFFFFFFFFu) {
+        return false;
+    }
+    return (int32_t)(millis() - g_matrix_display_enable_ms) >= 0;
+}
 
 // func
 // ========================= MATRIX =========================
@@ -69,6 +79,9 @@ static void pong_sync_matrix_brightness() {
     }
 }
 void print_val(char c, uint8_t v) {
+    if (!matrix_display_ready()) {
+        return;
+    }
     // Завжди тёмный фон + светлый шрифт: библиотечный print не умеет «тёмные» глифы при інверсії рота.
     mtrx.rect(0, 0, RadioConfig::analyzWidth - 1, 7, GFX_CLEAR);
     mtrx.setCursor(8 * 0 + 2, 1);
@@ -103,6 +116,9 @@ static void draw_batt_lightning_glyph() {
 }
 
 void print_batt(uint8_t pct) {
+    if (!matrix_display_ready()) {
+        return;
+    }
     const uint8_t v = (pct > 99u) ? 99u : pct;
     mtrx.rect(0, 0, RadioConfig::analyzWidth - 1, 7, GFX_CLEAR);
     draw_batt_lightning_glyph();
@@ -127,6 +143,15 @@ void draw_eyeb(uint8_t i, int x, int y, int w = 2) {
     mtrx.rect(x, y, x + w - 1, y + w - 1, GFX_CLEAR);
 }
 
+// Радио выкл.: статичные «спящие» глаза (тот же вид, что в change_state при !data.state).
+static void draw_eyes_radio_idle_off() {
+    draw_eye(0);
+    draw_eye(1);
+    mtrx.rect(RadioConfig::analyzWidth, 0, RadioConfig::analyzWidth + 16 - 1, 3, GFX_CLEAR);
+    draw_eyeb(0, 3, 5);
+    draw_eyeb(1, 3, 5);
+}
+
 // Pong: на табло счёт на глазах (левый — игрок, правый — ИИ). В розыгрыше — зрачок следует за мячом.
 static void draw_eyes_follow_ball(int8_t ball_x, int8_t ball_y) {
     if (pong_mouth_tablo_mode()) {
@@ -140,11 +165,7 @@ static void draw_eyes_follow_ball(int8_t ball_x, int8_t ball_y) {
     }
 
     if (!data.state) {
-        draw_eye(0);
-        draw_eye(1);
-        mtrx.rect(RadioConfig::analyzWidth, 0, RadioConfig::analyzWidth + 16 - 1, 3, GFX_CLEAR);
-        draw_eyeb(0, 3, 5);
-        draw_eyeb(1, 3, 5);
+        draw_eyes_radio_idle_off();
         return;
     }
     const int8_t pw = RadioConfig::analyzWidth;
@@ -166,6 +187,9 @@ static void draw_eyes_follow_ball(int8_t ball_x, int8_t ball_y) {
 }
 
 void anim_search() {
+    if (!matrix_display_ready()) {
+        return;
+    }
     static int8_t pos = 4, dir = 1;
     static Tmr tmr(50);
     if (tmr) {
@@ -178,22 +202,21 @@ void anim_search() {
         mtrx.update();
     }
 }
+
 void change_state() {
+    if (!matrix_display_ready()) {
+        return;
+    }
     mtrx.clear();
     if (data.state) {
         upd_bright();
-        square_tmr.start(600);
         draw_eye(0);
         draw_eye(1);
         draw_eyeb(0, 2, 2, 4);
         draw_eyeb(1, 2, 2, 4);
     } else {
         mtrx.setBright((uint8_t)0);
-        draw_eye(0);
-        draw_eye(1);
-        mtrx.rect(RadioConfig::analyzWidth, 0, RadioConfig::analyzWidth + 16 - 1, 3, GFX_CLEAR);
-        draw_eyeb(0, 3, 5);
-        draw_eyeb(1, 3, 5);
+        draw_eyes_radio_idle_off();
     }
     mtrx.update();
 }
@@ -592,7 +615,6 @@ void core0(void* p) {
     Tmr matrix_tmr(1000);
     Tmr angry_tmr(800);
     Tmr pong_tmr(145);
-    square_tmr.timerMode(1);
     matrix_tmr.timerMode(1);
     angry_tmr.timerMode(1);
     bool pulse = 0;
@@ -602,15 +624,56 @@ void core0(void* p) {
     EEPROM.begin(memory.blockSize());
     memory.begin(0, 'b');
 
+    {
+        uint32_t matrixPreDelay = RadioConfig::matrixPowerStabilizeBeforeBeginMs;
+        if (RadioConfig::matrixPowerStabilizeBeforeBeginMsAfterWakeMs > 0 &&
+            esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
+            matrixPreDelay = RadioConfig::matrixPowerStabilizeBeforeBeginMsAfterWakeMs;
+        }
+        delay(matrixPreDelay);
+    }
+    // Глобальный MAX7219 в GyverMAX7219 уже вызывает begin() в конструкторе до стабилизации питания —
+    // на холодном старте переинициализируем и «промываем» цепочку.
+    const bool matrixColdPowerOn = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_UNDEFINED);
     mtrx.begin();
+    if (matrixColdPowerOn && RadioConfig::matrixColdBootSecondBeginDelayMs > 0) {
+        delay(RadioConfig::matrixColdBootSecondBeginDelayMs);
+        mtrx.begin();
+    }
     mtrx.setBright((uint8_t)0);
-    mtrx.clear();
-    mtrx.update();
+    if (matrixColdPowerOn && RadioConfig::matrixColdBootFlushCycles > 0) {
+        for (uint8_t i = 0; i < RadioConfig::matrixColdBootFlushCycles; i++) {
+            mtrx.clearDisplay();
+            mtrx.clear();
+            mtrx.update();
+            if (RadioConfig::matrixColdBootFlushGapMs > 0) {
+                delay(RadioConfig::matrixColdBootFlushGapMs);
+            }
+        }
+    } else {
+        mtrx.clear();
+        mtrx.update();
+    }
     delay(RadioConfig::coldStartMatrixZeroMs);
-    upd_bright();
-    mtrx.update();
-
     delay(RadioConfig::coldStartAfterMatrixMs);
+
+    {
+        const uint32_t addMs = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0)
+                                   ? RadioConfig::matrixDisplayEnableDelayMsAfterWakeMs
+                                   : RadioConfig::matrixDisplayEnableDelayMs;
+        g_matrix_display_enable_ms = millis() + addMs;
+    }
+    if (matrix_display_ready()) {
+        upd_bright();
+        mtrx.update();
+        s_matrix_ui_started = true;
+    } else {
+        uint8_t br0[5] = {0, 0, 0, 0, 0};
+        mtrx.setBright(br0);
+        mtrx.clear();
+        mtrx.update();
+        s_matrix_ui_started = false;
+    }
 
     audio.setBufsize(RadioConfig::radioBuffer, -1);
     audio.setPinout(RadioConfig::i2sBclk, RadioConfig::i2sLrc, RadioConfig::i2sDout);
@@ -630,21 +693,39 @@ void core0(void* p) {
     // ========================= LOOP =========================
     for (;;) {
         battery_update();
-        square_tmr.tick();
         matrix_tmr.tick();
         angry_tmr.tick();
         memory.tick();
 
         if (s_pending_change_state_after_wake) {
             if ((int32_t)(millis() - s_wake_after_sleep_anim_until_ms) >= 0) {
-                s_pending_change_state_after_wake = false;
-                s_wake_after_sleep_anim_until_ms = 0;
-                change_state();
+                if (matrix_display_ready()) {
+                    s_pending_change_state_after_wake = false;
+                    s_wake_after_sleep_anim_until_ms = 0;
+                    change_state();
+                    s_matrix_ui_started = true;
+                }
             }
         }
         const bool show_wake_after_sleep_anim =
             s_pending_change_state_after_wake &&
             (int32_t)(millis() - s_wake_after_sleep_anim_until_ms) < 0;
+
+        if (matrix_display_ready() && !s_matrix_ui_started) {
+            s_matrix_ui_started = true;
+            change_state();
+        }
+
+        if (!matrix_display_ready()) {
+            static uint32_t s_matrix_hold_dark_ms;
+            if ((uint32_t)(millis() - s_matrix_hold_dark_ms) >= 400) {
+                s_matrix_hold_dark_ms = millis();
+                uint8_t br0[5] = {0, 0, 0, 0, 0};
+                mtrx.setBright(br0);
+                mtrx.clear();
+                mtrx.update();
+            }
+        }
 
         const bool eb_tick = eb.tick();
         if (data.state) {
@@ -679,6 +760,7 @@ void core0(void* p) {
         }
         const bool eb_e = (!wifiConnecting && !show_wake_after_sleep_anim && eb_tick);
 
+        if (matrix_display_ready()) {
         // Только core0 трогает MAX7219: вызов anim_search с core1 в setup() давал гонку и мигание при Wi‑Fi.
         if (wifiConnecting || show_wake_after_sleep_anim) {
             anim_search();
@@ -719,7 +801,7 @@ void core0(void* p) {
                 memory.update();
             }
         } else {
-            if (data.state && !square_tmr.state()) {
+            if (data.state) {
                 if (eye_tmr) {
                     draw_eye(0);
                     draw_eye(1);
@@ -757,13 +839,18 @@ void core0(void* p) {
                     }
                     mtrx.update();
                 }
+            } else {
+                if (eye_tmr) {
+                    draw_eyes_radio_idle_off();
+                    mtrx.update();
+                }
             }
 
             // Режимы рта 0…4: волна / волна инв. / EQ / рот / рот инв.
             if (data.mode > 4) {
                 data.mode = 0;
             }
-            if (viz_tmr && !matrix_tmr.state() && (data.state || data.mode <= 4)) {
+            if (viz_tmr && !matrix_tmr.state() && data.state && data.mode <= 4) {
                 const uint8_t vol = pcm_vis_after_noise_gate(g_pcm_vis);
                 if (vol > pcm_pulse_l + 12) {
                     pulse = 1;
@@ -892,6 +979,7 @@ void core0(void* p) {
                 }
                 memory.update();
             }
+        }
         }
 
         syncWifiWithAudioSilence();

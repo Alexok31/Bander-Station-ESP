@@ -45,7 +45,7 @@ class RadioConfig {
     // Пороги для battery_eye_mood() (якщо підключиш настрій очей за АКБ).
     static constexpr uint8_t batteryMoodCheerfulMinPct = 70;
     static constexpr uint8_t batteryMoodNormalMinPct = 30;
-    static constexpr uint32_t batterySampleIntervalMs = 500;
+    static constexpr uint32_t batterySampleIntervalMs = 60000;  // 1 мин
     // 4 кліки: % АКБ на «роті»; тривалість паузи волни/EQ — стільки мс.
     static constexpr uint32_t batteryPercentShowDurationMs = 2000;
     // 6 кликов: вкл/выкл точку доступа (SoftAP) для веб-настройки, если STA уже подключён; без STA при работающем AP не отключается.
@@ -125,6 +125,20 @@ class RadioConfig {
 
     // Пока заряжаются входные конденсаторы, 5V может проседать — разнос нагрузки во времени.
     static constexpr uint32_t coldStartBootMs = 250;
+    // Пауза перед mtrx.begin(): питание на цепочке MAX7219 (несколько модулей) должно стабилизироваться,
+    // иначе часть дисплеев не инициализируется при первом включении. Подберите под свой DC‑DC/линейник.
+    static constexpr uint32_t matrixPowerStabilizeBeforeBeginMs = 3000;
+    // После пробуждения из deep sleep (ext0): короче, чем холодный старт (0 = всегда matrixPowerStabilizeBeforeBeginMs).
+    static constexpr uint32_t matrixPowerStabilizeBeforeBeginMsAfterWakeMs = 400;
+    // Холодное включение после долгого простоя: повторный begin() и «промывка» регистров MAX7219 (артефакты / нет глаз).
+    // 0 = не делать второй begin; 0 циклов = только обычный clear+update.
+    static constexpr uint32_t matrixColdBootSecondBeginDelayMs = 100;
+    static constexpr uint8_t matrixColdBootFlushCycles = 6;
+    static constexpr uint32_t matrixColdBootFlushGapMs = 10;
+    // После инициализации MAX7219: не подсвечивать матрицу N мс (прогрев/стабилизация). 0 = сразу показ.
+    // После пробуждения из deep sleep обычно 0 — не ждать лишнего.
+    static constexpr uint32_t matrixDisplayEnableDelayMs = 5000;
+    static constexpr uint32_t matrixDisplayEnableDelayMsAfterWakeMs = 0;
     static constexpr uint32_t coldStartMatrixZeroMs = 200;
     static constexpr uint32_t coldStartAfterMatrixMs = 300;
     static constexpr uint32_t coldStartBeforeWifiMs = 400;
@@ -171,7 +185,7 @@ class RadioConfig {
     // Пауза в конце цикла core0 — уступка CPU и лёгкий idle (0 = выкл.).
     static constexpr uint8_t core0LoopDelayMs = 1;
     // Радио выкл.: реже опрашивать делитель АКБ (0 = всегда batterySampleIntervalMs).
-    static constexpr uint32_t batterySampleIntervalIdleMs = 4000;
+    static constexpr uint32_t batterySampleIntervalIdleMs = 60000;  // 1 мин
     // loop(): при выкл. радио — короткая пауза, меньше кручение CPU в ожидании.
     static constexpr uint8_t loopDelayMsWhenRadioOff = 2;
     // После пробуждения из deep sleep (ext0): «бегающие глаза» как при поиске Wi‑Fi (0 = выкл.).
