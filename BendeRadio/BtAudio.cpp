@@ -112,3 +112,17 @@ void bt_audio_avrcp_play() {
     }
     g_a2dp_sink.play();
 }
+
+void bt_audio_avrcp_next() {
+    if (!g_sink_running || !g_a2dp_sink.is_connected() || !g_a2dp_sink.is_avrc_connected()) {
+        return;
+    }
+    g_a2dp_sink.next();
+}
+
+void bt_audio_avrcp_previous() {
+    if (!g_sink_running || !g_a2dp_sink.is_connected() || !g_a2dp_sink.is_avrc_connected()) {
+        return;
+    }
+    g_a2dp_sink.previous();
+}

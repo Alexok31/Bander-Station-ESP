@@ -64,9 +64,9 @@ static inline bool matrix_display_ready() {
 // func
 // ========================= MATRIX =========================
 void upd_bright() {
-    uint8_t m = data.bright_mouth, e = data.bright_eyes;
-    uint8_t br[] = {m, m, m, e, e};
-    mtrx.setBright(br);
+    const int v = max((int)data.bright_mouth, (int)data.bright_eyes);
+    const int b = constrain(v, 0, 15);
+    mtrx.setBright(b);
 }
 
 // Глиф 5×7 внутри одной 8×8-клетки (модуль MAX7219): строка = 5 бит, старший бит — левый столбец.
@@ -105,20 +105,8 @@ static void draw_mode_pick_mouth() {
     }
 }
 
-// Pong: на табло ярче крайние «ротовые» модули; счёт на глазах — подсвечиваем их (bright_eyes).
 static void pong_sync_matrix_brightness() {
-    if (pong_mouth_tablo_mode()) {
-        uint8_t m = (uint8_t)constrain((int)data.bright_mouth, 0, 15);
-        uint8_t side = (uint8_t)constrain((int)m + 5, 0, 15);
-        uint8_t mid = (uint8_t)constrain((int)m - 2, 0, 15);
-        const uint8_t pulse = (uint8_t)(((millis() / 90) & 1) ? 1u : 0u);
-        side = (uint8_t)constrain((int)side + (int)pulse, 0, 15);
-        uint8_t e = (uint8_t)constrain((int)data.bright_eyes, 0, 15);
-        uint8_t br[] = {side, mid, side, e, e};
-        mtrx.setBright(br);
-    } else {
-        upd_bright();
-    }
+    upd_bright();
 }
 void print_val(char c, uint8_t v) {
     if (!matrix_display_ready()) {
@@ -696,6 +684,8 @@ void core0(void* p) {
     bool pulse = 0;
     uint8_t pcm_pulse_l = 0;
     static uint32_t enc_btn_press_ms = 0;
+    // Удерж.+поворот (станция/яркость/громкость): не трактовать как длинное удержание → сон / restart.
+    static bool s_enc_hold_had_turn_while_pressed = false;
 
     EEPROM.begin(memory.blockSize());
     memory.begin(0, 'b');
@@ -820,13 +810,12 @@ void core0(void* p) {
         }
         if (eb_tick && eb.press()) {
             enc_btn_press_ms = millis();
-        }
-        if (eb_tick && eb.pressing() && eb.pressFor() >= RadioConfig::encoderHardResetHoldMs) {
-            ESP.restart();
+            s_enc_hold_had_turn_while_pressed = false;
         }
         if (eb_tick && eb.release()) {
             const uint32_t dur = millis() - enc_btn_press_ms;
-            if (dur >= RadioConfig::encoderSleepHoldMs && dur < RadioConfig::encoderHardResetHoldMs) {
+            if (!s_enc_hold_had_turn_while_pressed && dur >= RadioConfig::encoderSleepHoldMs &&
+                dur < RadioConfig::encoderHardResetHoldMs) {
                 memory.update();
                 if (data.state) {
                     if (strcmp(g_audio_source, "bt") == 0) {
@@ -864,12 +853,16 @@ void core0(void* p) {
                 mtrx.update();
             }
             if (eb_e) {
-                if (eb.turn() && !eb.pressing()) {
-                    pong_paddle_nudge(eb.dir());
-                    pong_draw();
-                    draw_eyes_follow_ball(pong_ball_x(), pong_ball_y());
-                    pong_sync_matrix_brightness();
-                    mtrx.update();
+                if (eb.turn()) {
+                    if (eb.pressing()) {
+                        s_enc_hold_had_turn_while_pressed = true;
+                    } else {
+                        pong_paddle_nudge(eb.dir());
+                        pong_draw();
+                        draw_eyes_follow_ball(pong_ball_x(), pong_ball_y());
+                        pong_sync_matrix_brightness();
+                        mtrx.update();
+                    }
                 }
                 if (eb.hasClicks()) {
                     const uint8_t n = eb.getClicks();
@@ -1044,15 +1037,25 @@ void core0(void* p) {
 
                 if (eb.turn()) {
                     if (eb.pressing()) {
+                        s_enc_hold_had_turn_while_pressed = true;
                         // getClicks() при удержании = число уже завершённых кликов в серии:
                         // 0 — один клик + поворот; 1 — двойной; 2 — тройной (яркость); 3 — четверной (Wi‑Fi / Bluetooth).
                         switch (eb.getClicks()) {
                             case 0:
-                                data.station += eb.dir();
-                                data.station = constrain(data.station, 0, sizeof(stations) / sizeof(char*) - 1);
-                                print_val('s', data.station);
-                                matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
-                                station_changed = 1;
+                                if (strcmp(g_audio_source, "bt") == 0) {
+                                    if (eb.dir() > 0) {
+                                        bt_audio_avrcp_next();
+                                    } else if (eb.dir() < 0) {
+                                        bt_audio_avrcp_previous();
+                                    }
+                                } else {
+                                    data.station += eb.dir();
+                                    data.station =
+                                        constrain(data.station, 0, sizeof(stations) / sizeof(char*) - 1);
+                                    print_val('s', data.station);
+                                    matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
+                                    station_changed = 1;
+                                }
                                 break;
                             case 1: {
                                 const int8_t d = eb.dir();
@@ -1063,10 +1066,10 @@ void core0(void* p) {
                             }
                             case 2: {
                                 const int8_t d = eb.dir();
-                                data.bright_mouth += d;
-                                data.bright_eyes += d;
-                                data.bright_mouth = constrain(data.bright_mouth, 0, 16);
-                                data.bright_eyes = constrain(data.bright_eyes, 0, 16);
+                                int v = max((int)data.bright_mouth, (int)data.bright_eyes) + (int)d;
+                                v = constrain(v, 0, 15);
+                                data.bright_mouth = (int8_t)v;
+                                data.bright_eyes = (int8_t)v;
                                 upd_bright();
                                 break;
                             }
@@ -1121,6 +1124,11 @@ void core0(void* p) {
                 memory.update();
             }
         }
+        }
+
+        if (eb_tick && eb.pressing() && !s_enc_hold_had_turn_while_pressed &&
+            eb.pressFor() >= RadioConfig::encoderHardResetHoldMs) {
+            ESP.restart();
         }
 
         syncWifiWithAudioSilence();

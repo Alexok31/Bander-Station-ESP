@@ -9,7 +9,7 @@ struct Data {
     bool state = 0;
     int8_t vol = 10;
     int8_t bright_eyes = 5;
-    int8_t bright_mouth = 2;
+    int8_t bright_mouth = 5;
     // Порог «тишины» для PCM-метра (после смены с АЦП сделайте 3 клика на тихой паузе).
     uint16_t trsh = 24;
     // 0 волна; 1 волна інверсія; 2 EQ; 3 рот; 4 рот інверсія. Інше → 0.

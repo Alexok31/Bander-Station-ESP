@@ -17,3 +17,5 @@ void bt_audio_volume_apply(bool audio_on, int8_t vol_ui);
 // AVRCP только на телефон: пауза/плей (без чтения состояния с телефона).
 void bt_audio_avrcp_pause();
 void bt_audio_avrcp_play();
+void bt_audio_avrcp_next();
+void bt_audio_avrcp_previous();
