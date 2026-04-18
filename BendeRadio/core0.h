@@ -3,6 +3,7 @@
 #include <Audio.h>
 
 #include "RadioConfig.h"
+#include "pcm_analyzer.h"
 
 struct Data {
     bool state = 0;
@@ -19,10 +20,6 @@ struct Data {
 extern Audio audio;
 extern const char* reconnect;
 extern volatile bool wifiConnecting;
-// Уровень из PCM (audio_process_extern): шкала 0…100 и «АЦП» для порога тишины на матрице.
-extern volatile uint16_t g_pcm_level_adc;
-extern volatile uint8_t g_pcm_vis;
-extern volatile uint8_t g_pcm_eq_band[RadioConfig::pcmEqBandCount];
 
 void change_state();
 void anim_search();

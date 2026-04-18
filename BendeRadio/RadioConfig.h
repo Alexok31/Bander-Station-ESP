@@ -25,6 +25,13 @@ class RadioConfig {
     static constexpr uint8_t btReconnectBurstCount = 16;
     // Пауза внутри ESP32-A2DP при наличии last_bda в NVS (до init Bluetooth) — больше = спокойнее после подачи питания.
     static constexpr uint32_t btA2dpLastConnPreStackDelayMs = 1800;
+    // Визуализация рта/EQ по BT: в библиотеке set_stream_reader вызывается ПОСЛЕ цифровой громкости A2DP — сигнал часто «ниже» Wi‑Fi.
+    // Берём raw_stream_reader (до volume) + отдельные пороги. gain 100 = без усиления; 120…200 — если всё ещё бідно.
+    static constexpr uint16_t btPcmAnalyzerGainPercent = 145;
+    // Аналог pcmSilenceAbs, но для сырого A2DP PCM (обычно ниже, чем у Wi‑Fi декодера).
+    static constexpr uint32_t btPcmSilenceAbs = 220;
+    // В core0 noise gate: для BT сравниваем g_pcm_level_adc с data.trsh * percent / 100 (меньше % — раньше «открывается» рот).
+    static constexpr uint8_t btPcmNoiseGateTrshPercent = 50;
 
     static constexpr uint8_t mtrxCs = 22;
     static constexpr uint8_t mtrxDat = 23;

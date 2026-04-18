@@ -270,16 +270,32 @@ void change_state() {
 // ========================= ANALYZ =========================
 // g_pcm_level_adc в 0…4095 (inst*4095/100 в BendeRadio.ino). Порог тишины data.trsh — в тех же единицах.
 // Раньше нарастание было +120 счётчиков ADC — при полной шкале 4095 это ~3% над порогом → «рот» почти всегда 1 px.
+static uint16_t pcm_noise_gate_trsh_effective() {
+    if (strcmp(g_audio_source, "bt") != 0) {
+        return data.trsh;
+    }
+    const uint32_t t =
+        (uint32_t)data.trsh * (uint32_t)RadioConfig::btPcmNoiseGateTrshPercent / 100u;
+    if (t < 4u) {
+        return 4u;
+    }
+    if (t > 3800u) {
+        return 3800u;
+    }
+    return (uint16_t)t;
+}
+
 static uint8_t pcm_vis_after_noise_gate(uint8_t vw) {
     const uint16_t adc = g_pcm_level_adc;
-    if (adc <= data.trsh || vw == 0) {
+    const uint16_t trsh = pcm_noise_gate_trsh_effective();
+    if (adc <= trsh || vw == 0) {
         return 0;
     }
     if (RadioConfig::pcmNoiseGateBinary) {
         return vw;
     }
-    const uint32_t above = (uint32_t)adc - (uint32_t)data.trsh;
-    const uint32_t head = (uint32_t)RadioConfig::pcmLevelAdcMax - (uint32_t)data.trsh;
+    const uint32_t above = (uint32_t)adc - (uint32_t)trsh;
+    const uint32_t head = (uint32_t)RadioConfig::pcmLevelAdcMax - (uint32_t)trsh;
     uint32_t ramp = head / 3u;
     if (ramp < 200u) {
         ramp = 200u;
