@@ -1006,6 +1006,7 @@ void core0(void* p) {
                             break;
                         case 5:
                             if (RadioConfig::batteryMonitorEnable) {
+                                battery_force_sample();
                                 print_batt(battery_percent());
                                 matrix_tmr.start((uint16_t)RadioConfig::batteryPercentShowDurationMs);
                             }

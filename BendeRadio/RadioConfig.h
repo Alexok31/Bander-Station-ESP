@@ -54,7 +54,7 @@ class RadioConfig {
     // Пороги для battery_eye_mood() (якщо підключиш настрій очей за АКБ).
     static constexpr uint8_t batteryMoodCheerfulMinPct = 70;
     static constexpr uint8_t batteryMoodNormalMinPct = 30;
-    static constexpr uint32_t batterySampleIntervalMs = 60000;  // 1 мин
+    static constexpr uint32_t batterySampleIntervalMs = 180000;  // 3 мин
     // 4 кліки: % АКБ на «роті»; скільки мс показувати (потім зникає).
     static constexpr uint32_t batteryPercentShowDurationMs = 3000;
     // 6 кликов: вкл/выкл точку доступа (SoftAP) для веб-настройки, если STA уже подключён; без STA при работающем AP не отключается.
@@ -194,7 +194,7 @@ class RadioConfig {
     // Пауза в конце цикла core0 — уступка CPU и лёгкий idle (0 = выкл.).
     static constexpr uint8_t core0LoopDelayMs = 1;
     // Радио выкл.: реже опрашивать делитель АКБ (0 = всегда batterySampleIntervalMs).
-    static constexpr uint32_t batterySampleIntervalIdleMs = 60000;  // 1 мин
+    static constexpr uint32_t batterySampleIntervalIdleMs = 180000;  // 3 мин (радио выкл.)
     // loop(): при выкл. радио — короткая пауза, меньше кручение CPU в ожидании.
     static constexpr uint8_t loopDelayMsWhenRadioOff = 2;
     // После пробуждения из deep sleep (ext0): «бегающие глаза» как при поиске Wi‑Fi (0 = выкл.).

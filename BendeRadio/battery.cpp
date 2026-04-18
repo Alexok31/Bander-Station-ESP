@@ -31,19 +31,7 @@ void battery_init() {
     analogSetPinAttenuation(RadioConfig::batteryAdcPin, ADC_11db);
 }
 
-void battery_update() {
-    if (!RadioConfig::batteryMonitorEnable) {
-        return;
-    }
-    const uint32_t now = millis();
-    const uint32_t interval = (!data.state && RadioConfig::batterySampleIntervalIdleMs > 0)
-                                  ? RadioConfig::batterySampleIntervalIdleMs
-                                  : RadioConfig::batterySampleIntervalMs;
-    if ((uint32_t)(now - s_last_sample_ms) < interval) {
-        return;
-    }
-    s_last_sample_ms = now;
-
+static void battery_sample_apply() {
     uint32_t acc = 0;
     constexpr uint8_t kSamples = 12;
     for (uint8_t i = 0; i < kSamples; i++) {
@@ -77,6 +65,29 @@ void battery_update() {
         p = 99;
     }
     s_percent = (uint8_t)p;
+}
+
+void battery_force_sample() {
+    if (!RadioConfig::batteryMonitorEnable) {
+        return;
+    }
+    battery_sample_apply();
+    s_last_sample_ms = millis();
+}
+
+void battery_update() {
+    if (!RadioConfig::batteryMonitorEnable) {
+        return;
+    }
+    const uint32_t now = millis();
+    const uint32_t interval = (!data.state && RadioConfig::batterySampleIntervalIdleMs > 0)
+                                  ? RadioConfig::batterySampleIntervalIdleMs
+                                  : RadioConfig::batterySampleIntervalMs;
+    if ((uint32_t)(now - s_last_sample_ms) < interval) {
+        return;
+    }
+    s_last_sample_ms = now;
+    battery_sample_apply();
 }
 
 uint8_t battery_percent() {
