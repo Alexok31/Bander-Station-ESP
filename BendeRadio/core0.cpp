@@ -1,5 +1,6 @@
 #include "core0.h"
 
+#include <cstring>
 #include <math.h>
 #include <ESP.h>
 #include <WiFi.h>
@@ -12,6 +13,7 @@
 #include <GyverMAX7219.h>
 
 #include "battery.h"
+#include "BtAudio.h"
 #include "NvsConfig.h"
 #include "pong.h"
 #include "soc/timer_group_reg.h"
@@ -48,6 +50,10 @@ static bool s_pending_change_state_after_wake = false;
 static uint32_t g_matrix_display_enable_ms = 0xFFFFFFFFu;
 static bool s_matrix_ui_started = false;
 
+// Выбор Wi‑Fi / Bluetooth: 4×клик + удержание + поворот — текст на рту; применение при отпускании кнопки.
+static bool s_mode_pick_active = false;
+static char s_mode_pick_choice[8] = "wifi";
+
 static inline bool matrix_display_ready() {
     if (g_matrix_display_enable_ms == 0xFFFFFFFFu) {
         return false;
@@ -61,6 +67,42 @@ void upd_bright() {
     uint8_t m = data.bright_mouth, e = data.bright_eyes;
     uint8_t br[] = {m, m, m, e, e};
     mtrx.setBright(br);
+}
+
+// Глиф 5×7 внутри одной 8×8-клетки (модуль MAX7219): строка = 5 бит, старший бит — левый столбец.
+static void draw_mode_pick_glyph_cell(uint8_t cell, const uint8_t rows[7]) {
+    const uint8_t x0 = (uint8_t)(cell * 8u + 1u);
+    for (uint8_t y = 0; y < 7u; y++) {
+        const uint8_t bits = rows[y];
+        for (uint8_t c = 0; c < 5u; c++) {
+            if ((bits >> (4u - c)) & 1u) {
+                mtrx.dot(x0 + c, y, GFX_FILL);
+            }
+        }
+    }
+}
+
+// Рот: «wfi» / «bt» — по одной букве на квадратик (8×8), без библиотечного print.
+static void draw_mode_pick_mouth() {
+    mtrx.rect(0, 0, RadioConfig::analyzWidth - 1, 7, GFX_CLEAR);
+    // W
+    static const uint8_t gW[7] = {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A};
+    // F
+    static const uint8_t gF[7] = {0x1E, 0x10, 0x10, 0x1C, 0x10, 0x10, 0x10};
+    // I
+    static const uint8_t gI[7] = {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1F};
+    // B, T
+    static const uint8_t gB[7] = {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E};
+    static const uint8_t gT[7] = {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04};
+
+    if (strcmp(s_mode_pick_choice, "bt") == 0) {
+        draw_mode_pick_glyph_cell(0, gB);
+        draw_mode_pick_glyph_cell(1, gT);
+    } else {
+        draw_mode_pick_glyph_cell(0, gW);
+        draw_mode_pick_glyph_cell(1, gF);
+        draw_mode_pick_glyph_cell(2, gI);
+    }
 }
 
 // Pong: на табло ярче крайние «ротовые» модули; счёт на глазах — подсвечиваем их (bright_eyes).
@@ -196,6 +238,10 @@ void anim_search() {
         pos += dir;
         if (pos >= 6) dir = -1;
         if (pos <= 0) dir = 1;
+        // Полный кадр: иначе после «спящих» глаз (change_state при !data.state, яркость 0) остаётся
+        // старый рисунок слева/справа и смешивается с бегающими бровями (Wi‑Fi / BT / после сна).
+        upd_bright();
+        mtrx.clear();
         mtrx.rect(RadioConfig::analyzWidth, 2, RadioConfig::analyzWidth + 16 - 1, 5, GFX_FILL);
         draw_eyeb(0, pos, 3);
         draw_eyeb(1, pos, 3);
@@ -548,6 +594,9 @@ void syncWifiWithAudioSilence() {
     if (!RadioConfig::wifiSleepWhenSilent) {
         return;
     }
+    if (WiFi.getMode() == WIFI_OFF) {
+        return;
+    }
     const bool wifiIdleLong =
         (RadioConfig::wifiIdleSleepAfterMs > 0) &&
         ((uint32_t)(millis() - s_wifi_last_activity_ms) >= RadioConfig::wifiIdleSleepAfterMs);
@@ -558,6 +607,9 @@ void syncWifiWithAudioSilence() {
 }
 
 void wifi_ap_toggle_from_core0() {
+    if (strcmp(g_audio_source, "bt") == 0) {
+        return;
+    }
     if (wifiConnecting) {
         return;
     }
@@ -758,11 +810,12 @@ void core0(void* p) {
                 esp_deep_sleep_start();
             }
         }
-        const bool eb_e = (!wifiConnecting && !show_wake_after_sleep_anim && eb_tick);
+        // Энкодер не глушим на время STA-подключения — иначе жест «4 клика + поворот» не работает до ~25 с.
+        const bool eb_e = (!show_wake_after_sleep_anim && eb_tick);
 
         if (matrix_display_ready()) {
         // Только core0 трогает MAX7219: вызов anim_search с core1 в setup() давал гонку и мигание при Wi‑Fi.
-        if (wifiConnecting || show_wake_after_sleep_anim) {
+        if (show_wake_after_sleep_anim) {
             anim_search();
         } else if (pong_active()) {
             if (pong_tmr.tick()) {
@@ -789,11 +842,11 @@ void core0(void* p) {
                         draw_eyes_follow_ball(pong_ball_x(), pong_ball_y());
                         pong_sync_matrix_brightness();
                         mtrx.update();
-                    } else if (n == 5) {
+                    } else if (n == 6) {
                         pong_set_active(false);
                         upd_bright();
                         mtrx.update();
-                    } else if (n == 6) {
+                    } else if (n == 7) {
                         wifi_ap_toggle_from_core0();
                         matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
                     }
@@ -801,6 +854,10 @@ void core0(void* p) {
                 memory.update();
             }
         } else {
+            if ((wifiConnecting || (strcmp(g_audio_source, "bt") == 0 && bt_audio_needs_pairing_ui())) &&
+                !s_mode_pick_active) {
+                anim_search();
+            } else {
             if (data.state) {
                 if (eye_tmr) {
                     draw_eye(0);
@@ -854,7 +911,11 @@ void core0(void* p) {
             if (data.mode > 4) {
                 data.mode = 0;
             }
-            if (viz_tmr && !matrix_tmr.state() && data.state && data.mode <= 4) {
+            if (s_mode_pick_active) {
+                upd_bright();
+                draw_mode_pick_mouth();
+                mtrx.update();
+            } else if (viz_tmr && !matrix_tmr.state() && data.state && data.mode <= 4) {
                 const uint8_t vol = pcm_vis_after_noise_gate(g_pcm_vis);
                 if (vol > pcm_pulse_l + 12) {
                     pulse = 1;
@@ -888,13 +949,56 @@ void core0(void* p) {
                 mtrx.update();
             }
 
+            }
+
             if (eb_e) {
                 static bool station_changed = 0;
+
+                // hasClicks() до turn(): иначе на том же тике поворот уходит в громкость.
+                if (eb.hasClicks()) {
+                    switch (eb.getClicks()) {
+                        case 1:
+                            data.state = !data.state;
+                            if (!data.state) {
+                                audio.setVolume(0);
+                                audio.stopSong();
+                            } else {
+                                reconnect = stations[data.station];
+                                audio.setVolume(data.vol);
+                            }
+                            syncWifiWithAudioSilence();
+                            change_state();
+                            break;
+                        case 2:
+                            break;
+                        case 3:
+                            data.trsh = (uint16_t)constrain((int)g_pcm_level_adc * 2 / 3, 4, 3800);
+                            break;
+                        case 5:
+                            if (RadioConfig::batteryMonitorEnable) {
+                                print_batt(battery_percent());
+                                matrix_tmr.start((uint16_t)RadioConfig::batteryPercentShowDurationMs);
+                            }
+                            break;
+                        case 6:
+                            pong_start();
+                            pong_tmr.start();
+                            pong_draw();
+                            draw_eyes_follow_ball(pong_ball_x(), pong_ball_y());
+                            pong_sync_matrix_brightness();
+                            mtrx.update();
+                            break;
+                        case 7:
+                            wifi_ap_toggle_from_core0();
+                            matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
+                            break;
+                    }
+                }
 
                 if (eb.turn()) {
                     if (eb.pressing()) {
                         // getClicks() при удержании = число уже завершённых кликов в серии:
-                        // 0 — первое нажатие; 1 — второе нажатие (двойной клик + поворот); 2 — третье (тройной + поворот).
+                        // 0 — один клик + поворот; 1 — двойной; 2 — тройной (яркость); 3 — четверной (Wi‑Fi / Bluetooth).
                         switch (eb.getClicks()) {
                             case 0:
                                 data.station += eb.dir();
@@ -919,6 +1023,25 @@ void core0(void* p) {
                                 upd_bright();
                                 break;
                             }
+                            case 3: {
+                                if (!s_mode_pick_active) {
+                                    s_mode_pick_active = true;
+                                    if (strcmp(g_audio_source, "bt") == 0) {
+                                        strncpy(s_mode_pick_choice, "wifi", sizeof(s_mode_pick_choice));
+                                    } else {
+                                        strncpy(s_mode_pick_choice, "bt", sizeof(s_mode_pick_choice));
+                                    }
+                                    s_mode_pick_choice[sizeof(s_mode_pick_choice) - 1] = '\0';
+                                } else {
+                                    if (strcmp(s_mode_pick_choice, "wifi") == 0) {
+                                        strncpy(s_mode_pick_choice, "bt", sizeof(s_mode_pick_choice));
+                                    } else {
+                                        strncpy(s_mode_pick_choice, "wifi", sizeof(s_mode_pick_choice));
+                                    }
+                                    s_mode_pick_choice[sizeof(s_mode_pick_choice) - 1] = '\0';
+                                }
+                                break;
+                            }
                             default:
                                 break;
                         }
@@ -935,47 +1058,14 @@ void core0(void* p) {
                     }
                 }
 
-                if (eb.hasClicks()) {
-                    switch (eb.getClicks()) {
-                        case 1:
-                            data.state = !data.state;
-                            if (!data.state) {
-                                audio.setVolume(0);
-                                audio.stopSong();
-                            } else {
-                                reconnect = stations[data.station];
-                                audio.setVolume(data.vol);
-                            }
-                            syncWifiWithAudioSilence();
-                            change_state();
-                            break;
-                        case 2:
-                            break;
-                        case 3:
-                            data.trsh = (uint16_t)constrain((int)g_pcm_level_adc * 2 / 3, 4, 3800);
-                            break;
-                        case 4:
-                            if (RadioConfig::batteryMonitorEnable) {
-                                print_batt(battery_percent());
-                                matrix_tmr.start((uint16_t)RadioConfig::batteryPercentShowDurationMs);
-                            }
-                            break;
-                        case 5:
-                            pong_start();
-                            pong_tmr.start();
-                            pong_draw();
-                            draw_eyes_follow_ball(pong_ball_x(), pong_ball_y());
-                            pong_sync_matrix_brightness();
-                            mtrx.update();
-                            break;
-                        case 6:
-                            wifi_ap_toggle_from_core0();
-                            matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
-                            break;
-                    }
-                }
-
                 if (eb.release()) {
+                    if (s_mode_pick_active) {
+                        s_mode_pick_active = false;
+                        if (strcmp(s_mode_pick_choice, g_audio_source) != 0) {
+                            Serial.printf("[Mode] switch to %s\n", s_mode_pick_choice);
+                            commitSourceModeSwitch(s_mode_pick_choice);
+                        }
+                    }
                     if (station_changed) {
                         station_changed = 0;
                         reconnect = stations[data.station];

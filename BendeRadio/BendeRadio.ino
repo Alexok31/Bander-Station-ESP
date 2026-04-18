@@ -1,14 +1,32 @@
 #include <Arduino.h>
+#include <cstring>
+#include <Preferences.h>
 #include <WiFi.h>
 #include <esp_sleep.h>
+#include <esp_system.h>
 #include <math.h>
 
+#include "BtAudio.h"
 #include "NvsConfig.h"
 #include "RadioConfig.h"
 #include "WebUi.h"
 #include "core0.h"
 
 TaskHandle_t Task0;
+
+char g_audio_source[8] = "wifi";
+
+void commitSourceModeSwitch(const char* new_mode) {
+    if (strcmp(new_mode, "wifi") != 0 && strcmp(new_mode, "bt") != 0) {
+        return;
+    }
+    Preferences prefs;
+    prefs.begin("bende", false);
+    prefs.putString("aud", new_mode);
+    prefs.end();
+    delay(100);
+    esp_restart();
+}
 
 extern Data data;
 
@@ -75,6 +93,11 @@ static void pcm_serial_debug_line(const char* tag,
 
 void audio_process_extern(int16_t* buff, uint16_t len, bool* continueI2S) {
     *continueI2S = true;
+
+    if (strcmp(g_audio_source, "bt") == 0) {
+        pcm_vis_reset();
+        return;
+    }
 
     if (!data.state || data.vol <= 0 || !audio.isRunning()) {
         pcm_vis_reset();
@@ -268,10 +291,46 @@ void audio_process_extern(int16_t* buff, uint16_t len, bool* continueI2S) {
 
 void setup() {
     delay(RadioConfig::coldStartBootMs);
+
+    // До запуска core0: иначе жест смены режима видит g_audio_source по умолчанию ("wifi"), а не NVS —
+    // при первом выборе «wifi» при уже сохранённом «wifi» strcmp даёт ложное «другое» и лишняя перезагрузка.
+    {
+        Preferences prefs;
+        prefs.begin("bende", true);
+        String s = prefs.getString("aud", "");
+        if (s != "wifi" && s != "bt") {
+            const uint8_t legacy = prefs.getUChar("src", 0);
+            s = (legacy == 1) ? "bt" : "wifi";
+            prefs.end();
+            prefs.begin("bende", false);
+            prefs.putString("aud", s);
+            prefs.end();
+        } else {
+            prefs.end();
+        }
+        strncpy(g_audio_source, s.c_str(), sizeof(g_audio_source));
+        g_audio_source[sizeof(g_audio_source) - 1] = '\0';
+    }
+    if (strcmp(g_audio_source, "wifi") != 0 && strcmp(g_audio_source, "bt") != 0) {
+        strncpy(g_audio_source, "wifi", sizeof(g_audio_source));
+        g_audio_source[sizeof(g_audio_source) - 1] = '\0';
+    }
+
     xTaskCreatePinnedToCore(core0, "Task0", 10000, NULL, 1, &Task0, 0);
 
     Serial.begin(115200);
     delay(RadioConfig::coldStartBeforeWifiMs);
+
+    if (strcmp(g_audio_source, "bt") == 0) {
+        wifiConnecting = false;
+        Serial.println(F("Mode: Bluetooth A2DP (pair from phone)"));
+        bt_audio_start_sink();
+        if (!(esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 && RadioConfig::wakeAfterSleepAnimMs > 0)) {
+            change_state();
+        }
+        syncWifiWithAudioSilence();
+        return;
+    }
 
     WifiStored w;
     nvsLoadWifi(w);
@@ -321,6 +380,12 @@ void setup() {
 }
 
 void loop() {
+    if (strcmp(g_audio_source, "bt") == 0) {
+        pcm_vis_reset();
+        delay(5);
+        return;
+    }
+
     webUiLoop();
     audio.loop();
     if (!data.state || data.vol <= 0 || !audio.isRunning()) {

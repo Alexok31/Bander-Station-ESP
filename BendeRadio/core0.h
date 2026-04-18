@@ -30,3 +30,7 @@ void core0(void *p);
 void syncWifiWithAudioSilence();
 void wifi_touch_activity();
 void wifi_ap_toggle_from_core0();
+
+// Источник звука: "wifi" (интернет-радио) или "bt" (Bluetooth A2DP). NVS "bende"/"aud". Смена через NVS + перезагрузка.
+extern char g_audio_source[8];
+void commitSourceModeSwitch(const char* new_mode);

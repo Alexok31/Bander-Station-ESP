@@ -17,6 +17,8 @@ class RadioConfig {
     static constexpr uint8_t i2sDout = 25;
     static constexpr uint8_t i2sBclk = 27;
     static constexpr uint8_t i2sLrc = 26;
+    // Имя Bluetooth A2DP sink (телефон увидит это в списке сопряжения).
+    static constexpr const char* btSinkName = "BendeRadio";
 
     static constexpr uint8_t mtrxCs = 22;
     static constexpr uint8_t mtrxDat = 23;
@@ -25,6 +27,7 @@ class RadioConfig {
     static constexpr uint8_t encS1 = 19;
     static constexpr uint8_t encS2 = 18;
     static constexpr uint8_t encBtn = 4;
+    // Жесты (EncButton): 1 — пуск; 3 тапа — порог; 4×клик+удержание+поворот — выбор wfi/bt на рту, отпускание — применить; 5 — % АКБ; 6 — Pong; 7 — SoftAP.
     // Кнопка энкодера (GPIO 4 = RTC): отпустить после 5–9 с удержания — deep sleep, пробуждение нажатием (ext0, уровень LOW);
     // держать ≥10 с без отпускания — ESP.restart().
     static constexpr uint16_t encoderSleepHoldMs = 5000;
