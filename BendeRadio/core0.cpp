@@ -658,6 +658,14 @@ void wifi_ap_toggle_from_core0() {
     }
 }
 
+static void apply_output_volume() {
+    if (strcmp(g_audio_source, "bt") == 0) {
+        bt_audio_volume_apply(data.state, data.vol);
+    } else {
+        audio.setVolume(data.state ? data.vol : 0);
+    }
+}
+
 void core0(void* p) {
     // ========================= SETUP =========================
     EncButton eb(RadioConfig::encS1, RadioConfig::encS2, RadioConfig::encBtn);
@@ -681,12 +689,16 @@ void core0(void* p) {
         if (RadioConfig::matrixPowerStabilizeBeforeBeginMsAfterWakeMs > 0 &&
             esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
             matrixPreDelay = RadioConfig::matrixPowerStabilizeBeforeBeginMsAfterWakeMs;
+        } else if (g_warm_boot_after_mode_switch &&
+                   RadioConfig::matrixPowerStabilizeBeforeBeginMsAfterWakeMs > 0) {
+            matrixPreDelay = RadioConfig::matrixPowerStabilizeBeforeBeginMsAfterWakeMs;
         }
         delay(matrixPreDelay);
     }
     // Глобальный MAX7219 в GyverMAX7219 уже вызывает begin() в конструкторе до стабилизации питания —
     // на холодном старте переинициализируем и «промываем» цепочку.
-    const bool matrixColdPowerOn = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_UNDEFINED);
+    const bool matrixColdPowerOn =
+        (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_UNDEFINED) && !g_warm_boot_after_mode_switch;
     mtrx.begin();
     if (matrixColdPowerOn && RadioConfig::matrixColdBootSecondBeginDelayMs > 0) {
         delay(RadioConfig::matrixColdBootSecondBeginDelayMs);
@@ -706,13 +718,18 @@ void core0(void* p) {
         mtrx.clear();
         mtrx.update();
     }
-    delay(RadioConfig::coldStartMatrixZeroMs);
-    delay(RadioConfig::coldStartAfterMatrixMs);
+    if (!g_warm_boot_after_mode_switch) {
+        delay(RadioConfig::coldStartMatrixZeroMs);
+        delay(RadioConfig::coldStartAfterMatrixMs);
+    }
 
     {
-        const uint32_t addMs = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0)
-                                   ? RadioConfig::matrixDisplayEnableDelayMsAfterWakeMs
-                                   : RadioConfig::matrixDisplayEnableDelayMs;
+        uint32_t addMs = RadioConfig::matrixDisplayEnableDelayMs;
+        if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
+            addMs = RadioConfig::matrixDisplayEnableDelayMsAfterWakeMs;
+        } else if (g_warm_boot_after_mode_switch) {
+            addMs = RadioConfig::matrixDisplayEnableDelayMsAfterWakeMs;
+        }
         g_matrix_display_enable_ms = millis() + addMs;
     }
     if (matrix_display_ready()) {
@@ -729,7 +746,7 @@ void core0(void* p) {
 
     audio.setBufsize(RadioConfig::radioBuffer, -1);
     audio.setPinout(RadioConfig::i2sBclk, RadioConfig::i2sLrc, RadioConfig::i2sDout);
-    audio.setVolume(data.state ? data.vol : 0);
+    apply_output_volume();
     data.station = constrain(data.station, 0, sizeof(stations) / sizeof(char*) - 1);
     reconnect = stations[data.station];
 
@@ -748,6 +765,25 @@ void core0(void* p) {
         matrix_tmr.tick();
         angry_tmr.tick();
         memory.tick();
+
+        // Bluetooth: пауза/плей с телефона (AVRCP) → тот же data.state, что и на энкодере.
+        if (strcmp(g_audio_source, "bt") == 0 && bt_audio_is_sink_running()) {
+            bool remote_play = false;
+            if (bt_audio_consume_remote_playstate(&remote_play)) {
+                if (remote_play != data.state) {
+                    data.state = remote_play;
+                    if (!data.state) {
+                        bt_audio_volume_apply(false, 0);
+                    } else {
+                        apply_output_volume();
+                    }
+                    syncWifiWithAudioSilence();
+                    if (matrix_display_ready()) {
+                        change_state();
+                    }
+                }
+            }
+        }
 
         if (s_pending_change_state_after_wake) {
             if ((int32_t)(millis() - s_wake_after_sleep_anim_until_ms) >= 0) {
@@ -796,8 +832,12 @@ void core0(void* p) {
             if (dur >= RadioConfig::encoderSleepHoldMs && dur < RadioConfig::encoderHardResetHoldMs) {
                 memory.update();
                 if (data.state) {
-                    audio.setVolume(0);
-                    audio.stopSong();
+                    if (strcmp(g_audio_source, "bt") == 0) {
+                        bt_audio_volume_apply(false, 0);
+                    } else {
+                        audio.setVolume(0);
+                        audio.stopSong();
+                    }
                 }
                 {
                     uint8_t br_off[] = {0, 0, 0, 0, 0};
@@ -958,13 +998,33 @@ void core0(void* p) {
                 if (eb.hasClicks()) {
                     switch (eb.getClicks()) {
                         case 1:
-                            data.state = !data.state;
-                            if (!data.state) {
-                                audio.setVolume(0);
-                                audio.stopSong();
+                            if (strcmp(g_audio_source, "bt") == 0 && bt_audio_is_avrc_connected()) {
+                                if (data.state) {
+                                    bt_audio_avrcp_pause();
+                                } else {
+                                    bt_audio_avrcp_play();
+                                }
+                                data.state = !data.state;
+                                if (!data.state) {
+                                    bt_audio_volume_apply(false, 0);
+                                } else {
+                                    apply_output_volume();
+                                }
                             } else {
-                                reconnect = stations[data.station];
-                                audio.setVolume(data.vol);
+                                data.state = !data.state;
+                                if (!data.state) {
+                                    if (strcmp(g_audio_source, "bt") == 0) {
+                                        bt_audio_volume_apply(false, 0);
+                                    } else {
+                                        audio.setVolume(0);
+                                        audio.stopSong();
+                                    }
+                                } else {
+                                    if (strcmp(g_audio_source, "wifi") == 0) {
+                                        reconnect = stations[data.station];
+                                    }
+                                    apply_output_volume();
+                                }
                             }
                             syncWifiWithAudioSilence();
                             change_state();
@@ -1050,7 +1110,7 @@ void core0(void* p) {
                             angry_tmr.start();
                             data.vol += eb.dir();
                             data.vol = constrain(data.vol, 0, 21);
-                            audio.setVolume(data.vol);
+                            apply_output_volume();
                             syncWifiWithAudioSilence();
                             print_val('v', data.vol);
                             matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);

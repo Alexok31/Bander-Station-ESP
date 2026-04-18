@@ -27,7 +27,7 @@ class RadioConfig {
     static constexpr uint8_t encS1 = 19;
     static constexpr uint8_t encS2 = 18;
     static constexpr uint8_t encBtn = 4;
-    // Жесты (EncButton): 1 — пуск; 3 тапа — порог; 4×клик+удержание+поворот — выбор wfi/bt на рту, отпускание — применить; 5 — % АКБ; 6 — Pong; 7 — SoftAP.
+    // Жесты (EncButton): 1 — пуск/пауза (Wi‑Fi: вкл/выкл поток; BT: AVRCP на телефон при наличии AVRCP); 3 тапа — порог; 4×клик+удержание+поворот — выбор wfi/bt на рту, отпускание — применить; 5 — % АКБ; 6 — Pong; 7 — SoftAP.
     // Кнопка энкодера (GPIO 4 = RTC): отпустить после 5–9 с удержания — deep sleep, пробуждение нажатием (ext0, уровень LOW);
     // держать ≥10 с без отпускания — ESP.restart().
     static constexpr uint16_t encoderSleepHoldMs = 5000;
@@ -130,7 +130,7 @@ class RadioConfig {
     static constexpr uint32_t coldStartBootMs = 250;
     // Пауза перед mtrx.begin(): питание на цепочке MAX7219 (несколько модулей) должно стабилизироваться,
     // иначе часть дисплеев не инициализируется при первом включении. Подберите под свой DC‑DC/линейник.
-    static constexpr uint32_t matrixPowerStabilizeBeforeBeginMs = 3000;
+    static constexpr uint32_t matrixPowerStabilizeBeforeBeginMs = 2000;
     // После пробуждения из deep sleep (ext0): короче, чем холодный старт (0 = всегда matrixPowerStabilizeBeforeBeginMs).
     static constexpr uint32_t matrixPowerStabilizeBeforeBeginMsAfterWakeMs = 400;
     // Холодное включение после долгого простоя: повторный begin() и «промывка» регистров MAX7219 (артефакты / нет глаз).
@@ -140,7 +140,7 @@ class RadioConfig {
     static constexpr uint32_t matrixColdBootFlushGapMs = 10;
     // После инициализации MAX7219: не подсвечивать матрицу N мс (прогрев/стабилизация). 0 = сразу показ.
     // После пробуждения из deep sleep обычно 0 — не ждать лишнего.
-    static constexpr uint32_t matrixDisplayEnableDelayMs = 5000;
+    static constexpr uint32_t matrixDisplayEnableDelayMs = 2000;
     static constexpr uint32_t matrixDisplayEnableDelayMsAfterWakeMs = 0;
     static constexpr uint32_t coldStartMatrixZeroMs = 200;
     static constexpr uint32_t coldStartAfterMatrixMs = 300;

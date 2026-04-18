@@ -33,4 +33,6 @@ void wifi_ap_toggle_from_core0();
 
 // Источник звука: "wifi" (интернет-радио) или "bt" (Bluetooth A2DP). NVS "bende"/"aud". Смена через NVS + перезагрузка.
 extern char g_audio_source[8];
+// true только после esp_restart() из commitSourceModeSwitch — короткие задержки вместо холодного старта.
+extern bool g_warm_boot_after_mode_switch;
 void commitSourceModeSwitch(const char* new_mode);

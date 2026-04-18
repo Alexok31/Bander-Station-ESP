@@ -15,6 +15,7 @@
 TaskHandle_t Task0;
 
 char g_audio_source[8] = "wifi";
+bool g_warm_boot_after_mode_switch = false;
 
 void commitSourceModeSwitch(const char* new_mode) {
     if (strcmp(new_mode, "wifi") != 0 && strcmp(new_mode, "bt") != 0) {
@@ -23,6 +24,7 @@ void commitSourceModeSwitch(const char* new_mode) {
     Preferences prefs;
     prefs.begin("bende", false);
     prefs.putString("aud", new_mode);
+    prefs.putBool("wmrst", true);
     prefs.end();
     delay(100);
     esp_restart();
@@ -290,13 +292,11 @@ void audio_process_extern(int16_t* buff, uint16_t len, bool* continueI2S) {
 }
 
 void setup() {
-    delay(RadioConfig::coldStartBootMs);
-
-    // До запуска core0: иначе жест смены режима видит g_audio_source по умолчанию ("wifi"), а не NVS —
-    // при первом выборе «wifi» при уже сохранённом «wifi» strcmp даёт ложное «другое» и лишняя перезагрузка.
+    // Сначала NVS (до core0 и до холодных delay): режим + флаг «тёплой» перезагрузки после смены Wi‑Fi/BT.
     {
         Preferences prefs;
         prefs.begin("bende", true);
+        g_warm_boot_after_mode_switch = prefs.getBool("wmrst", false);
         String s = prefs.getString("aud", "");
         if (s != "wifi" && s != "bt") {
             const uint8_t legacy = prefs.getUChar("src", 0);
@@ -310,21 +310,33 @@ void setup() {
         }
         strncpy(g_audio_source, s.c_str(), sizeof(g_audio_source));
         g_audio_source[sizeof(g_audio_source) - 1] = '\0';
+        if (g_warm_boot_after_mode_switch) {
+            prefs.begin("bende", false);
+            prefs.putBool("wmrst", false);
+            prefs.end();
+        }
     }
     if (strcmp(g_audio_source, "wifi") != 0 && strcmp(g_audio_source, "bt") != 0) {
         strncpy(g_audio_source, "wifi", sizeof(g_audio_source));
         g_audio_source[sizeof(g_audio_source) - 1] = '\0';
     }
 
+    if (!g_warm_boot_after_mode_switch) {
+        delay(RadioConfig::coldStartBootMs);
+    }
+
     xTaskCreatePinnedToCore(core0, "Task0", 10000, NULL, 1, &Task0, 0);
 
     Serial.begin(115200);
-    delay(RadioConfig::coldStartBeforeWifiMs);
+    if (!g_warm_boot_after_mode_switch) {
+        delay(RadioConfig::coldStartBeforeWifiMs);
+    }
 
     if (strcmp(g_audio_source, "bt") == 0) {
         wifiConnecting = false;
         Serial.println(F("Mode: Bluetooth A2DP (pair from phone)"));
         bt_audio_start_sink();
+        bt_audio_volume_apply(data.state, data.vol);
         if (!(esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 && RadioConfig::wakeAfterSleepAnimMs > 0)) {
             change_state();
         }
