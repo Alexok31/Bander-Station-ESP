@@ -27,7 +27,7 @@ class RadioConfig {
     static constexpr uint8_t encS1 = 19;
     static constexpr uint8_t encS2 = 18;
     static constexpr uint8_t encBtn = 4;
-    // Жесты (EncButton): 1 — пуск/пауза (Wi‑Fi: вкл/выкл поток; BT: AVRCP на телефон при наличии AVRCP); 3 тапа — порог; 4×клик+удержание+поворот — выбор wfi/bt на рту, отпускание — применить; 5 — % АКБ; 6 — Pong; 7 — SoftAP.
+    // Жесты (EncButton): 1 — пуск/пауза (Wi‑Fi: вкл/выкл поток; BT: только AVRCP pause/play, громкость sink не в 0); 3 тапа — порог; 4×клик+удержание+поворот — выбор wfi/bt на рту, отпускание — применить; 5 — % АКБ; 6 — Pong; 7 — SoftAP.
     // Кнопка энкодера (GPIO 4 = RTC): отпустить после 5–9 с удержания — deep sleep, пробуждение нажатием (ext0, уровень LOW);
     // держать ≥10 с без отпускания — ESP.restart().
     static constexpr uint16_t encoderSleepHoldMs = 5000;

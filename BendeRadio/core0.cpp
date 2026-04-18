@@ -766,25 +766,6 @@ void core0(void* p) {
         angry_tmr.tick();
         memory.tick();
 
-        // Bluetooth: пауза/плей с телефона (AVRCP) → тот же data.state, что и на энкодере.
-        if (strcmp(g_audio_source, "bt") == 0 && bt_audio_is_sink_running()) {
-            bool remote_play = false;
-            if (bt_audio_consume_remote_playstate(&remote_play)) {
-                if (remote_play != data.state) {
-                    data.state = remote_play;
-                    if (!data.state) {
-                        bt_audio_volume_apply(false, 0);
-                    } else {
-                        apply_output_volume();
-                    }
-                    syncWifiWithAudioSilence();
-                    if (matrix_display_ready()) {
-                        change_state();
-                    }
-                }
-            }
-        }
-
         if (s_pending_change_state_after_wake) {
             if ((int32_t)(millis() - s_wake_after_sleep_anim_until_ms) >= 0) {
                 if (matrix_display_ready()) {
@@ -998,33 +979,22 @@ void core0(void* p) {
                 if (eb.hasClicks()) {
                     switch (eb.getClicks()) {
                         case 1:
-                            if (strcmp(g_audio_source, "bt") == 0 && bt_audio_is_avrc_connected()) {
-                                if (data.state) {
+                            data.state = !data.state;
+                            if (!data.state) {
+                                if (strcmp(g_audio_source, "bt") == 0) {
                                     bt_audio_avrcp_pause();
                                 } else {
-                                    bt_audio_avrcp_play();
-                                }
-                                data.state = !data.state;
-                                if (!data.state) {
-                                    bt_audio_volume_apply(false, 0);
-                                } else {
-                                    apply_output_volume();
+                                    audio.setVolume(0);
+                                    audio.stopSong();
                                 }
                             } else {
-                                data.state = !data.state;
-                                if (!data.state) {
-                                    if (strcmp(g_audio_source, "bt") == 0) {
-                                        bt_audio_volume_apply(false, 0);
-                                    } else {
-                                        audio.setVolume(0);
-                                        audio.stopSong();
-                                    }
-                                } else {
-                                    if (strcmp(g_audio_source, "wifi") == 0) {
-                                        reconnect = stations[data.station];
-                                    }
-                                    apply_output_volume();
+                                if (strcmp(g_audio_source, "wifi") == 0) {
+                                    reconnect = stations[data.station];
                                 }
+                                if (strcmp(g_audio_source, "bt") == 0) {
+                                    bt_audio_avrcp_play();
+                                }
+                                apply_output_volume();
                             }
                             syncWifiWithAudioSilence();
                             change_state();
