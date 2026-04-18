@@ -393,6 +393,7 @@ void setup() {
 
 void loop() {
     if (strcmp(g_audio_source, "bt") == 0) {
+        bt_audio_tick();
         pcm_vis_reset();
         delay(5);
         return;

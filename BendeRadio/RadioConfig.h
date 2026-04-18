@@ -19,6 +19,12 @@ class RadioConfig {
     static constexpr uint8_t i2sLrc = 26;
     // Имя Bluetooth A2DP sink (телефон увидит это в списке сопряжения).
     static constexpr const char* btSinkName = "BendeRadio";
+    // Автоподключение к последнему телефону: пауза перед первым reconnect из loop; интервал повторов.
+    static constexpr uint32_t btReconnectFirstDelayMs = 4500;
+    static constexpr uint32_t btReconnectRetryMs = 6000;
+    static constexpr uint8_t btReconnectBurstCount = 16;
+    // Пауза внутри ESP32-A2DP при наличии last_bda в NVS (до init Bluetooth) — больше = спокойнее после подачи питания.
+    static constexpr uint32_t btA2dpLastConnPreStackDelayMs = 1800;
 
     static constexpr uint8_t mtrxCs = 22;
     static constexpr uint8_t mtrxDat = 23;
