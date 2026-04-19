@@ -29,3 +29,6 @@ void bt_audio_poll_track_position();
 // Метаданные для бегущей строки (UTF-8). serial меняется при смене title/artist или трека — сброс прокрутки.
 uint32_t bt_audio_track_meta_serial();
 const char* bt_audio_track_scroll_cstr();
+
+// Запрос из AVRCP: 0 — нет, 1 — как пауза на энкодере (спящие глаза), 2 — как плей. Забрать в task core0.
+uint8_t bt_audio_take_remote_ui_request();

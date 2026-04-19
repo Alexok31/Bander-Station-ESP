@@ -1,6 +1,7 @@
 #include "BtAudio.h"
 
 #include "RadioConfig.h"
+#include "core0.h"
 #include "pcm_analyzer.h"
 
 #include <BluetoothA2DPSink.h>
@@ -9,6 +10,8 @@
 #include <cstring>
 #include <esp_avrc_api.h>
 #include <esp_idf_version.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/portmacro.h>
 
 static BluetoothA2DPSink g_a2dp_sink;
 static bool g_sink_running = false;
@@ -30,6 +33,9 @@ static uint32_t s_bt_pos_poll_burst_until_ms = 0u;
 static char s_bt_title[96];
 static char s_bt_artist[96];
 static volatile uint32_t s_bt_meta_serial = 0u;
+// 0 нет; 1 — пауза с телефона (как выкл. энкодером); 2 — плей с телефона. Читает только core0.
+static volatile uint8_t s_bt_remote_ui_req = 0u;
+static portMUX_TYPE s_bt_remote_ui_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static void bt_meta_bump_serial() {
     s_bt_meta_serial++;
@@ -101,6 +107,30 @@ static void bt_copy_meta_text(char* dst, size_t cap, const uint8_t* text) {
 
 static bool bt_playstat_is_seek(esp_avrc_playback_stat_t st) {
     return st == ESP_AVRC_PLAYBACK_FWD_SEEK || st == ESP_AVRC_PLAYBACK_REV_SEEK;
+}
+
+static void bt_remote_ui_queue_from_playstat(esp_avrc_playback_stat_t prev, esp_avrc_playback_stat_t st) {
+    if (!g_sink_running || strcmp(g_audio_source, "bt") != 0) {
+        return;
+    }
+    // Пока ползунок scrub — не меняем «спящий» режим.
+    if (bt_playstat_is_seek(st)) {
+        return;
+    }
+    const bool now_play = (st == ESP_AVRC_PLAYBACK_PLAYING);
+    const bool now_idle =
+        (st == ESP_AVRC_PLAYBACK_PAUSED || st == ESP_AVRC_PLAYBACK_STOPPED);
+    const bool prev_active =
+        (prev == ESP_AVRC_PLAYBACK_PLAYING || bt_playstat_is_seek(prev));
+
+    portENTER_CRITICAL(&s_bt_remote_ui_mux);
+    // Пауза после PLAYING или после seek (телефон часто шлёт PAUSED с prev=SEEK).
+    if (now_idle && prev_active) {
+        s_bt_remote_ui_req = 1u;
+    } else if (now_play && prev != ESP_AVRC_PLAYBACK_PLAYING) {
+        s_bt_remote_ui_req = 2u;
+    }
+    portEXIT_CRITICAL(&s_bt_remote_ui_mux);
 }
 
 static void bt_avrc_play_pos_cb(uint32_t play_pos_ms);
@@ -189,8 +219,19 @@ static void bt_freeze_extrapolation_to_anchor() {
 
 static void bt_avrc_playstatus_cb(esp_avrc_playback_stat_t st) {
     const bool have_prev = (s_bt_prev_playstat_u8 != 0xffu);
-    const esp_avrc_playback_stat_t prev =
+    esp_avrc_playback_stat_t prev =
         have_prev ? (esp_avrc_playback_stat_t)s_bt_prev_playstat_u8 : st;
+    // После смены трека prev сбрасывается; телефон часто не шлёт повторный PLAYING.
+    // Без этого prev=st=PAUSED → «нет перехода» и первая пауза не зеркалится в UI.
+    if (!have_prev && s_bt_is_playing != 0u &&
+        (st == ESP_AVRC_PLAYBACK_PAUSED || st == ESP_AVRC_PLAYBACK_STOPPED)) {
+        prev = ESP_AVRC_PLAYBACK_PLAYING;
+    }
+    // Заход в плеер часто даёт track-change → prev=0xff; первый PLAYING иначе даёт prev=st=PLAYING
+    // и «глаза» не выходят из сна до второго цикла пауза/play.
+    if (!have_prev && s_bt_is_playing == 0u && st == ESP_AVRC_PLAYBACK_PLAYING) {
+        prev = ESP_AVRC_PLAYBACK_PAUSED;
+    }
 
     const bool was_extrap = (s_bt_is_playing != 0u);
     const bool is_extrap = (st == ESP_AVRC_PLAYBACK_PLAYING);
@@ -216,6 +257,8 @@ static void bt_avrc_playstatus_cb(esp_avrc_playback_stat_t st) {
         // пауза → play (не после seek)
         s_bt_anchor_wall_ms = millis();
     }
+
+    bt_remote_ui_queue_from_playstat(prev, st);
 
     s_bt_is_playing = is_extrap ? 1u : 0u;
     s_bt_prev_playstat_u8 = (uint8_t)st;
@@ -293,6 +336,9 @@ void bt_audio_stop_sink() {
     s_bt_title[0] = '\0';
     s_bt_artist[0] = '\0';
     bt_meta_bump_serial();
+    portENTER_CRITICAL(&s_bt_remote_ui_mux);
+    s_bt_remote_ui_req = 0u;
+    portEXIT_CRITICAL(&s_bt_remote_ui_mux);
     g_a2dp_sink.set_raw_stream_reader(nullptr);
     g_a2dp_sink.set_stream_reader(nullptr, true);
     g_a2dp_sink.end(true);
@@ -417,6 +463,14 @@ void bt_audio_poll_track_position() {
 
 uint32_t bt_audio_track_meta_serial() {
     return s_bt_meta_serial;
+}
+
+uint8_t bt_audio_take_remote_ui_request() {
+    portENTER_CRITICAL(&s_bt_remote_ui_mux);
+    const uint8_t v = s_bt_remote_ui_req;
+    s_bt_remote_ui_req = 0u;
+    portEXIT_CRITICAL(&s_bt_remote_ui_mux);
+    return v;
 }
 
 const char* bt_audio_track_scroll_cstr() {

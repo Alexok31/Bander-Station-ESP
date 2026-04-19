@@ -17,6 +17,7 @@ struct Data {
     int8_t station = 0;
 };
 
+extern Data data;
 extern Audio audio;
 extern const char* reconnect;
 extern volatile bool wifiConnecting;

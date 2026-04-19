@@ -901,6 +901,20 @@ void core0(void* p) {
         const bool eb_e = (!show_wake_after_sleep_anim && eb_tick);
 
         if (matrix_display_ready()) {
+            if (strcmp(g_audio_source, "bt") == 0) {
+                const uint8_t r = bt_audio_take_remote_ui_request();
+                if (r == 1u && data.state) {
+                    data.state = false;
+                    // Как при клике энкодером на паузу: не трогаем A2DP gain (иначе set_volume(0) и «нулятся» уши).
+                    syncWifiWithAudioSilence();
+                    change_state();
+                } else if (r == 2u && !data.state) {
+                    data.state = true;
+                    apply_output_volume();
+                    syncWifiWithAudioSilence();
+                    change_state();
+                }
+            }
         // Только core0 трогает MAX7219: вызов anim_search с core1 в setup() давал гонку и мигание при Wi‑Fi.
         if (show_wake_after_sleep_anim) {
             anim_search();
