@@ -8,6 +8,8 @@ void battery_update();
 void battery_force_sample();
 uint8_t battery_percent();
 uint16_t battery_millivolts();
+// Делитель с линии LED зарядки на chargingDetectPin: true, пока идёт активная зарядка.
+bool battery_is_charging();
 
 // 0 веселий (≥batteryMoodCheerfulMinPct), 1 звичайний, 2 сумний (<batteryMoodNormalMinPct).
 uint8_t battery_eye_mood();

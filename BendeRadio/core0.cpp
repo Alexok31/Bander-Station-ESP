@@ -13,6 +13,7 @@
 #include <GyverMAX7219.h>
 
 #include "battery.h"
+#include "battery_matrix.h"
 #include "BtAudio.h"
 #include "NvsConfig.h"
 #include "pong.h"
@@ -123,20 +124,9 @@ void print_val(char c, uint8_t v) {
     mtrx.update();
 }
 
-static void draw_batt_lightning_glyph() {
-    // Тонкий зигзаг (1 px), біт 7 = лівий стовпчик x=0. Увесь гліф опущено на 1 рядок вниз.
-    static const uint8_t kRows[8] = {
-        0x00,
-        0x08,  // верхня діагональ (зсув вліво на 1)
-        0x10,
-        0x20,
-        0x3C,  // x=2…5 горизонталь
-        0x04,  // x=5
-        0x08,  // x=4
-        0x10,  // x=3
-    };
+static void draw_batt_matrix_rows(const uint8_t rows[8]) {
     for (int y = 0; y < 8; y++) {
-        uint8_t b = kRows[y];
+        const uint8_t b = rows[(uint8_t)y];
         for (int x = 0; x < 8; x++) {
             if (b & (uint8_t)(1 << (7 - x))) {
                 mtrx.dot((uint8_t)x, (uint8_t)y, GFX_FILL);
@@ -145,18 +135,35 @@ static void draw_batt_lightning_glyph() {
     }
 }
 
-void print_batt(uint8_t pct) {
+static bool s_batt_matrix_overlay;
+static uint8_t s_batt_matrix_overlay_pct;
+static uint32_t s_batt_icon_step_ms;
+static uint32_t s_batt_charge_frame;
+static bool s_batt_overlay_prev_chg;
+
+static void print_batt_overlay(uint8_t pct) {
     if (!matrix_display_ready()) {
         return;
     }
     const uint8_t v = (pct > 99u) ? 99u : pct;
     mtrx.rect(0, 0, RadioConfig::analyzWidth - 1, 7, GFX_CLEAR);
-    draw_batt_lightning_glyph();
+    const bool chg = RadioConfig::chargingDetectEnable && battery_is_charging();
+    uint8_t rows[8];
+    if (chg) {
+        battery_matrix_rows_charging(v, s_batt_charge_frame, rows);
+    } else {
+        battery_matrix_rows_from_percent(v, rows);
+    }
+    draw_batt_matrix_rows(rows);
     mtrx.setCursor(8 * 1 + 2, 1);
     mtrx.print((char)('0' + (v / 10)));
     mtrx.setCursor(8 * 2 + 2, 1);
     mtrx.print((char)('0' + (v % 10)));
     mtrx.update();
+}
+
+void print_batt(uint8_t pct) {
+    print_batt_overlay(pct);
 }
 
 // ========================= EYES =========================
@@ -830,6 +837,26 @@ void core0(void* p) {
     for (;;) {
         battery_update();
         matrix_tmr.tick();
+        if (s_batt_matrix_overlay && !matrix_tmr.state()) {
+            s_batt_matrix_overlay = false;
+            s_batt_overlay_prev_chg = false;
+        }
+        if (matrix_display_ready() && s_batt_matrix_overlay && matrix_tmr.state()) {
+            const bool chg = RadioConfig::chargingDetectEnable && battery_is_charging();
+            if (chg) {
+                const uint32_t now = millis();
+                if ((uint32_t)(now - s_batt_icon_step_ms) >= RadioConfig::batteryChargeIconAnimStepMs) {
+                    s_batt_icon_step_ms = now;
+                    s_batt_charge_frame++;
+                    print_batt_overlay(s_batt_matrix_overlay_pct);
+                }
+            } else {
+                if (s_batt_overlay_prev_chg && !chg) {
+                    print_batt_overlay(s_batt_matrix_overlay_pct);
+                }
+            }
+            s_batt_overlay_prev_chg = chg;
+        }
         angry_tmr.tick();
         memory.tick();
 
@@ -953,6 +980,7 @@ void core0(void* p) {
                         mtrx.update();
                     } else if (n == 7) {
                         wifi_ap_toggle_from_core0();
+                        s_batt_matrix_overlay = false;
                         matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
                     }
                 }
@@ -1094,7 +1122,12 @@ void core0(void* p) {
                         case 5:
                             if (RadioConfig::batteryMonitorEnable) {
                                 battery_force_sample();
-                                print_batt(battery_percent());
+                                s_batt_matrix_overlay = true;
+                                s_batt_matrix_overlay_pct = battery_percent();
+                                s_batt_charge_frame = 0u;
+                                s_batt_icon_step_ms = millis();
+                                s_batt_overlay_prev_chg = battery_is_charging();
+                                print_batt_overlay(s_batt_matrix_overlay_pct);
                                 matrix_tmr.start((uint16_t)RadioConfig::batteryPercentShowDurationMs);
                             }
                             break;
@@ -1108,6 +1141,7 @@ void core0(void* p) {
                             break;
                         case 7:
                             wifi_ap_toggle_from_core0();
+                            s_batt_matrix_overlay = false;
                             matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
                             break;
                     }
@@ -1131,6 +1165,7 @@ void core0(void* p) {
                                     data.station =
                                         constrain(data.station, 0, sizeof(stations) / sizeof(char*) - 1);
                                     print_val('s', data.station);
+                                    s_batt_matrix_overlay = false;
                                     matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
                                     station_changed = 1;
                                 }
@@ -1181,6 +1216,7 @@ void core0(void* p) {
                             apply_output_volume();
                             syncWifiWithAudioSilence();
                             print_val('v', data.vol);
+                            s_batt_matrix_overlay = false;
                             matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
                         }
                     }

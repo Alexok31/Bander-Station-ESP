@@ -64,6 +64,19 @@ class RadioConfig {
     static constexpr uint32_t batterySampleIntervalMs = 180000;  // 3 мин
     // 4 кліки: % АКБ на «роті»; скільки мс показувати (потім зникає).
     static constexpr uint32_t batteryPercentShowDurationMs = 3000;
+    // Линия индикации зарядки IP2326 (через делитель 68k/100k): HIGH ≈ идёт зарядка, LOW ≈ завершена.
+    static constexpr bool chargingDetectEnable = true;
+    static constexpr uint8_t chargingDetectPin = 33;
+    // Крок анімації заливки батареї (мс на кадр; кадр = лічильник для battery_matrix_rows_charging).
+    static constexpr uint16_t batteryChargeIconAnimStepMs = 420;
+    // Повна заливка внутрішньої зони 8×8 батареї лише при pct > цього (див. battery_matrix.cpp).
+    static constexpr uint8_t batteryMatrixFullMinPct = 95;
+    // true — віддзеркалити батарею по вертикалі (ряд 0 ↔ 7).
+    static constexpr bool batteryMatrixInvertY = false;
+    // Під час зарядки напруга на пакеті завищена — % з напруги «стрибає» вгору. Якщо true: від якоря
+    // (останній % у момент появи зарядки) показ не росте швидше за N відсотків на хвилину.
+    static constexpr bool batteryChargeSocCapEnable = true;
+    static constexpr uint8_t batteryChargeSocMaxRisePerMinute = 4;
     // 6 кликов: вкл/выкл точку доступа (SoftAP) для веб-настройки, если STA уже подключён; без STA при работающем AP не отключается.
     // Станція / гучність на роті — фіксований період matrix_tmr (не довше за batteryPercentShowDurationMs після батареї).
     static constexpr uint16_t matrixOverlayDigitsMs = 1000;
