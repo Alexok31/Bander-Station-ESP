@@ -19,3 +19,13 @@ void bt_audio_avrcp_pause();
 void bt_audio_avrcp_play();
 void bt_audio_avrcp_next();
 void bt_audio_avrcp_previous();
+
+// Для режима рта «прогресс трека» (AVRCP): длительность из метаданных, позиция из RN (не все телефоны шлют).
+uint32_t bt_audio_track_duration_ms();
+uint32_t bt_audio_track_position_ms();
+// Повторно зарегистрировать AVRCP PLAY_POS_CHANGED — часто приходит interim с текущей позицией (мс).
+void bt_audio_poll_track_position();
+
+// Метаданные для бегущей строки (UTF-8). serial меняется при смене title/artist или трека — сброс прокрутки.
+uint32_t bt_audio_track_meta_serial();
+const char* bt_audio_track_scroll_cstr();

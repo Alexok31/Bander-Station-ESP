@@ -338,6 +338,67 @@ static void analyz_eq_bars(uint8_t v_gate, bool invert) {
     }
 }
 
+// Режим 5: бегущая строка (Gyver print) + таймлайн на нижнем ряду (без отступа между ними).
+static void analyz_bt_track_progress(bool invert) {
+    const int W = RadioConfig::analyzWidth;
+    static uint32_t s_bt_marquee_serial = 0xFFFFFFFFu;
+    static int16_t s_bt_marquee_x = (int16_t)RadioConfig::analyzWidth;
+    static uint32_t s_bt_marquee_adv_ms = 0;
+
+    if (strcmp(g_audio_source, "bt") == 0) {
+        const uint32_t ser = bt_audio_track_meta_serial();
+        if (ser != s_bt_marquee_serial) {
+            s_bt_marquee_serial = ser;
+            s_bt_marquee_x = (int16_t)W;
+        }
+        const char* const line = bt_audio_track_scroll_cstr();
+        const uint32_t now_ms = millis();
+        // ~84 ms на пиксель — в 2 раза медленнее прежних ~42 ms.
+        constexpr uint32_t kBtMarqueeMsPerPx = 84u;
+        if ((uint32_t)(now_ms - s_bt_marquee_adv_ms) >= kBtMarqueeMsPerPx) {
+            s_bt_marquee_adv_ms = now_ms;
+            s_bt_marquee_x--;
+        }
+        const int text_px = (int)strlen(line) * 6 + W + 16;
+        if (s_bt_marquee_x < -text_px) {
+            s_bt_marquee_x = (int16_t)W;
+        }
+        mtrx.setScale(1);
+        mtrx.invertText(invert);
+        mtrx.setTextBound(0, W - 1);
+        mtrx.setCursor((int)s_bt_marquee_x, 0);
+        mtrx.print(line);
+        mtrx.resetTextBound();
+        mtrx.invertText(false);
+    }
+
+    const int y = 7;
+    for (int x = 0; x < W; x++) {
+        mtrx.dot(x, y, mouth_gfx_on(invert));
+    }
+    uint32_t dur = bt_audio_track_duration_ms();
+    uint32_t pos = bt_audio_track_position_ms();
+    int gx = 0;
+    if (dur > 1u) {
+        if (pos >= dur) {
+            pos = dur - 1u;
+        }
+        gx = (int)((uint64_t)pos * (uint64_t)(W - 1) / (uint64_t)dur);
+    }
+    if (gx < 0) {
+        gx = 0;
+    }
+    if (gx >= W) {
+        gx = W - 1;
+    }
+    // Маркер позиции мигает (~2 Гц), чтобы было заметнее на статичной дорожке.
+    constexpr uint32_t kBtProgBlinkHalfMs = 250u;
+    const bool show_pos_marker = ((millis() / kBtProgBlinkHalfMs) & 1u) == 0u;
+    if (show_pos_marker) {
+        mtrx.dot((uint8_t)gx, (uint8_t)y, mouth_gfx_off(invert));
+    }
+}
+
 void analyz0(uint8_t vol, bool invert) {
     static float phi;
     static float phi_chaos;
@@ -937,15 +998,15 @@ void core0(void* p) {
                 }
             }
 
-            // Режимы рта 0…4: волна / волна инв. / EQ / рот / рот инв.
-            if (data.mode > 4) {
+            // Режимы рта 0…5: волна / волна инв. / EQ / рот / рот инв. / прогресс трека (BT).
+            if (data.mode > 5) {
                 data.mode = 0;
             }
             if (s_mode_pick_active) {
                 upd_bright();
                 draw_mode_pick_mouth();
                 mtrx.update();
-            } else if (viz_tmr && !matrix_tmr.state() && data.state && data.mode <= 4) {
+            } else if (viz_tmr && !matrix_tmr.state() && data.state && data.mode <= 5) {
                 const uint8_t vol = pcm_vis_after_noise_gate(g_pcm_vis);
                 if (vol > pcm_pulse_l + 12) {
                     pulse = 1;
@@ -970,6 +1031,9 @@ void core0(void* p) {
                         break;
                     case 4:
                         analyz_mouth_robot_backup(v_mouth, true);
+                        break;
+                    case 5:
+                        analyz_bt_track_progress(mouth_invert);
                         break;
                     default:
                         data.mode = 0;
@@ -1060,7 +1124,7 @@ void core0(void* p) {
                             case 1: {
                                 const int8_t d = eb.dir();
                                 int m = (int)data.mode + (int)d;
-                                m = (m % 5 + 5) % 5;
+                                m = (m % 6 + 6) % 6;
                                 data.mode = (uint8_t)m;
                                 break;
                             }
