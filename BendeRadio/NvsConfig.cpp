@@ -56,3 +56,119 @@ String nvsEffectiveApPass(const WifiStored& w) {
     }
     return String(RadioConfig::apPassDefault);
 }
+
+void nvsLoadCustomStations(String* outStations, uint8_t capacity, uint8_t& outCount) {
+    outCount = 0;
+    if (outStations == nullptr || capacity == 0) {
+        return;
+    }
+    Preferences p;
+    if (!p.begin(kNs, true)) {
+        return;
+    }
+    uint8_t cnt = p.getUChar("st_cnt", 0u);
+    if (cnt > capacity) {
+        cnt = capacity;
+    }
+    for (uint8_t i = 0; i < cnt; i++) {
+        char key[8];
+        snprintf(key, sizeof(key), "st%u", (unsigned)i);
+        String v = p.getString(key, "");
+        v.trim();
+        if (v.length() == 0) {
+            continue;
+        }
+        outStations[outCount++] = v;
+    }
+    p.end();
+}
+
+void nvsSaveCustomStations(const String* stations, uint8_t count) {
+    if (stations == nullptr) {
+        return;
+    }
+    if (count > RadioConfig::customStationMaxCount) {
+        count = RadioConfig::customStationMaxCount;
+    }
+    Preferences p;
+    if (!p.begin(kNs, false)) {
+        return;
+    }
+    p.putUChar("st_cnt", count);
+    for (uint8_t i = 0; i < RadioConfig::customStationMaxCount; i++) {
+        char key[8];
+        snprintf(key, sizeof(key), "st%u", (unsigned)i);
+        if (i < count) {
+            p.putString(key, stations[i]);
+        } else {
+            p.remove(key);
+        }
+    }
+    p.end();
+}
+
+void nvsLoadMatrixBrightnessTrim(int8_t* outTrim, uint8_t count) {
+    if (outTrim == nullptr || count == 0) {
+        return;
+    }
+    for (uint8_t i = 0; i < count; i++) {
+        outTrim[i] = 0;
+    }
+    Preferences p;
+    if (!p.begin(kNs, true)) {
+        return;
+    }
+    for (uint8_t i = 0; i < count; i++) {
+        char key[8];
+        snprintf(key, sizeof(key), "mbr%u", (unsigned)i);
+        const int v = p.getChar(key, 0);
+        outTrim[i] = (int8_t)constrain(v, (int)RadioConfig::matrixBrightnessTrimMin,
+                                        (int)RadioConfig::matrixBrightnessTrimMax);
+    }
+    p.end();
+}
+
+void nvsSaveMatrixBrightnessTrim(const int8_t* trim, uint8_t count) {
+    if (trim == nullptr || count == 0) {
+        return;
+    }
+    Preferences p;
+    if (!p.begin(kNs, false)) {
+        return;
+    }
+    for (uint8_t i = 0; i < count; i++) {
+        char key[8];
+        snprintf(key, sizeof(key), "mbr%u", (unsigned)i);
+        const int v = constrain((int)trim[i], (int)RadioConfig::matrixBrightnessTrimMin,
+                                (int)RadioConfig::matrixBrightnessTrimMax);
+        p.putChar(key, (int8_t)v);
+    }
+    p.end();
+}
+
+bool nvsTakePendingBrightnessOverride(uint8_t& outValue) {
+    Preferences p;
+    if (!p.begin(kNs, false)) {
+        return false;
+    }
+    const bool has = p.isKey("br_ovr");
+    if (!has) {
+        p.end();
+        return false;
+    }
+    int v = p.getUChar("br_ovr", 8u);
+    v = constrain(v, 0, 15);
+    outValue = (uint8_t)v;
+    p.remove("br_ovr");
+    p.end();
+    return true;
+}
+
+void nvsSetPendingBrightnessOverride(uint8_t value) {
+    Preferences p;
+    if (!p.begin(kNs, false)) {
+        return;
+    }
+    p.putUChar("br_ovr", (uint8_t)constrain((int)value, 0, 15));
+    p.end();
+}

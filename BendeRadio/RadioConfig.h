@@ -10,7 +10,7 @@ class RadioConfig {
     static constexpr const char* wifiPass = "cassini31";
 
     // Точка доступа ESP для настройки: подключитесь к ней и откройте http://192.168.4.1
-    static constexpr const char* apSsid = "BendeRadio";
+    static constexpr const char* apSsid = "Bender Station";
     // Пароль AP не короче 8 символов (WPA2). Пустая строка = открытая сеть (только для отладки).
     static constexpr const char* apPassDefault = "benderadio";
 
@@ -18,7 +18,7 @@ class RadioConfig {
     static constexpr uint8_t i2sBclk = 27;
     static constexpr uint8_t i2sLrc = 26;
     // Имя Bluetooth A2DP sink (телефон увидит это в списке сопряжения).
-    static constexpr const char* btSinkName = "Bender";
+    static constexpr const char* btSinkName = "Bender Station";
     // Автоподключение к последнему телефону: пауза перед первым reconnect из loop; интервал повторов.
     static constexpr uint32_t btReconnectFirstDelayMs = 1200;
     static constexpr uint32_t btReconnectRetryMs = 2500;
@@ -36,6 +36,11 @@ class RadioConfig {
     static constexpr uint8_t mtrxCs = 22;
     static constexpr uint8_t mtrxDat = 23;
     static constexpr uint8_t mtrxClk = 21;
+    static constexpr uint8_t matrixModuleCount = 5;
+    // Калибровка модулей как абсолютный offset от минимального (0..15).
+    // Итоговая яркость каждого модуля = base + offset[i], где base двигается энкодером.
+    static constexpr int8_t matrixBrightnessTrimMin = 0;
+    static constexpr int8_t matrixBrightnessTrimMax = 15;
 
     static constexpr uint8_t encS1 = 19;
     static constexpr uint8_t encS2 = 18;
@@ -174,6 +179,8 @@ class RadioConfig {
     static constexpr uint32_t coldStartBeforeWifiMs = 400;
     // Пауза перед esp_restart() при смене источника (Wi‑Fi/BT) — снижает артефакты матрицы при быстром переключении.
     static constexpr uint16_t modeSwitchRestartDelayMs = 2000;
+    // Количество пользовательских URL интернет-радио, которые можно хранить через Web UI.
+    static constexpr uint8_t customStationMaxCount = 16;
 
     // Перед паузой/сменой станции: сколько мс выводить «тишину» в I2S (gain ramp), пока декодер ещё идёт —
     // иначе DMA останавливается и на усилителе часто слышен ВЧ-писк.

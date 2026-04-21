@@ -28,6 +28,9 @@ void core0(void *p);
 void syncWifiWithAudioSilence();
 void wifi_touch_activity();
 void wifi_ap_toggle_from_core0();
+void matrix_get_brightness_trim(int8_t* outTrim, uint8_t count);
+void matrix_set_brightness_trim(const int8_t* trim, uint8_t count, bool persist);
+uint8_t matrix_get_base_brightness();
 
 // Источник звука: "wifi" (интернет-радио) или "bt" (Bluetooth A2DP). NVS "bende"/"aud". Смена через NVS + перезагрузка.
 extern char g_audio_source[8];

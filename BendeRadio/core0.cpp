@@ -34,6 +34,39 @@ const char* stations[] = {
     "http://prmstrm.1.fm:8000/x",
     "http://stream81.metacast.eu/radio1rock128",
 };
+static constexpr uint8_t kStationBuiltInCount = (uint8_t)(sizeof(stations) / sizeof(stations[0]));
+static String s_custom_stations[RadioConfig::customStationMaxCount];
+static uint8_t s_custom_station_count = 0;
+static int8_t s_matrix_brightness_trim[RadioConfig::matrixModuleCount] = {0, 0, 0, 0, 0};
+static volatile bool s_matrix_brightness_trim_dirty = false;
+extern Data data;
+
+static uint8_t station_total_count() {
+    return (uint8_t)(kStationBuiltInCount + s_custom_station_count);
+}
+
+static const char* station_url_by_index(int idx) {
+    if (idx < 0) {
+        return stations[0];
+    }
+    if (idx < (int)kStationBuiltInCount) {
+        return stations[(uint8_t)idx];
+    }
+    const int custom_idx = idx - (int)kStationBuiltInCount;
+    if (custom_idx >= 0 && custom_idx < (int)s_custom_station_count) {
+        return s_custom_stations[(uint8_t)custom_idx].c_str();
+    }
+    return stations[0];
+}
+
+static void station_clamp_index() {
+    const int total = (int)station_total_count();
+    if (total <= 0) {
+        data.station = 0;
+        return;
+    }
+    data.station = constrain(data.station, 0, total - 1);
+}
 
 // data
 MAX7219<5, 1, RadioConfig::mtrxCs, RadioConfig::mtrxDat, RadioConfig::mtrxClk> mtrx;
@@ -64,10 +97,72 @@ static inline bool matrix_display_ready() {
 
 // func
 // ========================= MATRIX =========================
+static void matrix_apply_brightness(int base) {
+    uint8_t br[RadioConfig::matrixModuleCount];
+    for (uint8_t i = 0; i < RadioConfig::matrixModuleCount; i++) {
+        const int v = constrain(base + (int)s_matrix_brightness_trim[i], 0, 15);
+        br[i] = (uint8_t)v;
+    }
+    mtrx.setBright(br);
+}
+
+static int matrix_max_offset() {
+    int m = 0;
+    for (uint8_t i = 0; i < RadioConfig::matrixModuleCount; i++) {
+        if ((int)s_matrix_brightness_trim[i] > m) {
+            m = (int)s_matrix_brightness_trim[i];
+        }
+    }
+    return m;
+}
+
+static int matrix_base_max() {
+    const int v = 15 - matrix_max_offset();
+    return (v < 0) ? 0 : v;
+}
+
 void upd_bright() {
-    const int v = max((int)data.bright_mouth, (int)data.bright_eyes);
-    const int b = constrain(v, 0, 15);
-    mtrx.setBright(b);
+    // Пауза / «спящие» глаза: базовая яркость 0 — каждая матрица только по своему offset калибровки.
+    if (!data.state) {
+        matrix_apply_brightness(0);
+        return;
+    }
+    int v = max((int)data.bright_mouth, (int)data.bright_eyes);
+    v = constrain(v, 0, matrix_base_max());
+    data.bright_mouth = (int8_t)v;
+    data.bright_eyes = (int8_t)v;
+    matrix_apply_brightness(v);
+}
+
+uint8_t matrix_get_base_brightness() {
+    const int v = constrain(max((int)data.bright_mouth, (int)data.bright_eyes), 0, matrix_base_max());
+    return (uint8_t)v;
+}
+
+void matrix_get_brightness_trim(int8_t* outTrim, uint8_t count) {
+    if (outTrim == nullptr || count == 0) {
+        return;
+    }
+    const uint8_t n = (count < RadioConfig::matrixModuleCount) ? count : RadioConfig::matrixModuleCount;
+    for (uint8_t i = 0; i < n; i++) {
+        outTrim[i] = s_matrix_brightness_trim[i];
+    }
+}
+
+void matrix_set_brightness_trim(const int8_t* trim, uint8_t count, bool persist) {
+    if (trim == nullptr || count == 0) {
+        return;
+    }
+    const uint8_t n = (count < RadioConfig::matrixModuleCount) ? count : RadioConfig::matrixModuleCount;
+    for (uint8_t i = 0; i < n; i++) {
+        s_matrix_brightness_trim[i] =
+            (int8_t)constrain((int)trim[i], (int)RadioConfig::matrixBrightnessTrimMin,
+                              (int)RadioConfig::matrixBrightnessTrimMax);
+    }
+    if (persist) {
+        nvsSaveMatrixBrightnessTrim(s_matrix_brightness_trim, RadioConfig::matrixModuleCount);
+    }
+    s_matrix_brightness_trim_dirty = true;
 }
 
 // Глиф 5×7 внутри одной 8×8-клетки (модуль MAX7219): строка = 5 бит, старший бит — левый столбец.
@@ -256,7 +351,9 @@ void change_state() {
         draw_eyeb(0, 2, 2, 4);
         draw_eyeb(1, 2, 2, 4);
     } else {
-        mtrx.setBright((uint8_t)0);
+        // Даже в «спящем» режиме используем общую яркость + per-module trim
+        // (иначе калибровка глаз не видна).
+        upd_bright();
         draw_eyes_radio_idle_off();
     }
     mtrx.update();
@@ -759,6 +856,15 @@ void core0(void* p) {
 
     EEPROM.begin(memory.blockSize());
     memory.begin(0, 'b');
+    {
+        uint8_t b = 0;
+        if (nvsTakePendingBrightnessOverride(b)) {
+            data.bright_eyes = (int8_t)b;
+            data.bright_mouth = (int8_t)b;
+        }
+    }
+    nvsLoadCustomStations(s_custom_stations, RadioConfig::customStationMaxCount, s_custom_station_count);
+    nvsLoadMatrixBrightnessTrim(s_matrix_brightness_trim, RadioConfig::matrixModuleCount);
 
     {
         uint32_t matrixPreDelay = RadioConfig::matrixPowerStabilizeBeforeBeginMs;
@@ -823,8 +929,8 @@ void core0(void* p) {
     audio.setBufsize(RadioConfig::radioBuffer, -1);
     audio.setPinout(RadioConfig::i2sBclk, RadioConfig::i2sLrc, RadioConfig::i2sDout);
     apply_output_volume();
-    data.station = constrain(data.station, 0, sizeof(stations) / sizeof(char*) - 1);
-    reconnect = stations[data.station];
+    station_clamp_index();
+    reconnect = station_url_by_index(data.station);
 
     battery_init();
 
@@ -837,6 +943,10 @@ void core0(void* p) {
 
     // ========================= LOOP =========================
     for (;;) {
+        if (s_matrix_brightness_trim_dirty && matrix_display_ready()) {
+            s_matrix_brightness_trim_dirty = false;
+            upd_bright();
+        }
         battery_update();
         matrix_tmr.tick();
         if (s_batt_matrix_overlay && !matrix_tmr.state()) {
@@ -1041,6 +1151,7 @@ void core0(void* p) {
                 }
             } else {
                 if (eye_tmr) {
+                    upd_bright();
                     // Радио выкл.: рот не визуализируется — после оверлея батареи (matrix_tmr) цифры иначе не снимаются.
                     if (!matrix_tmr.state()) {
                         mtrx.rect(0, 0, RadioConfig::analyzWidth - 1, 7, GFX_CLEAR);
@@ -1114,7 +1225,7 @@ void core0(void* p) {
                                 }
                             } else {
                                 if (strcmp(g_audio_source, "wifi") == 0) {
-                                    reconnect = stations[data.station];
+                                    reconnect = station_url_by_index(data.station);
                                 }
                                 if (strcmp(g_audio_source, "bt") == 0) {
                                     bt_audio_avrcp_play();
@@ -1173,8 +1284,7 @@ void core0(void* p) {
                                     }
                                 } else {
                                     data.station += eb.dir();
-                                    data.station =
-                                        constrain(data.station, 0, sizeof(stations) / sizeof(char*) - 1);
+                                    station_clamp_index();
                                     print_val('s', data.station);
                                     s_batt_matrix_overlay = false;
                                     matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
@@ -1191,7 +1301,7 @@ void core0(void* p) {
                             case 2: {
                                 const int8_t d = eb.dir();
                                 int v = max((int)data.bright_mouth, (int)data.bright_eyes) + (int)d;
-                                v = constrain(v, 0, 15);
+                                v = constrain(v, 0, matrix_base_max());
                                 data.bright_mouth = (int8_t)v;
                                 data.bright_eyes = (int8_t)v;
                                 upd_bright();
@@ -1249,7 +1359,7 @@ void core0(void* p) {
                     }
                     if (station_changed) {
                         station_changed = 0;
-                        reconnect = stations[data.station];
+                        reconnect = station_url_by_index(data.station);
                     }
                     s_bt_forget_pair_hold_ready = false;
                 }
