@@ -68,6 +68,14 @@ class RadioConfig {
     static constexpr uint8_t batteryMoodCheerfulMinPct = 70;
     static constexpr uint8_t batteryMoodNormalMinPct = 30;
     static constexpr uint32_t batterySampleIntervalMs = 180000;  // 3 мин
+    // Ниже этого % опрашиваем АКБ чаще (batteryLowSampleIntervalMs) — для порога выключения и стабильности.
+    static constexpr uint8_t batteryLowAttentionPercent = 10;
+    static constexpr uint32_t batteryLowSampleIntervalMs = 5000;
+    // Ниже порога без зарядки: глубокий сон без источников пробуждения (меньше тока, чем цикл Brownout).
+    static constexpr bool batteryShutdownEnable = true;
+    static constexpr uint8_t batteryShutdownBelowPercent = 5;
+    // Подряд столько замеров (с интервалом выше) должны быть < порога — защита от шума АЦП.
+    static constexpr uint8_t batteryShutdownConsecutiveSamples = 2;
     // 4 кліки: % АКБ на «роті»; скільки мс показувати (потім зникає).
     static constexpr uint32_t batteryPercentShowDurationMs = 3000;
     // Линия индикации зарядки IP2326 (через делитель 68k/100k): HIGH ≈ идёт зарядка, LOW ≈ завершена.

@@ -10,6 +10,7 @@ extern Data data;
 static uint32_t s_last_sample_ms;
 static uint16_t s_smooth_mv;
 static uint8_t s_percent;
+static bool s_gauge_ready;
 
 static bool s_chg_prev_for_soc;
 static uint8_t s_charge_soc_anchor_pct;
@@ -28,6 +29,7 @@ void battery_init() {
     s_last_sample_ms = 0;
     s_smooth_mv = 0;
     s_percent = 0;
+    s_gauge_ready = false;
     s_chg_prev_for_soc = false;
     s_charge_soc_anchor_pct = 0;
     s_charge_soc_anchor_ms = 0;
@@ -101,6 +103,7 @@ static void battery_sample_apply() {
     }
     s_percent = (uint8_t)p;
     s_chg_prev_for_soc = chg;
+    s_gauge_ready = true;
 }
 
 void battery_force_sample() {
@@ -111,19 +114,30 @@ void battery_force_sample() {
     s_last_sample_ms = millis();
 }
 
-void battery_update() {
+bool battery_gauge_ready() {
+    return RadioConfig::batteryMonitorEnable && s_gauge_ready;
+}
+
+bool battery_update() {
     if (!RadioConfig::batteryMonitorEnable) {
-        return;
+        return false;
     }
     const uint32_t now = millis();
-    const uint32_t interval = (!data.state && RadioConfig::batterySampleIntervalIdleMs > 0)
-                                  ? RadioConfig::batterySampleIntervalIdleMs
-                                  : RadioConfig::batterySampleIntervalMs;
+    uint32_t interval = (!data.state && RadioConfig::batterySampleIntervalIdleMs > 0)
+                            ? RadioConfig::batterySampleIntervalIdleMs
+                            : RadioConfig::batterySampleIntervalMs;
+    if (s_gauge_ready && s_percent < RadioConfig::batteryLowAttentionPercent) {
+        if (RadioConfig::batteryLowSampleIntervalMs > 0 &&
+            interval > RadioConfig::batteryLowSampleIntervalMs) {
+            interval = RadioConfig::batteryLowSampleIntervalMs;
+        }
+    }
     if ((uint32_t)(now - s_last_sample_ms) < interval) {
-        return;
+        return false;
     }
     s_last_sample_ms = now;
     battery_sample_apply();
+    return true;
 }
 
 uint8_t battery_percent() {

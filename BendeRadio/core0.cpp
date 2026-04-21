@@ -235,6 +235,7 @@ static uint8_t s_batt_matrix_overlay_pct;
 static uint32_t s_batt_icon_step_ms;
 static uint32_t s_batt_charge_frame;
 static bool s_batt_overlay_prev_chg;
+static uint8_t s_batt_shutdown_consecutive;
 
 static void print_batt_overlay(uint8_t pct) {
     if (!matrix_display_ready()) {
@@ -835,6 +836,38 @@ static void apply_output_volume() {
     }
 }
 
+// Критический заряд: уводим в deep sleep без wake sources — меньше ток, чем у «живой» прошивки
+// (типичный цикл: Brownout → reset → снова нагрузка → снова Brownout).
+static void low_battery_enter_deep_sleep_forever() {
+    data.state = false;
+    if (strcmp(g_audio_source, "wifi") == 0) {
+        audio.setVolume(0);
+        if (audio.isRunning()) {
+            audio.stopSong();
+        }
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+    } else {
+        bt_audio_volume_apply(false, 0);
+        bt_audio_stop_sink();
+        WiFi.mode(WIFI_OFF);
+    }
+    delay(120);
+    uint8_t br_off[] = {0, 0, 0, 0, 0};
+    mtrx.setBright(br_off);
+    mtrx.clear();
+    mtrx.update();
+    (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT0);
+    (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT1);
+    (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+    (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TOUCHPAD);
+#if defined(ESP_SLEEP_WAKEUP_ULP)
+    (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ULP);
+#endif
+    esp_deep_sleep_start();
+    delay(1000);
+}
+
 void core0(void* p) {
     // ========================= SETUP =========================
     EncButton eb(RadioConfig::encS1, RadioConfig::encS2, RadioConfig::encBtn);
@@ -947,7 +980,19 @@ void core0(void* p) {
             s_matrix_brightness_trim_dirty = false;
             upd_bright();
         }
-        battery_update();
+        const bool batt_sampled = battery_update();
+        if (batt_sampled && RadioConfig::batteryShutdownEnable && RadioConfig::batteryMonitorEnable &&
+            battery_gauge_ready()) {
+            if (battery_is_charging()) {
+                s_batt_shutdown_consecutive = 0;
+            } else if (battery_percent() < RadioConfig::batteryShutdownBelowPercent) {
+                if (++s_batt_shutdown_consecutive >= RadioConfig::batteryShutdownConsecutiveSamples) {
+                    low_battery_enter_deep_sleep_forever();
+                }
+            } else {
+                s_batt_shutdown_consecutive = 0;
+            }
+        }
         matrix_tmr.tick();
         if (s_batt_matrix_overlay && !matrix_tmr.state()) {
             s_batt_matrix_overlay = false;
