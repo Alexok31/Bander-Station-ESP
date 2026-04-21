@@ -8,6 +8,8 @@ void bt_audio_stop_sink();
 bool bt_audio_is_sink_running();
 // Sink запущен, но A2DP ещё не подключён — можно показывать ожидание (бегающие глаза).
 bool bt_audio_needs_pairing_ui();
+// Сбросить сохранённые BT-сопряжения и заново запустить sink в режиме поиска нового устройства (без reboot).
+void bt_audio_forget_paired_devices();
 // Периодически вызывать из loop в режиме BT: отложенные попытки reconnect к последнему устройству.
 void bt_audio_tick();
 

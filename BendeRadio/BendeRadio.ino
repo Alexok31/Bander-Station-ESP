@@ -24,7 +24,7 @@ void commitSourceModeSwitch(const char* new_mode) {
     prefs.putString("aud", new_mode);
     prefs.putBool("wmrst", true);
     prefs.end();
-    delay(100);
+    delay(RadioConfig::modeSwitchRestartDelayMs);
     esp_restart();
 }
 

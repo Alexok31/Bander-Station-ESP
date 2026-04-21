@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <esp_avrc_api.h>
+#include <esp_system.h>
 #include <esp_idf_version.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/portmacro.h>
@@ -287,7 +288,7 @@ static void bt_a2dp_pcm_raw_cb(const uint8_t* data, uint32_t len) {
 static uint32_t s_bt_next_reconnect_ms = 0;
 static uint8_t s_bt_reconnect_attempts = 0;
 
-void bt_audio_start_sink() {
+static void bt_audio_start_sink_impl(bool reconnect_last_device) {
     if (g_sink_running) {
         return;
     }
@@ -311,9 +312,13 @@ void bt_audio_start_sink() {
     g_a2dp_sink.set_avrc_rn_play_pos_callback(bt_avrc_play_pos_cb, 1);
     g_a2dp_sink.set_avrc_rn_playstatus_callback(bt_avrc_playstatus_cb);
     g_a2dp_sink.set_avrc_rn_track_change_callback(bt_avrc_track_change_cb);
-    // Второй аргумент true — autoreconnect + last BDA из NVS (см. BluetoothA2DPSink::start(name, bool)).
-    g_a2dp_sink.start(RadioConfig::btSinkName, true);
+    // Второй аргумент: autoreconnect + last BDA из NVS (если true).
+    g_a2dp_sink.start(RadioConfig::btSinkName, reconnect_last_device);
     g_sink_running = true;
+}
+
+void bt_audio_start_sink() {
+    bt_audio_start_sink_impl(true);
 }
 
 void bt_audio_stop_sink() {
@@ -345,6 +350,11 @@ void bt_audio_stop_sink() {
     g_sink_running = false;
     s_bt_next_reconnect_ms = 0;
     s_bt_reconnect_attempts = 0;
+}
+
+void bt_audio_forget_paired_devices() {
+    g_a2dp_sink.disconnect();
+    g_a2dp_sink.set_auto_reconnect(false);
 }
 
 bool bt_audio_is_sink_running() {

@@ -754,6 +754,8 @@ void core0(void* p) {
     static uint32_t enc_btn_press_ms = 0;
     // Удерж.+поворот (станция/яркость/громкость): не трактовать как длинное удержание → сон / restart.
     static bool s_enc_hold_had_turn_while_pressed = false;
+    // BT: 4 клика + удержание без поворота — сброс сопряжений и вход в поиск нового телефона.
+    static bool s_bt_forget_pair_hold_ready = false;
 
     EEPROM.begin(memory.blockSize());
     memory.begin(0, 'b');
@@ -899,10 +901,13 @@ void core0(void* p) {
         if (eb_tick && eb.press()) {
             enc_btn_press_ms = millis();
             s_enc_hold_had_turn_while_pressed = false;
+            s_bt_forget_pair_hold_ready = false;
         }
         if (eb_tick && eb.release()) {
             const uint32_t dur = millis() - enc_btn_press_ms;
-            if (!s_enc_hold_had_turn_while_pressed && dur >= RadioConfig::encoderSleepHoldMs &&
+            // Сон только для «чистого» удержания кнопки без предшествующей серии кликов.
+            if (!s_enc_hold_had_turn_while_pressed && eb.getClicks() == 0 &&
+                dur >= RadioConfig::encoderSleepHoldMs &&
                 dur < RadioConfig::encoderHardResetHoldMs) {
                 memory.update();
                 if (data.state) {
@@ -926,6 +931,11 @@ void core0(void* p) {
         }
         // Энкодер не глушим на время STA-подключения — иначе жест «4 клика + поворот» не работает до ~25 с.
         const bool eb_e = (!show_wake_after_sleep_anim && eb_tick);
+        if (eb_tick && eb.pressing() && !s_enc_hold_had_turn_while_pressed &&
+            strcmp(g_audio_source, "bt") == 0 && eb.getClicks() == 3 &&
+            eb.pressFor() >= RadioConfig::btForgetPairedHoldMs) {
+            s_bt_forget_pair_hold_ready = true;
+        }
 
         if (matrix_display_ready()) {
             if (strcmp(g_audio_source, "bt") == 0) {
@@ -1150,6 +1160,7 @@ void core0(void* p) {
                 if (eb.turn()) {
                     if (eb.pressing()) {
                         s_enc_hold_had_turn_while_pressed = true;
+                        s_bt_forget_pair_hold_ready = false;
                         // getClicks() при удержании = число уже завершённых кликов в серии:
                         // 0 — один клик + поворот; 1 — двойной; 2 — тройной (яркость); 3 — четверной (Wi‑Fi / Bluetooth).
                         switch (eb.getClicks()) {
@@ -1223,6 +1234,12 @@ void core0(void* p) {
                 }
 
                 if (eb.release()) {
+                    if (s_bt_forget_pair_hold_ready) {
+                        s_bt_forget_pair_hold_ready = false;
+                        if (strcmp(g_audio_source, "bt") == 0) {
+                            bt_audio_forget_paired_devices();
+                        }
+                    }
                     if (s_mode_pick_active) {
                         s_mode_pick_active = false;
                         if (strcmp(s_mode_pick_choice, g_audio_source) != 0) {
@@ -1234,13 +1251,15 @@ void core0(void* p) {
                         station_changed = 0;
                         reconnect = stations[data.station];
                     }
+                    s_bt_forget_pair_hold_ready = false;
                 }
                 memory.update();
             }
         }
         }
 
-        if (eb_tick && eb.pressing() && !s_enc_hold_had_turn_while_pressed &&
+        // Hard reset только для «чистого» удержания без серии кликов.
+        if (eb_tick && eb.pressing() && !s_enc_hold_had_turn_while_pressed && eb.getClicks() == 0 &&
             eb.pressFor() >= RadioConfig::encoderHardResetHoldMs) {
             ESP.restart();
         }

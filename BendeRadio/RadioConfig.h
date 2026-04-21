@@ -18,13 +18,13 @@ class RadioConfig {
     static constexpr uint8_t i2sBclk = 27;
     static constexpr uint8_t i2sLrc = 26;
     // Имя Bluetooth A2DP sink (телефон увидит это в списке сопряжения).
-    static constexpr const char* btSinkName = "BendeRadio";
+    static constexpr const char* btSinkName = "Bender";
     // Автоподключение к последнему телефону: пауза перед первым reconnect из loop; интервал повторов.
-    static constexpr uint32_t btReconnectFirstDelayMs = 4500;
-    static constexpr uint32_t btReconnectRetryMs = 6000;
+    static constexpr uint32_t btReconnectFirstDelayMs = 1200;
+    static constexpr uint32_t btReconnectRetryMs = 2500;
     static constexpr uint8_t btReconnectBurstCount = 16;
     // Пауза внутри ESP32-A2DP при наличии last_bda в NVS (до init Bluetooth) — больше = спокойнее после подачи питания.
-    static constexpr uint32_t btA2dpLastConnPreStackDelayMs = 1800;
+    static constexpr uint32_t btA2dpLastConnPreStackDelayMs = 600;
     // Визуализация рта/EQ по BT: в библиотеке set_stream_reader вызывается ПОСЛЕ цифровой громкости A2DP — сигнал часто «ниже» Wi‑Fi.
     // Берём raw_stream_reader (до volume) + отдельные пороги. gain 100 = без усиления; 120…200 — если всё ещё бідно.
     static constexpr uint16_t btPcmAnalyzerGainPercent = 145;
@@ -40,11 +40,12 @@ class RadioConfig {
     static constexpr uint8_t encS1 = 19;
     static constexpr uint8_t encS2 = 18;
     static constexpr uint8_t encBtn = 4;
-    // Жесты (EncButton): удерж.+поворот — Wi‑Fi: станция; BT: AVRCP next/prev; двойной+поворот — режим рта (6 вар.); 1 клик — пуск/пауза; 3 тапа — порог; 4×клик+удерж.+поворот — wfi/bt; 5 — АКБ; 6 — Pong; 7 — SoftAP.
+    // Жесты (EncButton): удерж.+поворот — Wi‑Fi: станция; BT: AVRCP next/prev; двойной+поворот — режим рта (6 вар.); 1 клик — пуск/пауза; 3 тапа — порог; 4×клик+удерж.+поворот — wfi/bt; 4×клик+удерж. без поворота (BT) — сброс сопряжений; 5 — АКБ; 6 — Pong; 7 — SoftAP.
     // Кнопка энкодера (GPIO 4 = RTC): отпустить после 5–9 с удержания — deep sleep (если за удержание не было поворота с нажатой кнопкой);
     // держать ≥10 с без отпускания — ESP.restart() (то же: при удерж.+повороте станция/яркость/громкость — не срабатывает).
     static constexpr uint16_t encoderSleepHoldMs = 5000;
     static constexpr uint16_t encoderHardResetHoldMs = 10000;
+    static constexpr uint16_t btForgetPairedHoldMs = 1400;
 
     // Раньше: АЦП для VolAnalyzer. Сейчас уровень берётся из PCM в audio_process_extern (см. BendeRadio.ino).
     static constexpr uint8_t analyzPin = 34;
@@ -171,6 +172,8 @@ class RadioConfig {
     static constexpr uint32_t coldStartMatrixZeroMs = 200;
     static constexpr uint32_t coldStartAfterMatrixMs = 300;
     static constexpr uint32_t coldStartBeforeWifiMs = 400;
+    // Пауза перед esp_restart() при смене источника (Wi‑Fi/BT) — снижает артефакты матрицы при быстром переключении.
+    static constexpr uint16_t modeSwitchRestartDelayMs = 2000;
 
     // Перед паузой/сменой станции: сколько мс выводить «тишину» в I2S (gain ramp), пока декодер ещё идёт —
     // иначе DMA останавливается и на усилителе часто слышен ВЧ-писк.
