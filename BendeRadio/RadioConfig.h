@@ -70,12 +70,21 @@ class RadioConfig {
     static constexpr uint32_t batterySampleIntervalMs = 180000;  // 3 мин
     // Ниже этого % опрашиваем АКБ чаще (batteryLowSampleIntervalMs) — для порога выключения и стабильности.
     static constexpr uint8_t batteryLowAttentionPercent = 10;
-    static constexpr uint32_t batteryLowSampleIntervalMs = 5000;
+    static constexpr uint32_t batteryLowSampleIntervalMs = 60000;  // 1 мин при < batteryLowAttentionPercent
     // Ниже порога без зарядки: глубокий сон без источников пробуждения (меньше тока, чем цикл Brownout).
     static constexpr bool batteryShutdownEnable = true;
     static constexpr uint8_t batteryShutdownBelowPercent = 5;
     // Подряд столько замеров (с интервалом выше) должны быть < порога — защита от шума АЦП.
     static constexpr uint8_t batteryShutdownConsecutiveSamples = 2;
+    // Ниже этого % (без активной зарядки) — грустные глаза по битмапу (левый/правый — отдельные массивы в core0).
+    static constexpr bool batterySadEyesEnable = true;
+    static constexpr uint8_t batterySadEyesBelowPercent = 20;
+    // Кадр 0…7 (индекс в IMAGES левого/правого глаза).
+    static constexpr uint8_t batterySadEyesBitmapIndex = 5;
+    // Зрачок 2×2 на грустных глазах: шаг анимации (мс).
+    static constexpr uint16_t batterySadEyesPupilStepMs = 1200;
+    // Грустные глаза: зрачок позиционируется от центра (dx,dy) в core0; сдвиг не используется.
+    static constexpr int8_t batterySadEyesPupilOffsetY = 0;
     // 4 кліки: % АКБ на «роті»; скільки мс показувати (потім зникає).
     static constexpr uint32_t batteryPercentShowDurationMs = 3000;
     // Линия индикации зарядки IP2326 (через делитель 68k/100k): HIGH ≈ идёт зарядка, LOW ≈ завершена.

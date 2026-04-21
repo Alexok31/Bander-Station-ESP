@@ -285,6 +285,165 @@ static void draw_eyes_radio_idle_off() {
     draw_eyeb(1, 3, 5);
 }
 
+// Грустные глаза: uint8_t IMAGES[][8] пользователя → uint64 (младший байт = верхняя строка кадра для blit).
+// Левый: 0x00,0x1e,0x3f,0x7f,0xff,0xff,0x7e,0x3c
+static const uint64_t kBatterySadEyeFramesLeft[] = {
+    0x0000000000000000ULL,
+    0x3C7EFFFF7F3F1E00ULL,
+    0x3C7EFFFF7F3F1E00ULL,
+    0x3C7EFFFF7F3F1E00ULL,
+    0x3C7EFFFF7F3F1E00ULL,
+    0x3C7EFFFF7F3F1E00ULL,
+    0x3C7EFFFF7F3F1E00ULL,
+    0x3C7EFFFF7F3F1E00ULL,
+};
+// Правый: 0x00,0x78,0xfc,0xfe,0xff,0xff,0x7e,0x3c
+static const uint64_t kBatterySadEyeFramesRight[] = {
+    0x0000000000000000ULL,
+    0x3C7EFFFFFEFC7800ULL,
+    0x3C7EFFFFFEFC7800ULL,
+    0x3C7EFFFFFEFC7800ULL,
+    0x3C7EFFFFFEFC7800ULL,
+    0x3C7EFFFFFEFC7800ULL,
+    0x3C7EFFFFFEFC7800ULL,
+    0x3C7EFFFFFEFC7800ULL,
+};
+
+static inline bool battery_sad_eyes_wanted() {
+    return RadioConfig::batterySadEyesEnable && RadioConfig::batteryMonitorEnable && battery_gauge_ready() &&
+           !battery_is_charging() && battery_percent() < RadioConfig::batterySadEyesBelowPercent;
+}
+
+static void blit_u64_8x8(uint8_t x0, uint8_t y0, uint64_t bits) {
+    // 180°: физическая точка (r,c) = пиксель исходного кадра (7−r, 7−c).
+    // В строке 0b… старший бит — левый столбец (как у IMAGES[][8]).
+    for (uint8_t r = 0; r < 8; r++) {
+        const uint8_t row = (uint8_t)((bits >> (56 - 8 * (uint64_t)(7 - r))) & 0xFFu);
+        for (uint8_t c = 0; c < 8; c++) {
+            const uint8_t on = ((row >> (7u - c)) & 1u) ? GFX_FILL : GFX_CLEAR;
+            mtrx.dot(x0 + c, y0 + r, on);
+        }
+    }
+}
+
+static uint64_t battery_sad_frame_bits(uint8_t eye) {
+    constexpr uint8_t kN = (uint8_t)(sizeof(kBatterySadEyeFramesLeft) / sizeof(kBatterySadEyeFramesLeft[0]));
+    const uint8_t idx =
+        (RadioConfig::batterySadEyesBitmapIndex < kN) ? RadioConfig::batterySadEyesBitmapIndex : (uint8_t)(kN - 1u);
+    return (eye == 0u) ? kBatterySadEyeFramesLeft[idx] : kBatterySadEyeFramesRight[idx];
+}
+
+// Зрачок 2×2: центр (3,3); по горизонтали только ±1 от центра (±2 ломает обводку глаза на матрице).
+// По вертикали до ±2 от центра; верхний левый (px,py) = (3+dx, 3+dy), clamp 1…5.
+static constexpr int8_t kBattSadPupilCx = 3;
+static constexpr int8_t kBattSadPupilCy = 3;
+static int8_t s_batt_sad_dx = 0;
+static int8_t s_batt_sad_dy = 0;
+static uint32_t s_batt_sad_next_pupil_ms;
+static bool s_batt_sad_was_active;
+// После шага вниз на 1 (или диагонали с вниз) — следующий тик только «назад» по dy.
+static bool s_batt_sad_pupil_need_return;
+
+static void battery_sad_clamp_pupil_deltas() {
+    if (s_batt_sad_dx < -1) {
+        s_batt_sad_dx = -1;
+    }
+    if (s_batt_sad_dx > 1) {
+        s_batt_sad_dx = 1;
+    }
+    if (s_batt_sad_dy < -2) {
+        s_batt_sad_dy = -2;
+    }
+    if (s_batt_sad_dy > 2) {
+        s_batt_sad_dy = 2;
+    }
+}
+
+static void battery_sad_pupil_tick() {
+    if (s_batt_sad_pupil_need_return) {
+        s_batt_sad_dy--;
+        battery_sad_clamp_pupil_deltas();
+        s_batt_sad_pupil_need_return = false;
+        return;
+    }
+
+    const int r = random(0, 100);
+    if (r < 26) {
+        // Ровно на 1 вниз от текущего положения (не ниже +2 от центра); потом возврат.
+        if (s_batt_sad_dy < 2) {
+            s_batt_sad_dy++;
+            battery_sad_clamp_pupil_deltas();
+            s_batt_sad_pupil_need_return = true;
+        }
+    } else if (r < 52) {
+        // Влево или вправо на 1 (не дальше ±1 от центра).
+        if (random(0, 2) != 0) {
+            if (s_batt_sad_dx > -1) {
+                s_batt_sad_dx--;
+            }
+        } else {
+            if (s_batt_sad_dx < 1) {
+                s_batt_sad_dx++;
+            }
+        }
+        battery_sad_clamp_pupil_deltas();
+    } else if (r < 90) {
+        // Вниз на 1 и влево или вправо на 1; вертикаль на следующем тике отменяем.
+        if (s_batt_sad_dy < 2) {
+            s_batt_sad_dy++;
+            if (random(0, 2) != 0) {
+                if (s_batt_sad_dx > -1) {
+                    s_batt_sad_dx--;
+                }
+            } else {
+                if (s_batt_sad_dx < 1) {
+                    s_batt_sad_dx++;
+                }
+            }
+            battery_sad_clamp_pupil_deltas();
+            s_batt_sad_pupil_need_return = true;
+        }
+    }
+}
+
+static void battery_sad_eyes_begin_session() {
+    s_batt_sad_dx = 0;
+    s_batt_sad_dy = 0;
+    s_batt_sad_pupil_need_return = false;
+    s_batt_sad_next_pupil_ms = millis() + RadioConfig::batterySadEyesPupilStepMs;
+}
+
+static void battery_sad_eyes_track_session() {
+    const bool want = battery_sad_eyes_wanted();
+    if (want && !s_batt_sad_was_active) {
+        battery_sad_eyes_begin_session();
+    }
+    s_batt_sad_was_active = want;
+}
+
+static void battery_sad_maybe_tick_pupil() {
+    const uint32_t now = millis();
+    if ((int32_t)(now - s_batt_sad_next_pupil_ms) < 0) {
+        return;
+    }
+    s_batt_sad_next_pupil_ms = now + RadioConfig::batterySadEyesPupilStepMs;
+    battery_sad_pupil_tick();
+}
+
+static void draw_battery_sad_eyes_both() {
+    battery_sad_eyes_track_session();
+    battery_sad_maybe_tick_pupil();
+    const uint8_t xL = RadioConfig::analyzWidth;
+    const uint8_t xR = (uint8_t)(RadioConfig::analyzWidth + 8u);
+    blit_u64_8x8(xL, 0, battery_sad_frame_bits(0));
+    blit_u64_8x8(xR, 0, battery_sad_frame_bits(1));
+    // Зрачок 2×2: центр (3,3) + (dx,dy); clamp 1…5 — отступ 1 px от края 8×8.
+    const int px = constrain((int)kBattSadPupilCx + (int)s_batt_sad_dx, 1, 5);
+    const int py = constrain((int)kBattSadPupilCy + (int)s_batt_sad_dy, 1, 5);
+    draw_eyeb(0, px, py, 2);
+    draw_eyeb(1, px, py, 2);
+}
+
 // Pong: на табло счёт на глазах (левый — игрок, правый — ИИ). В розыгрыше — зрачок следует за мячом.
 static void draw_eyes_follow_ball(int8_t ball_x, int8_t ball_y) {
     if (pong_mouth_tablo_mode()) {
@@ -347,15 +506,23 @@ void change_state() {
     mtrx.clear();
     if (data.state) {
         upd_bright();
-        draw_eye(0);
-        draw_eye(1);
-        draw_eyeb(0, 2, 2, 4);
-        draw_eyeb(1, 2, 2, 4);
+        if (battery_sad_eyes_wanted()) {
+            draw_battery_sad_eyes_both();
+        } else {
+            draw_eye(0);
+            draw_eye(1);
+            draw_eyeb(0, 2, 2, 4);
+            draw_eyeb(1, 2, 2, 4);
+        }
     } else {
         // Даже в «спящем» режиме используем общую яркость + per-module trim
         // (иначе калибровка глаз не видна).
         upd_bright();
-        draw_eyes_radio_idle_off();
+        if (battery_sad_eyes_wanted()) {
+            draw_battery_sad_eyes_both();
+        } else {
+            draw_eyes_radio_idle_off();
+        }
     }
     mtrx.update();
 }
@@ -1158,41 +1325,46 @@ void core0(void* p) {
             } else {
             if (data.state) {
                 if (eye_tmr) {
-                    draw_eye(0);
-                    draw_eye(1);
-                    if (angry_tmr.state()) {
-                        draw_eyeb(0, 3, 3);
-                        draw_eyeb(1, 3, 3);
-                        mtrx.lineH(0, RadioConfig::analyzWidth, RadioConfig::analyzWidth + 16 - 1, GFX_CLEAR);
-                        mtrx.lineH(1, RadioConfig::analyzWidth + 5, RadioConfig::analyzWidth + 5 + 6 - 1, GFX_CLEAR);
-                        mtrx.lineH(2, RadioConfig::analyzWidth + 6, RadioConfig::analyzWidth + 6 + 4 - 1, GFX_CLEAR);
-                        mtrx.lineH(3, RadioConfig::analyzWidth + 7, RadioConfig::analyzWidth + 7 + 2 - 1, GFX_CLEAR);
+                    if (battery_sad_eyes_wanted()) {
+                        draw_battery_sad_eyes_both();
+                        mtrx.update();
                     } else {
-                        if (eb.pressing()) {
-                            draw_eyeb(0, 4, 3, 3);
-                            draw_eyeb(1, 1, 3, 3);
+                        draw_eye(0);
+                        draw_eye(1);
+                        if (angry_tmr.state()) {
+                            draw_eyeb(0, 3, 3);
+                            draw_eyeb(1, 3, 3);
+                            mtrx.lineH(0, RadioConfig::analyzWidth, RadioConfig::analyzWidth + 16 - 1, GFX_CLEAR);
+                            mtrx.lineH(1, RadioConfig::analyzWidth + 5, RadioConfig::analyzWidth + 5 + 6 - 1, GFX_CLEAR);
+                            mtrx.lineH(2, RadioConfig::analyzWidth + 6, RadioConfig::analyzWidth + 6 + 4 - 1, GFX_CLEAR);
+                            mtrx.lineH(3, RadioConfig::analyzWidth + 7, RadioConfig::analyzWidth + 7 + 2 - 1, GFX_CLEAR);
                         } else {
-                            static uint16_t pos;
-                            pos += 15;
-                            uint8_t x = inoise8(pos);
-                            uint8_t y = inoise8(pos + UINT16_MAX / 4);
-                            x = constrain(x, 40, 255 - 40);
-                            y = constrain(y, 40, 255 - 40);
-                            x = map(x, 40, 255 - 40, 2, 5);
-                            y = map(y, 40, 255 - 40, 2, 5);
-                            if (pulse) {
-                                pulse = 0;
-                                int8_t sx = random(-1, 1);
-                                int8_t sy = random(-1, 1);
-                                draw_eyeb(0, x + sx, y + sy, 3);
-                                draw_eyeb(1, x + sx, y + sy, 3);
+                            if (eb.pressing()) {
+                                draw_eyeb(0, 4, 3, 3);
+                                draw_eyeb(1, 1, 3, 3);
                             } else {
-                                draw_eyeb(0, x, y);
-                                draw_eyeb(1, x, y);
+                                static uint16_t pos;
+                                pos += 15;
+                                uint8_t x = inoise8(pos);
+                                uint8_t y = inoise8(pos + UINT16_MAX / 4);
+                                x = constrain(x, 40, 255 - 40);
+                                y = constrain(y, 40, 255 - 40);
+                                x = map(x, 40, 255 - 40, 2, 5);
+                                y = map(y, 40, 255 - 40, 2, 5);
+                                if (pulse) {
+                                    pulse = 0;
+                                    int8_t sx = random(-1, 1);
+                                    int8_t sy = random(-1, 1);
+                                    draw_eyeb(0, x + sx, y + sy, 3);
+                                    draw_eyeb(1, x + sx, y + sy, 3);
+                                } else {
+                                    draw_eyeb(0, x, y);
+                                    draw_eyeb(1, x, y);
+                                }
                             }
                         }
+                        mtrx.update();
                     }
-                    mtrx.update();
                 }
             } else {
                 if (eye_tmr) {
@@ -1201,7 +1373,11 @@ void core0(void* p) {
                     if (!matrix_tmr.state()) {
                         mtrx.rect(0, 0, RadioConfig::analyzWidth - 1, 7, GFX_CLEAR);
                     }
-                    draw_eyes_radio_idle_off();
+                    if (battery_sad_eyes_wanted()) {
+                        draw_battery_sad_eyes_both();
+                    } else {
+                        draw_eyes_radio_idle_off();
+                    }
                     mtrx.update();
                 }
             }
