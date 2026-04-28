@@ -1,5 +1,6 @@
 #include "WebUi.h"
 
+#include <Arduino.h>
 #include <DNSServer.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -12,6 +13,11 @@ static WebServer server(80);
 static DNSServer dnsServer;
 static bool dnsRunning = false;
 static bool handlersInstalled = false;
+static volatile bool s_web_need_listen_reset = false;
+
+static void web_send_close_connection() {
+    server.sendHeader("Connection", "close");
+}
 
 static bool apModeActive() {
     const wifi_mode_t m = WiFi.getMode();
@@ -19,11 +25,13 @@ static bool apModeActive() {
 }
 
 static void sendRedirectRoot() {
+    web_send_close_connection();
     server.sendHeader("Location", "http://192.168.4.1/", true);
     server.send(302, "text/plain", "");
 }
 
 static void captiveProbeOk() {
+    web_send_close_connection();
     server.send(200, "text/plain", "OK");
 }
 
@@ -41,6 +49,17 @@ static void updateCaptivePortalState() {
         dnsServer.stop();
         dnsRunning = false;
     }
+}
+
+static void webUiOnWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+    (void)info;
+    if (event != ARDUINO_EVENT_WIFI_AP_STADISCONNECTED) {
+        return;
+    }
+    if (!apModeActive()) {
+        return;
+    }
+    s_web_need_listen_reset = true;
 }
 
 static void sendPage() {
@@ -174,12 +193,14 @@ static void sendPage() {
               "</script>"
               "</body></html>");
 
+    web_send_close_connection();
     server.send(200, "text/html; charset=utf-8", html);
 }
 
 static void handleSave() {
     wifi_touch_activity();
     if (server.method() != HTTP_POST) {
+        web_send_close_connection();
         server.send(405, "text/plain", "Method Not Allowed");
         return;
     }
@@ -187,6 +208,7 @@ static void handleSave() {
     String staSsid = server.arg("sta_ssid");
     staSsid.trim();
     if (staSsid.length() == 0) {
+        web_send_close_connection();
         server.send(400, "text/plain", "SSID required");
         return;
     }
@@ -238,6 +260,7 @@ static void handleSave() {
     nvsSaveCustomStations(parsed, parsedCount);
     matrix_set_brightness_trim(trim, RadioConfig::matrixModuleCount, true);
 
+    web_send_close_connection();
     server.send(200, "text/html; charset=utf-8",
                  "<!DOCTYPE html><html><head><meta charset=utf-8></head><body>"
                  "<p>Сохранено. Перезагрузка…</p>"
@@ -250,6 +273,7 @@ static void handleSave() {
 static void handleCalib() {
     wifi_touch_activity();
     if (server.method() != HTTP_POST) {
+        web_send_close_connection();
         server.send(405, "text/plain", "Method Not Allowed");
         return;
     }
@@ -266,6 +290,7 @@ static void handleCalib() {
                                      (int)RadioConfig::matrixBrightnessTrimMax);
     }
     matrix_set_brightness_trim(trim, RadioConfig::matrixModuleCount, false);
+    web_send_close_connection();
     server.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -279,19 +304,31 @@ void webUiBegin() {
         server.on("/redirect", HTTP_ANY, sendRedirectRoot);            // Windows
         server.on("/fwlink", HTTP_ANY, sendRedirectRoot);              // Windows
         server.on("/ncsi.txt", HTTP_ANY, captiveProbeOk);              // Windows fallback
+        server.on("/", HTTP_GET, sendPage);
+        server.on("/calib", HTTP_POST, handleCalib);
+        server.on("/save", HTTP_POST, handleSave);
         server.onNotFound([]() {
+            web_send_close_connection();
             server.send(404, "text/plain", "Not Found");
         });
+        WiFi.onEvent(webUiOnWifiEvent);
         handlersInstalled = true;
     }
-    server.on("/", HTTP_GET, sendPage);
-    server.on("/calib", HTTP_POST, handleCalib);
-    server.on("/save", HTTP_POST, handleSave);
     server.begin();
     updateCaptivePortalState();
 }
 
 void webUiLoop() {
+    if (s_web_need_listen_reset) {
+        s_web_need_listen_reset = false;
+        if (dnsRunning) {
+            dnsServer.stop();
+            dnsRunning = false;
+        }
+        server.close();  // esp32 2.x WebServer: no end(); close()/stop() drop listener
+        delay(30);
+        server.begin();
+    }
     updateCaptivePortalState();
     if (dnsRunning) {
         dnsServer.processNextRequest();

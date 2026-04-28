@@ -116,7 +116,8 @@ void setup() {
     wifiConnecting = false;
 
     if (WiFi.status() != WL_CONNECTED) {
-        WiFi.mode(WIFI_AP_STA);
+        // Стабильность WebUI выше в AP-only (без одновременного STA-трафика и стрима).
+        WiFi.mode(WIFI_AP);
         if (apPwd.length() >= 8) {
             WiFi.softAP(apSsid.c_str(), apPwd.c_str());
         } else {
@@ -127,7 +128,7 @@ void setup() {
     Serial.println();
     if (WiFi.status() == WL_CONNECTED) {
         Serial.println(WiFi.localIP());
-        Serial.println(F("SoftAP: off (6 clicks to enable AP for setup)"));
+        Serial.println(F("SoftAP: Wi-Fi mode — 4 clicks + hold 2s (no turn) to toggle AP for setup"));
     } else {
         Serial.println(F("STA: not connected (use SoftAP for setup)"));
     }

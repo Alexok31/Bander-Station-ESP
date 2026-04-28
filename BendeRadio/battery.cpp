@@ -12,9 +12,37 @@ static uint16_t s_smooth_mv;
 static uint8_t s_percent;
 static bool s_gauge_ready;
 
-static bool s_chg_prev_for_soc;
-static uint8_t s_charge_soc_anchor_pct;
-static uint32_t s_charge_soc_anchor_ms;
+static uint32_t s_charging_read_ms;
+static bool s_charging_cached;
+
+// Таблиця: мВ пакета (2S, після BMS) → %; обидва рядки по зростанню U. Без інтерполяції:
+// береться останній %, для якого U ≥ порога (ступінчасто).
+static const uint16_t batterySocTableMv[] = {
+    6000, 6150, 6300, 6500, 6700, 6900, 7100, 7300, 7500, 7700, 7900, 8050, 8200, 8350, 8500,
+};
+static const uint8_t batterySocTablePct[] = {
+    0, 3, 7, 12, 18, 25, 33, 42, 50, 58, 68, 76, 84, 92, 99,
+};
+static constexpr uint8_t batterySocTableN =
+    (uint8_t)(sizeof(batterySocTableMv) / sizeof(batterySocTableMv[0]));
+static_assert(sizeof(batterySocTableMv) / sizeof(batterySocTableMv[0]) ==
+                  sizeof(batterySocTablePct) / sizeof(batterySocTablePct[0]),
+              "batterySocTable mv/pct count mismatch");
+
+static uint8_t percent_from_pack_mv(uint16_t pack_mv) {
+    if (batterySocTableN == 0u) {
+        return 0u;
+    }
+    uint8_t out = batterySocTablePct[0];
+    for (uint8_t i = 0; i < batterySocTableN; i++) {
+        if (pack_mv >= batterySocTableMv[i]) {
+            out = batterySocTablePct[i];
+        } else {
+            break;
+        }
+    }
+    return out;
+}
 
 static uint32_t adc_pin_millivolts() {
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 2)
@@ -25,14 +53,26 @@ static uint32_t adc_pin_millivolts() {
 #endif
 }
 
+static bool charging_pin_majority_high() {
+    if (!RadioConfig::chargingDetectEnable) {
+        return false;
+    }
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < 8u; i++) {
+        if (digitalRead(RadioConfig::chargingDetectPin) == HIGH) {
+            n++;
+        }
+    }
+    return n >= 5u;
+}
+
 void battery_init() {
     s_last_sample_ms = 0;
     s_smooth_mv = 0;
     s_percent = 0;
     s_gauge_ready = false;
-    s_chg_prev_for_soc = false;
-    s_charge_soc_anchor_pct = 0;
-    s_charge_soc_anchor_ms = 0;
+    s_charging_read_ms = 0;
+    s_charging_cached = false;
     if (RadioConfig::chargingDetectEnable) {
         pinMode(RadioConfig::chargingDetectPin, INPUT);
     }
@@ -44,10 +84,7 @@ void battery_init() {
 }
 
 static void battery_sample_apply() {
-    const bool chg = battery_is_charging();
-    // До першого заміру s_smooth_mv == 0 і s_percent скинутий у 0: якщо вже йде зарядка,
-    // старий якорь з «0» ламав cap (0+0=0 → завжди 0% до відключення ЗУ).
-    const bool adc_never_inited = (s_smooth_mv == 0u);
+    const bool chg = charging_pin_majority_high();
 
     uint32_t acc = 0;
     constexpr uint8_t kSamples = 12;
@@ -68,41 +105,16 @@ static void battery_sample_apply() {
         s_smooth_mv = (uint16_t)(ema / 8u);
     }
 
-    const int32_t lo = (int32_t)RadioConfig::batteryEmptyMv;
-    const int32_t hi = (int32_t)RadioConfig::batteryFullMv;
-    int32_t p = 0;
-    if (hi > lo) {
-        // 0…99 %: на двух цифрах матрицы 100% виглядало як «00» (десятки 10 → некоректний гліф).
-        p = ((int32_t)s_smooth_mv - lo) * 99 / (hi - lo);
-    }
+    int32_t p = (int32_t)percent_from_pack_mv(s_smooth_mv);
     if (p < 0) {
         p = 0;
     }
     if (p > 99) {
         p = 99;
     }
-    if (chg && !s_chg_prev_for_soc) {
-        if (adc_never_inited) {
-            s_charge_soc_anchor_pct = (uint8_t)p;
-        } else {
-            s_charge_soc_anchor_pct = s_percent;
-        }
-        s_charge_soc_anchor_ms = millis();
-    }
-    if (chg && RadioConfig::batteryChargeSocCapEnable) {
-        const uint32_t elapsed_ms = (uint32_t)(millis() - s_charge_soc_anchor_ms);
-        const uint32_t rise =
-            (elapsed_ms * (uint32_t)RadioConfig::batteryChargeSocMaxRisePerMinute) / 60000u;
-        int32_t cap = (int32_t)s_charge_soc_anchor_pct + (int32_t)rise;
-        if (cap > 99) {
-            cap = 99;
-        }
-        if (p > cap) {
-            p = cap;
-        }
-    }
     s_percent = (uint8_t)p;
-    s_chg_prev_for_soc = chg;
+    s_charging_cached = chg;
+    s_charging_read_ms = millis();
     s_gauge_ready = true;
 }
 
@@ -152,7 +164,12 @@ bool battery_is_charging() {
     if (!RadioConfig::chargingDetectEnable) {
         return false;
     }
-    return digitalRead(RadioConfig::chargingDetectPin) == HIGH;
+    const uint32_t now = millis();
+    if (s_charging_read_ms == 0u || (uint32_t)(now - s_charging_read_ms) >= 80u) {
+        s_charging_read_ms = now;
+        s_charging_cached = charging_pin_majority_high();
+    }
+    return s_charging_cached;
 }
 
 uint8_t battery_eye_mood() {

@@ -45,25 +45,25 @@ class RadioConfig {
     static constexpr uint8_t encS1 = 19;
     static constexpr uint8_t encS2 = 18;
     static constexpr uint8_t encBtn = 4;
-    // Жесты (EncButton): удерж.+поворот — Wi‑Fi: станция; BT: AVRCP next/prev; двойной+поворот — режим рта (6 вар.); 1 клик — пуск/пауза; 3 тапа — порог; 4×клик+удерж.+поворот — wfi/bt; 4×клик+удерж. без поворота (BT) — сброс сопряжений; 5 — АКБ; 6 — Pong; 7 — SoftAP.
+    // Жесты (EncButton): удерж.+поворот — Wi‑Fi: станция; BT: AVRCP next/prev; двойной+поворот — режим рта (6 вар.); 1 клик — пуск/пауза; 3 тапа — порог; 4×клик+удерж.+поворот — wfi/bt; 4×клик+удерж. без поворота (BT) — сброс сопряжений; 4×клик+удерж. без поворота (Wi‑Fi) — SoftAP; 5 — АКБ; 6 — Pong.
     // Кнопка энкодера (GPIO 4 = RTC): отпустить после 5–9 с удержания — deep sleep (если за удержание не было поворота с нажатой кнопкой);
     // держать ≥10 с без отпускания — ESP.restart() (то же: при удерж.+повороте станция/яркость/громкость — не срабатывает).
     static constexpr uint16_t encoderSleepHoldMs = 5000;
     static constexpr uint16_t encoderHardResetHoldMs = 10000;
     static constexpr uint16_t btForgetPairedHoldMs = 1400;
+    // Wi‑Fi: 4×клик + удержание без поворота — вкл/выкл SoftAP (как по духу жесту сброса BT).
+    static constexpr uint16_t encoderSoftApToggleHoldMs = 2000;
 
     // Раньше: АЦП для VolAnalyzer. Сейчас уровень берётся из PCM в audio_process_extern (см. BendeRadio.ino).
     static constexpr uint8_t analyzPin = 34;
 
-    // АКБ 2S Li-ion через делитель на ADC1 (тільки input-only), напр. GPIO 35:
+    // АКБ 2S Li-ion через делитель на ADC1 (тільки input-only), напр. GPIO 32:
     // Ubat —[Rверх 100k]— вузол —[Rниз 47k]— GND; ratio = (100+47)/47.
     // Якщо у тебе навпаки (47k до батареї, 100k до землі), постав ratio = (47+100)/100.
     static constexpr bool batteryMonitorEnable = true;
-    static constexpr uint8_t batteryAdcPin = 35;
+    static constexpr uint8_t batteryAdcPin = 32;
     static constexpr float batteryDividerRatio = (100.0f + 47.0f) / 47.0f;
-    // Калібрування % під мультиметр на клемах пакета (після BMS).
-    static constexpr uint16_t batteryEmptyMv = 6200;
-    static constexpr uint16_t batteryFullMv = 8300;
+    // % з напруги: ступінчаста таблиця U→% у battery.cpp (без інтерполяції між точками).
     // Пороги для battery_eye_mood() (якщо підключиш настрій очей за АКБ).
     static constexpr uint8_t batteryMoodCheerfulMinPct = 70;
     static constexpr uint8_t batteryMoodNormalMinPct = 30;
@@ -96,11 +96,7 @@ class RadioConfig {
     static constexpr uint8_t batteryMatrixFullMinPct = 95;
     // true — віддзеркалити батарею по вертикалі (ряд 0 ↔ 7).
     static constexpr bool batteryMatrixInvertY = false;
-    // Під час зарядки напруга на пакеті завищена — % з напруги «стрибає» вгору. Якщо true: від якоря
-    // (останній % у момент появи зарядки) показ не росте швидше за N відсотків на хвилину.
-    static constexpr bool batteryChargeSocCapEnable = true;
-    static constexpr uint8_t batteryChargeSocMaxRisePerMinute = 4;
-    // 6 кликов: вкл/выкл точку доступа (SoftAP) для веб-настройки, если STA уже подключён; без STA при работающем AP не отключается.
+    // SoftAP: см. encoderSoftApToggleHoldMs + жест 4×клик+удерж. в режиме Wi‑Fi.
     // Станція / гучність на роті — фіксований період matrix_tmr (не довше за batteryPercentShowDurationMs після батареї).
     static constexpr uint16_t matrixOverlayDigitsMs = 1000;
 
@@ -233,11 +229,11 @@ class RadioConfig {
     // Wi‑Fi в экономичный режим только после wifiIdleSleepAfterMs без активности (не сразу при паузе).
     // Активность: воспроизведение, энкодер, открытие веб‑страницы. Если обрывается поток — выставьте false.
     static constexpr bool wifiSleepWhenSilent = true;
-    // 0 = не переводить Wi‑Fi в сон по таймеру. Иначе мс бездействия до WiFi.setSleep + WIFI_PS_MAX_MODEM.
-    // Тест: 10 с; в бою поставьте обратно 300000 (5 мин).
-    static constexpr uint32_t wifiIdleSleepAfterMs = 10000;
-    // После таймера бездействия — MAX_MODEM; иначе NONE (без задержки при возобновлении стрима).
-    static constexpr bool wifiPsMaxModemWhenSilent = true;
+    // 0 = не уводить STA в modem sleep по таймеру (стабильнее стрим/переподключение). Иначе мс бездействия.
+    static constexpr uint32_t wifiIdleSleepAfterMs = 0;
+    // После таймера: true = WIFI_PS_MAX_MODEM (максимум экономии, часто ломает TCP/аудио);
+    // false = WIFI_PS_MIN_MODEM (мягче, меньше «системных» сбоев при энергосбережении).
+    static constexpr bool wifiIdlePsMaxModem = false;
     // Пауза в конце цикла core0 — уступка CPU и лёгкий idle (0 = выкл.).
     static constexpr uint8_t core0LoopDelayMs = 1;
     // Радио выкл.: реже опрашивать делитель АКБ (0 = всегда batterySampleIntervalMs).

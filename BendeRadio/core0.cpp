@@ -928,18 +928,32 @@ void wifi_touch_activity() {
 }
 
 void syncWifiWithAudioSilence() {
+    const wifi_mode_t mode = WiFi.getMode();
+    if (mode == WIFI_OFF) {
+        return;
+    }
+    // SoftAP / AP+STA: всегда без modem sleep — инакше WebUI и captive portal падают на части плат.
+    if (mode == WIFI_AP || mode == WIFI_AP_STA) {
+        WiFi.setSleep(false);
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        return;
+    }
+
+    // STA: при выключенной политике явно снимаем PS (иначе остаётся SDK default MIN_MODEM и даёт сбои).
     if (!RadioConfig::wifiSleepWhenSilent) {
+        WiFi.setSleep(false);
+        esp_wifi_set_ps(WIFI_PS_NONE);
         return;
     }
-    if (WiFi.getMode() == WIFI_OFF) {
-        return;
-    }
+
     const bool wifiIdleLong =
         (RadioConfig::wifiIdleSleepAfterMs > 0) &&
         ((uint32_t)(millis() - s_wifi_last_activity_ms) >= RadioConfig::wifiIdleSleepAfterMs);
     WiFi.setSleep(wifiIdleLong);
-    if (RadioConfig::wifiPsMaxModemWhenSilent && WiFi.getMode() != WIFI_OFF) {
-        esp_wifi_set_ps(wifiIdleLong ? WIFI_PS_MAX_MODEM : WIFI_PS_NONE);
+    if (wifiIdleLong) {
+        esp_wifi_set_ps(RadioConfig::wifiIdlePsMaxModem ? WIFI_PS_MAX_MODEM : WIFI_PS_MIN_MODEM);
+    } else {
+        esp_wifi_set_ps(WIFI_PS_NONE);
     }
 }
 
@@ -952,47 +966,48 @@ void wifi_ap_toggle_from_core0() {
     }
     WifiStored w;
     nvsLoadWifi(w);
+    const String staSsid = w.staSsid.length() ? w.staSsid : String(RadioConfig::wifiSsid);
+    const String staPass = w.staPass.length() ? w.staPass : String(RadioConfig::wifiPass);
     const String apSsid = nvsEffectiveApSsid(w);
     const String apPwd = nvsEffectiveApPass(w);
 
-    const bool sta_ok = (WiFi.status() == WL_CONNECTED);
     const wifi_mode_t mode = WiFi.getMode();
-    const bool ap_mode = (mode == WIFI_AP_STA || mode == WIFI_AP);
+    const bool ap_mode = (mode == WIFI_AP || mode == WIFI_AP_STA);
 
-    if (!sta_ok && ap_mode) {
-        return;
-    }
-    if (sta_ok && ap_mode) {
+    // AP on -> off: вернуться в STA и попробовать переподключиться к домашней сети.
+    if (ap_mode) {
         WiFi.softAPdisconnect(true);
         WiFi.mode(WIFI_STA);
+        wifiConnecting = true;
+        WiFi.begin(staSsid.c_str(), staPass.c_str());
+        const uint32_t t0 = millis();
+        while (WiFi.status() != WL_CONNECTED && (uint32_t)(millis() - t0) < 15000u) {
+            delay(25);
+        }
+        wifiConnecting = false;
+        if (WiFi.status() == WL_CONNECTED) {
+            reconnect = station_url_by_index(data.station);
+        }
         wifi_touch_activity();
         syncWifiWithAudioSilence();
         print_val('A', 0);
         return;
     }
-    if (sta_ok && mode == WIFI_STA) {
-        WiFi.mode(WIFI_AP_STA);
-        if (apPwd.length() >= 8) {
-            WiFi.softAP(apSsid.c_str(), apPwd.c_str());
-        } else {
-            WiFi.softAP(apSsid.c_str());
-        }
-        wifi_touch_activity();
-        syncWifiWithAudioSilence();
-        print_val('A', 1);
-        return;
+
+    // AP off -> on: стабильный режим настройки (AP-only).
+    if (audio.isRunning()) {
+        audio.stopSong();
     }
-    if (!sta_ok && mode == WIFI_STA) {
-        WiFi.mode(WIFI_AP_STA);
-        if (apPwd.length() >= 8) {
-            WiFi.softAP(apSsid.c_str(), apPwd.c_str());
-        } else {
-            WiFi.softAP(apSsid.c_str());
-        }
-        wifi_touch_activity();
-        syncWifiWithAudioSilence();
-        print_val('A', 1);
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_AP);
+    if (apPwd.length() >= 8) {
+        WiFi.softAP(apSsid.c_str(), apPwd.c_str());
+    } else {
+        WiFi.softAP(apSsid.c_str());
     }
+    wifi_touch_activity();
+    syncWifiWithAudioSilence();
+    print_val('A', 1);
 }
 
 static void apply_output_volume() {
@@ -1035,6 +1050,23 @@ static void low_battery_enter_deep_sleep_forever() {
     delay(1000);
 }
 
+static void battery_shutdown_guard_on_sample() {
+    if (!RadioConfig::batteryShutdownEnable || !RadioConfig::batteryMonitorEnable || !battery_gauge_ready()) {
+        return;
+    }
+    if (battery_is_charging()) {
+        s_batt_shutdown_consecutive = 0;
+        return;
+    }
+    if (battery_percent() < RadioConfig::batteryShutdownBelowPercent) {
+        if (++s_batt_shutdown_consecutive >= RadioConfig::batteryShutdownConsecutiveSamples) {
+            low_battery_enter_deep_sleep_forever();
+        }
+        return;
+    }
+    s_batt_shutdown_consecutive = 0;
+}
+
 void core0(void* p) {
     // ========================= SETUP =========================
     EncButton eb(RadioConfig::encS1, RadioConfig::encS2, RadioConfig::encBtn);
@@ -1053,6 +1085,8 @@ void core0(void* p) {
     static bool s_enc_hold_had_turn_while_pressed = false;
     // BT: 4 клика + удержание без поворота — сброс сопряжений и вход в поиск нового телефона.
     static bool s_bt_forget_pair_hold_ready = false;
+    // Wi‑Fi: то же число кликов + удержание — вкл/выкл SoftAP для веб‑настройки.
+    static bool s_softap_hold_ready = false;
 
     EEPROM.begin(memory.blockSize());
     memory.begin(0, 'b');
@@ -1133,6 +1167,9 @@ void core0(void* p) {
     reconnect = station_url_by_index(data.station);
 
     battery_init();
+    // Первый замер делаем сразу на старте, а не через интервальный таймер.
+    battery_force_sample();
+    battery_shutdown_guard_on_sample();
 
     s_wifi_last_activity_ms = millis();
     if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 && RadioConfig::wakeAfterSleepAnimMs > 0) {
@@ -1148,17 +1185,8 @@ void core0(void* p) {
             upd_bright();
         }
         const bool batt_sampled = battery_update();
-        if (batt_sampled && RadioConfig::batteryShutdownEnable && RadioConfig::batteryMonitorEnable &&
-            battery_gauge_ready()) {
-            if (battery_is_charging()) {
-                s_batt_shutdown_consecutive = 0;
-            } else if (battery_percent() < RadioConfig::batteryShutdownBelowPercent) {
-                if (++s_batt_shutdown_consecutive >= RadioConfig::batteryShutdownConsecutiveSamples) {
-                    low_battery_enter_deep_sleep_forever();
-                }
-            } else {
-                s_batt_shutdown_consecutive = 0;
-            }
+        if (batt_sampled) {
+            battery_shutdown_guard_on_sample();
         }
         matrix_tmr.tick();
         if (s_batt_matrix_overlay && !matrix_tmr.state()) {
@@ -1224,6 +1252,7 @@ void core0(void* p) {
             enc_btn_press_ms = millis();
             s_enc_hold_had_turn_while_pressed = false;
             s_bt_forget_pair_hold_ready = false;
+            s_softap_hold_ready = false;
         }
         if (eb_tick && eb.release()) {
             const uint32_t dur = millis() - enc_btn_press_ms;
@@ -1258,6 +1287,11 @@ void core0(void* p) {
             eb.pressFor() >= RadioConfig::btForgetPairedHoldMs) {
             s_bt_forget_pair_hold_ready = true;
         }
+        if (eb_tick && eb.pressing() && !s_enc_hold_had_turn_while_pressed &&
+            strcmp(g_audio_source, "wifi") == 0 && eb.getClicks() == 3 &&
+            eb.pressFor() >= RadioConfig::encoderSoftApToggleHoldMs) {
+            s_softap_hold_ready = true;
+        }
 
         if (matrix_display_ready()) {
             if (strcmp(g_audio_source, "bt") == 0) {
@@ -1290,6 +1324,8 @@ void core0(void* p) {
                 if (eb.turn()) {
                     if (eb.pressing()) {
                         s_enc_hold_had_turn_while_pressed = true;
+                        s_bt_forget_pair_hold_ready = false;
+                        s_softap_hold_ready = false;
                     } else {
                         pong_paddle_nudge(eb.dir());
                         pong_draw();
@@ -1310,10 +1346,6 @@ void core0(void* p) {
                         pong_set_active(false);
                         upd_bright();
                         mtrx.update();
-                    } else if (n == 7) {
-                        wifi_ap_toggle_from_core0();
-                        s_batt_matrix_overlay = false;
-                        matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
                     }
                 }
                 memory.update();
@@ -1481,11 +1513,6 @@ void core0(void* p) {
                             pong_sync_matrix_brightness();
                             mtrx.update();
                             break;
-                        case 7:
-                            wifi_ap_toggle_from_core0();
-                            s_batt_matrix_overlay = false;
-                            matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
-                            break;
                     }
                 }
 
@@ -1493,6 +1520,7 @@ void core0(void* p) {
                     if (eb.pressing()) {
                         s_enc_hold_had_turn_while_pressed = true;
                         s_bt_forget_pair_hold_ready = false;
+                        s_softap_hold_ready = false;
                         // getClicks() при удержании = число уже завершённых кликов в серии:
                         // 0 — один клик + поворот; 1 — двойной; 2 — тройной (яркость); 3 — четверной (Wi‑Fi / Bluetooth).
                         switch (eb.getClicks()) {
@@ -1571,6 +1599,14 @@ void core0(void* p) {
                             bt_audio_forget_paired_devices();
                         }
                     }
+                    if (s_softap_hold_ready) {
+                        s_softap_hold_ready = false;
+                        if (strcmp(g_audio_source, "wifi") == 0) {
+                            wifi_ap_toggle_from_core0();
+                            s_batt_matrix_overlay = false;
+                            matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
+                        }
+                    }
                     if (s_mode_pick_active) {
                         s_mode_pick_active = false;
                         if (strcmp(s_mode_pick_choice, g_audio_source) != 0) {
@@ -1583,6 +1619,7 @@ void core0(void* p) {
                         reconnect = station_url_by_index(data.station);
                     }
                     s_bt_forget_pair_hold_ready = false;
+                    s_softap_hold_ready = false;
                 }
                 memory.update();
             }
