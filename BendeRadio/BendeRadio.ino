@@ -4,6 +4,8 @@
 #include <WiFi.h>
 #include <esp_sleep.h>
 #include <esp_system.h>
+#include <esp_wifi.h>
+#include "AudioMux.h"
 #include "BtAudio.h"
 #include "NvsConfig.h"
 #include "RadioConfig.h"
@@ -16,6 +18,9 @@ char g_audio_source[8] = "wifi";
 bool g_warm_boot_after_mode_switch = false;
 
 void commitSourceModeSwitch(const char* new_mode) {
+    if (!RadioConfig::bluetoothEnable) {
+        return;
+    }
     if (strcmp(new_mode, "wifi") != 0 && strcmp(new_mode, "bt") != 0) {
         return;
     }
@@ -24,6 +29,10 @@ void commitSourceModeSwitch(const char* new_mode) {
     prefs.putString("aud", new_mode);
     prefs.putBool("wmrst", true);
     prefs.end();
+    audio_mux_apply_legacy_string(new_mode);
+    if (strcmp(new_mode, "wifi") == 0) {
+        bt_audio_shutdown_for_wifi_mode();
+    }
     delay(RadioConfig::modeSwitchRestartDelayMs);
     esp_restart();
 }
@@ -50,10 +59,9 @@ void setup() {
         Preferences prefs;
         prefs.begin("bende", true);
         g_warm_boot_after_mode_switch = prefs.getBool("wmrst", false);
-        String s = prefs.getString("aud", "");
-        if (s != "wifi" && s != "bt") {
-            const uint8_t legacy = prefs.getUChar("src", 0);
-            s = (legacy == 1) ? "bt" : "wifi";
+        String s = prefs.getString("aud", "wifi");
+        if (!RadioConfig::bluetoothEnable || (s != "wifi" && s != "bt")) {
+            s = "wifi";
             prefs.end();
             prefs.begin("bende", false);
             prefs.putString("aud", s);
@@ -69,33 +77,42 @@ void setup() {
             prefs.end();
         }
     }
-    if (strcmp(g_audio_source, "wifi") != 0 && strcmp(g_audio_source, "bt") != 0) {
-        strncpy(g_audio_source, "wifi", sizeof(g_audio_source));
-        g_audio_source[sizeof(g_audio_source) - 1] = '\0';
-    }
+    strncpy(g_audio_source, "wifi", sizeof(g_audio_source));
+    g_audio_source[sizeof(g_audio_source) - 1] = '\0';
 
     if (!g_warm_boot_after_mode_switch) {
         delay(RadioConfig::coldStartBootMs);
     }
 
-    xTaskCreatePinnedToCore(core0, "Task0", 10000, NULL, 1, &Task0, 0);
-
     Serial.begin(115200);
+    delay(300);
+    free_uart0_from_i2s_pins();
+    Serial.println();
+    Serial.println(F("BendeRadio / Bender V3 bring-up"));
+    Serial.printf("Reset reason: %d (1=power,3=sw,9=brownout,15/16=wdt)\n",
+                  (int)esp_reset_reason());
+    Serial.printf("Free heap: %u  PSRAM: %u\n", (unsigned)ESP.getFreeHeap(),
+                  (unsigned)ESP.getFreePsram());
+    Serial.println(F("REQUIRED: USB CDC On Boot = Enabled (BCLK=GPIO44 clashes UART0 RX)"));
+    Serial.println(F("Listen: POWER 5V, USB optional only with CDC"));
+
+    // Усилители: GPIO41 — либо mute, либо постоянно «play» (ampUseHardwareMute=false).
+    amp_force_mute();
+
+    audio_mux_init(AudioSource::Wifi);
+    // I2S/громкость — в core0 после EEPROM.
+
+    xTaskCreatePinnedToCore(core0, "Task0", 16000, NULL, 1, &Task0, 0);
     if (!g_warm_boot_after_mode_switch) {
         delay(RadioConfig::coldStartBeforeWifiMs);
     }
 
-    if (strcmp(g_audio_source, "bt") == 0) {
-        wifiConnecting = false;
-        Serial.println(F("Mode: Bluetooth A2DP (pair from phone)"));
-        bt_audio_start_sink();
-        bt_audio_volume_apply(data.state, data.vol);
-        if (!(esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 && RadioConfig::wakeAfterSleepAnimMs > 0)) {
-            change_state();
-        }
-        syncWifiWithAudioSilence();
-        return;
-    }
+    Serial.printf("Board: Bender V3 | I2S BCK=%u LRC=%u DOUT=%u mute=%u | enc %u/%u/%u | mtrx CS=%u DAT=%u CLK=%u\n",
+                  (unsigned)RadioConfig::i2sBclk, (unsigned)RadioConfig::i2sLrc,
+                  (unsigned)RadioConfig::i2sDout, (unsigned)RadioConfig::ampMutePin,
+                  (unsigned)RadioConfig::encS1, (unsigned)RadioConfig::encS2,
+                  (unsigned)RadioConfig::encBtn, (unsigned)RadioConfig::mtrxCs,
+                  (unsigned)RadioConfig::mtrxDat, (unsigned)RadioConfig::mtrxClk);
 
     WifiStored w;
     nvsLoadWifi(w);
@@ -155,40 +172,79 @@ void loop() {
         return;
     }
 
+    // Пока играет — Wi‑Fi без modem sleep (иначе то тише/то громче, то срыв буфера).
+    if (data.state) {
+        WiFi.setSleep(false);
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        wifi_touch_activity();
+        // Только снять UART0 с GPIO44. НЕ вызывать setPinout в цикле — в yoRadio его нет,
+        // а повторный setPinout рвёт I2S DMA → «пшики» даже на низкой громкости.
+        static uint32_t s_uart0_guard_ms = 0;
+        if ((uint32_t)(millis() - s_uart0_guard_ms) > 5000u) {
+            s_uart0_guard_ms = millis();
+            free_uart0_from_i2s_pins();
+        }
+    }
+
     webUiLoop();
+    audio.loop();
+    audio.loop();
     audio.loop();
     if (!data.state || data.vol <= 0 || !audio.isRunning()) {
         pcm_analyzer_reset();
+    }
+
+    // Стрим умер при включённом радио — мягкий reconnect без переинициализации I2S.
+    static uint32_t s_stream_dead_ms = 0;
+    if (data.state && WiFi.status() == WL_CONNECTED && !audio.isRunning()) {
+        if (s_stream_dead_ms == 0) {
+            s_stream_dead_ms = millis();
+        } else if ((uint32_t)(millis() - s_stream_dead_ms) > 2500u && reconnect == nullptr) {
+            s_stream_dead_ms = millis();
+            reconnect = station_url_for_current();
+            Serial.println(F("[Audio] stream stalled → reconnect"));
+        }
+    } else {
+        s_stream_dead_ms = 0;
     }
 
     if (reconnect) {
         const char* host = reconnect;
         reconnect = nullptr;
 
-        if (audio.isRunning()) {
-            audio.setVolume(0);
-            uint32_t t0 = millis();
-            while (audio.isRunning() && millis() - t0 < RadioConfig::audioPauseSilenceRampMs) {
-                audio.loop();
-                delay(2);
-            }
+        if (!data.state) {
             if (audio.isRunning()) {
+                audio.stopSong();
+            }
+            apply_output_volume();
+            syncWifiWithAudioSilence();
+        } else {
+            WiFi.setSleep(false);
+            esp_wifi_set_ps(WIFI_PS_NONE);
+            audio.setVolume(0);
+
+            if (audio.isRunning()) {
+                audio.stopSong();
+            }
+
+            // Не трогаем setPinout на каждый reconnect — иначе «захлёбы» и щелчки.
+            audio.connecttohost(host);
+            if (!audio.isRunning()) {
                 audio.pauseResume();
             }
-        }
 
-        audio.connecttohost(host);
-        if (!audio.isRunning()) {
-            audio.pauseResume();
+            pcm_analyzer_begin_stream_settle();
+            {
+                const uint32_t t0 = millis();
+                while ((uint32_t)(millis() - t0) < RadioConfig::ampUnmuteAfterStreamMs) {
+                    audio.loop();
+                    delay(1);
+                }
+            }
+            apply_output_volume();
+            syncWifiWithAudioSilence();
+            wifi_touch_activity();
         }
-
-        pcm_analyzer_begin_stream_settle();
-
-        audio.setVolume(data.state ? data.vol : 0);
-        if (!data.state) {
-            audio.stopSong();
-        }
-        syncWifiWithAudioSilence();
     }
 
     if (!data.state && RadioConfig::loopDelayMsWhenRadioOff > 0) {

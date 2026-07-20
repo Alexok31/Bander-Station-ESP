@@ -23,6 +23,13 @@ extern const char* reconnect;
 extern volatile bool wifiConnecting;
 
 void change_state();
+// I2S/буфер — как можно раньше в setup(), до connecttohost (конструктор Audio уже поднял I2S).
+void audio_hw_init(bool log_serial = false);
+void apply_output_volume();
+void amp_force_mute();
+// ESP32-S3: UART0 по умолчанию на 43/44, у нас BCLK=44 — без этого при USB динамик молчит.
+void free_uart0_from_i2s_pins();
+const char* station_url_for_current();
 void anim_search();
 void core0(void *p);
 void syncWifiWithAudioSilence();
@@ -32,8 +39,9 @@ void matrix_get_brightness_trim(int8_t* outTrim, uint8_t count);
 void matrix_set_brightness_trim(const int8_t* trim, uint8_t count, bool persist);
 uint8_t matrix_get_base_brightness();
 
-// Источник звука: "wifi" (интернет-радио) или "bt" (Bluetooth A2DP). NVS "bende"/"aud". Смена через NVS + перезагрузка.
+// Источник звука: "wifi" (интернет-радио / PCM5100) или "bt" (BK8000L через CD4052). NVS "bende"/"aud".
 extern char g_audio_source[8];
+// enum + CD4052: AudioMux.h
 // true только после esp_restart() из commitSourceModeSwitch — короткие задержки вместо холодного старта.
 extern bool g_warm_boot_after_mode_switch;
 void commitSourceModeSwitch(const char* new_mode);

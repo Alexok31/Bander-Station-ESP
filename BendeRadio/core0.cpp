@@ -14,11 +14,10 @@
 
 #include "battery.h"
 #include "battery_matrix.h"
+#include "AudioMux.h"
 #include "BtAudio.h"
 #include "NvsConfig.h"
 #include "pong.h"
-#include "soc/timer_group_reg.h"
-#include "soc/timer_group_struct.h"
 #include "tmr.h"
 
 static inline uint8_t mouth_gfx_on(bool invert) {
@@ -59,6 +58,10 @@ static const char* station_url_by_index(int idx) {
     return stations[0];
 }
 
+const char* station_url_for_current() {
+    return station_url_by_index(data.station);
+}
+
 static void station_clamp_index() {
     const int total = (int)station_total_count();
     if (total <= 0) {
@@ -95,6 +98,23 @@ static inline bool matrix_display_ready() {
     return (int32_t)(millis() - g_matrix_display_enable_ms) >= 0;
 }
 
+static uint32_t s_matrix_last_flush_ms = 0;
+
+static void matrix_flush(bool force = false) {
+    const uint32_t now = millis();
+    if (!force) {
+        if (!matrix_display_ready()) {
+            return;
+        }
+        if (RadioConfig::matrixUpdateMinIntervalMs > 0 &&
+            (uint32_t)(now - s_matrix_last_flush_ms) < (uint32_t)RadioConfig::matrixUpdateMinIntervalMs) {
+            return;
+        }
+    }
+    s_matrix_last_flush_ms = now;
+    mtrx.update();
+}
+
 // func
 // ========================= MATRIX =========================
 static void matrix_apply_brightness(int base) {
@@ -122,13 +142,15 @@ static int matrix_base_max() {
 }
 
 void upd_bright() {
-    // Пауза / «спящие» глаза: базовая яркость 0 — каждая матрица только по своему offset калибровки.
     if (!data.state) {
-        matrix_apply_brightness(0);
+        matrix_apply_brightness((int)RadioConfig::matrixBrightnessIdleBase);
         return;
     }
     int v = max((int)data.bright_mouth, (int)data.bright_eyes);
     v = constrain(v, 0, matrix_base_max());
+    if (RadioConfig::matrixBrightnessWhenPlayingCap < 15) {
+        v = min(v, (int)RadioConfig::matrixBrightnessWhenPlayingCap);
+    }
     data.bright_mouth = (int8_t)v;
     data.bright_eyes = (int8_t)v;
     matrix_apply_brightness(v);
@@ -216,7 +238,7 @@ void print_val(char c, uint8_t v) {
     mtrx.print(v / 10);
     mtrx.setCursor(8 * 2 + 2, 1);
     mtrx.print(v % 10);
-    mtrx.update();
+    matrix_flush();
 }
 
 static void draw_batt_matrix_rows(const uint8_t rows[8]) {
@@ -255,7 +277,7 @@ static void print_batt_overlay(uint8_t pct) {
     mtrx.print((char)('0' + (v / 10)));
     mtrx.setCursor(8 * 2 + 2, 1);
     mtrx.print((char)('0' + (v % 10)));
-    mtrx.update();
+    matrix_flush();
 }
 
 void print_batt(uint8_t pct) {
@@ -495,7 +517,7 @@ void anim_search() {
         mtrx.rect(RadioConfig::analyzWidth, 2, RadioConfig::analyzWidth + 16 - 1, 5, GFX_FILL);
         draw_eyeb(0, pos, 3);
         draw_eyeb(1, pos, 3);
-        mtrx.update();
+        matrix_flush();
     }
 }
 
@@ -524,7 +546,7 @@ void change_state() {
             draw_eyes_radio_idle_off();
         }
     }
-    mtrx.update();
+    matrix_flush();
 }
 
 // ========================= ANALYZ =========================
@@ -1010,11 +1032,78 @@ void wifi_ap_toggle_from_core0() {
     print_val('A', 1);
 }
 
-static void apply_output_volume() {
+void apply_output_volume() {
+    int8_t vol = data.vol;
+    if (vol > RadioConfig::ampVolumeUiMax) {
+        vol = RadioConfig::ampVolumeUiMax;
+    }
+    if (vol < 0) {
+        vol = 0;
+    }
     if (strcmp(g_audio_source, "bt") == 0) {
-        bt_audio_volume_apply(data.state, data.vol);
+        bt_audio_volume_apply(data.state, vol);
     } else {
-        audio.setVolume(data.state ? data.vol : 0);
+        audio.setVolume(data.state ? vol : 0);
+    }
+    if (RadioConfig::ampMutePin == 255) {
+        return;
+    }
+    pinMode(RadioConfig::ampMutePin, OUTPUT);
+    if (!RadioConfig::ampUseHardwareMute) {
+        // MOSFET выкл: SD только выбирает L/R по резисторам схемы.
+        digitalWrite(RadioConfig::ampMutePin, RadioConfig::ampMuteWhenIdleHigh ? LOW : HIGH);
+        return;
+    }
+    const bool silent = !data.state || vol <= 0;
+    const bool mute_high = RadioConfig::ampMuteWhenIdleHigh ? silent : !silent;
+    digitalWrite(RadioConfig::ampMutePin, mute_high ? HIGH : LOW);
+}
+
+void free_uart0_from_i2s_pins() {
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+    // DevKit: UART0 RX=GPIO44, TX=GPIO43. Наш I2S BCLK = 44.
+    // При USB без CDC Serial садится на UART0 → оба усилителя молчат.
+    Serial0.end();
+#endif
+}
+
+void amp_force_mute() {
+    if (RadioConfig::ampMutePin == 255) {
+        return;
+    }
+    pinMode(RadioConfig::ampMutePin, OUTPUT);
+    if (!RadioConfig::ampUseHardwareMute) {
+        digitalWrite(RadioConfig::ampMutePin, RadioConfig::ampMuteWhenIdleHigh ? LOW : HIGH);
+        return;
+    }
+    digitalWrite(RadioConfig::ampMutePin, RadioConfig::ampMuteWhenIdleHigh ? HIGH : LOW);
+}
+
+void audio_hw_init(bool log_serial) {
+    static bool s_bufsize_done = false;
+    if (!s_bufsize_done) {
+        audio.setBufsize(RadioConfig::radioBuffer, -1);
+        s_bufsize_done = true;
+    }
+    amp_force_mute();
+    free_uart0_from_i2s_pins();
+    if (RadioConfig::pcm5102XsmtPin != 255) {
+        pinMode(RadioConfig::pcm5102XsmtPin, OUTPUT);
+        digitalWrite(RadioConfig::pcm5102XsmtPin, RadioConfig::pcm5102XsmtActiveHigh ? HIGH : LOW);
+    }
+    const bool pins_ok =
+        audio.setPinout(RadioConfig::i2sBclk, RadioConfig::i2sLrc, RadioConfig::i2sDout);
+    audio.forceMono(RadioConfig::ampForceMono);
+    // Как yoRadio player.init: баланс/тон в ноль (иначе мусор после прошлых экспериментов).
+    audio.setBalance(0);
+    audio.setTone(0, 0, 0);
+    audio.setVolume(0);
+    audio.setConnectionTimeout(1200, 2000);
+    if (log_serial) {
+        Serial.printf("I2S BCK=%u LRCK=%u DIN=%u mute=%u set_pin=%s vol=%d state=%d\n",
+                      (unsigned)RadioConfig::i2sBclk, (unsigned)RadioConfig::i2sLrc,
+                      (unsigned)RadioConfig::i2sDout, (unsigned)RadioConfig::ampMutePin,
+                      pins_ok ? "OK" : "FAIL", (int)data.vol, (int)data.state);
     }
 }
 
@@ -1038,7 +1127,7 @@ static void low_battery_enter_deep_sleep_forever() {
     uint8_t br_off[] = {0, 0, 0, 0, 0};
     mtrx.setBright(br_off);
     mtrx.clear();
-    mtrx.update();
+    matrix_flush();
     (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT0);
     (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT1);
     (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
@@ -1051,7 +1140,7 @@ static void low_battery_enter_deep_sleep_forever() {
 }
 
 static void battery_shutdown_guard_on_sample() {
-    if (!RadioConfig::batteryShutdownEnable || !RadioConfig::batteryMonitorEnable || !battery_gauge_ready()) {
+    if (!battery_low_power_sleep_active() || !battery_gauge_ready()) {
         return;
     }
     if (battery_is_charging()) {
@@ -1071,8 +1160,10 @@ void core0(void* p) {
     // ========================= SETUP =========================
     EncButton eb(RadioConfig::encS1, RadioConfig::encS2, RadioConfig::encBtn);
     eb.setClickTimeout(480);
-    Tmr viz_tmr(42);
-    Tmr eye_tmr(150);
+    eb.setDebTimeout(80);
+    eb.setEncType(EB_STEP4_LOW);
+    Tmr viz_tmr(RadioConfig::matrixVizRefreshMs);
+    Tmr eye_tmr(RadioConfig::matrixEyeRefreshMs);
     Tmr matrix_tmr(1000);
     Tmr angry_tmr(800);
     Tmr pong_tmr(145);
@@ -1090,6 +1181,12 @@ void core0(void* p) {
 
     EEPROM.begin(memory.blockSize());
     memory.begin(0, 'b');
+    // Не поднимать стрим на холодном старте из EEPROM — connecttohost + I2S + усилители → brownout.
+    data.state = false;
+    if (data.vol > RadioConfig::ampVolumeUiMax) {
+        data.vol = RadioConfig::ampVolumeUiMax;
+    }
+    apply_output_volume();
     {
         uint8_t b = 0;
         if (nvsTakePendingBrightnessOverride(b)) {
@@ -1125,14 +1222,14 @@ void core0(void* p) {
         for (uint8_t i = 0; i < RadioConfig::matrixColdBootFlushCycles; i++) {
             mtrx.clearDisplay();
             mtrx.clear();
-            mtrx.update();
+            matrix_flush(true);
             if (RadioConfig::matrixColdBootFlushGapMs > 0) {
                 delay(RadioConfig::matrixColdBootFlushGapMs);
             }
         }
     } else {
         mtrx.clear();
-        mtrx.update();
+        matrix_flush(true);
     }
     if (!g_warm_boot_after_mode_switch) {
         delay(RadioConfig::coldStartMatrixZeroMs);
@@ -1148,23 +1245,18 @@ void core0(void* p) {
         }
         g_matrix_display_enable_ms = millis() + addMs;
     }
-    if (matrix_display_ready()) {
-        upd_bright();
-        mtrx.update();
-        s_matrix_ui_started = true;
-    } else {
-        uint8_t br0[5] = {0, 0, 0, 0, 0};
-        mtrx.setBright(br0);
-        mtrx.clear();
-        mtrx.update();
-        s_matrix_ui_started = false;
-    }
+    upd_bright();
+    mtrx.clear();
+    // Сразу глаза — чтобы видно, что матрица жива ещё до Wi‑Fi.
+    draw_eyes_radio_idle_off();
+    matrix_flush(true);
+    s_matrix_ui_started = true;
 
-    audio.setBufsize(RadioConfig::radioBuffer, -1);
-    audio.setPinout(RadioConfig::i2sBclk, RadioConfig::i2sLrc, RadioConfig::i2sDout);
+    audio_hw_init(true);
     apply_output_volume();
     station_clamp_index();
-    reconnect = station_url_by_index(data.station);
+    // Стрим только после клика play (data.state) — иначе ребут-цикл при Wi‑Fi+I2S на старте.
+    reconnect = nullptr;
 
     battery_init();
     // Первый замер делаем сразу на старте, а не через интервальный таймер.
@@ -1177,6 +1269,9 @@ void core0(void* p) {
         s_pending_change_state_after_wake = true;
     }
     syncWifiWithAudioSilence();
+
+    Serial.printf("Matrix CLK=%u CS=%u DAT=%u, idle bright=%u\n", RadioConfig::mtrxClk,
+                  RadioConfig::mtrxCs, RadioConfig::mtrxDat, RadioConfig::matrixBrightnessIdleBase);
 
     // ========================= LOOP =========================
     for (;;) {
@@ -1238,7 +1333,7 @@ void core0(void* p) {
                 uint8_t br0[5] = {0, 0, 0, 0, 0};
                 mtrx.setBright(br0);
                 mtrx.clear();
-                mtrx.update();
+                matrix_flush();
             }
         }
 
@@ -1273,7 +1368,7 @@ void core0(void* p) {
                     uint8_t br_off[] = {0, 0, 0, 0, 0};
                     mtrx.setBright(br_off);
                     mtrx.clear();
-                    mtrx.update();
+                    matrix_flush();
                 }
                 // ext0: RTC GPIO encBtn, пробуждение при нажатии кнопки (LOW к GND, подтяжка вверх).
                 esp_sleep_enable_ext0_wakeup((gpio_num_t)RadioConfig::encBtn, 0);
@@ -1298,7 +1393,7 @@ void core0(void* p) {
                 const uint8_t r = bt_audio_take_remote_ui_request();
                 if (r == 1u && data.state) {
                     data.state = false;
-                    // Как при клике энкодером на паузу: не трогаем A2DP gain (иначе set_volume(0) и «нулятся» уши).
+                    apply_output_volume();
                     syncWifiWithAudioSilence();
                     change_state();
                 } else if (r == 2u && !data.state) {
@@ -1318,7 +1413,7 @@ void core0(void* p) {
                 pong_draw();
                 draw_eyes_follow_ball(pong_ball_x(), pong_ball_y());
                 pong_sync_matrix_brightness();
-                mtrx.update();
+                matrix_flush();
             }
             if (eb_e) {
                 if (eb.turn()) {
@@ -1331,7 +1426,7 @@ void core0(void* p) {
                         pong_draw();
                         draw_eyes_follow_ball(pong_ball_x(), pong_ball_y());
                         pong_sync_matrix_brightness();
-                        mtrx.update();
+                        matrix_flush();
                     }
                 }
                 if (eb.hasClicks()) {
@@ -1341,11 +1436,11 @@ void core0(void* p) {
                         pong_draw();
                         draw_eyes_follow_ball(pong_ball_x(), pong_ball_y());
                         pong_sync_matrix_brightness();
-                        mtrx.update();
+                        matrix_flush();
                     } else if (n == 6) {
                         pong_set_active(false);
                         upd_bright();
-                        mtrx.update();
+                        matrix_flush();
                     }
                 }
                 memory.update();
@@ -1359,7 +1454,7 @@ void core0(void* p) {
                 if (eye_tmr) {
                     if (battery_sad_eyes_wanted()) {
                         draw_battery_sad_eyes_both();
-                        mtrx.update();
+                        matrix_flush();
                     } else {
                         draw_eye(0);
                         draw_eye(1);
@@ -1395,7 +1490,7 @@ void core0(void* p) {
                                 }
                             }
                         }
-                        mtrx.update();
+                        matrix_flush();
                     }
                 }
             } else {
@@ -1410,7 +1505,7 @@ void core0(void* p) {
                     } else {
                         draw_eyes_radio_idle_off();
                     }
-                    mtrx.update();
+                    matrix_flush();
                 }
             }
 
@@ -1421,7 +1516,7 @@ void core0(void* p) {
             if (s_mode_pick_active) {
                 upd_bright();
                 draw_mode_pick_mouth();
-                mtrx.update();
+                matrix_flush();
             } else if (viz_tmr && !matrix_tmr.state() && data.state && data.mode <= 5) {
                 const uint8_t vol = pcm_vis_after_noise_gate(g_pcm_vis);
                 if (vol > pcm_pulse_l + 12) {
@@ -1456,7 +1551,7 @@ void core0(void* p) {
                         analyz0(v_mouth, false);
                         break;
                 }
-                mtrx.update();
+                matrix_flush();
             }
 
             }
@@ -1483,8 +1578,8 @@ void core0(void* p) {
                                 if (strcmp(g_audio_source, "bt") == 0) {
                                     bt_audio_avrcp_play();
                                 }
-                                apply_output_volume();
                             }
+                            apply_output_volume();
                             syncWifiWithAudioSilence();
                             change_state();
                             break;
@@ -1511,7 +1606,7 @@ void core0(void* p) {
                             pong_draw();
                             draw_eyes_follow_ball(pong_ball_x(), pong_ball_y());
                             pong_sync_matrix_brightness();
-                            mtrx.update();
+                            matrix_flush();
                             break;
                     }
                 }
@@ -1557,6 +1652,9 @@ void core0(void* p) {
                                 break;
                             }
                             case 3: {
+                                if (!RadioConfig::bluetoothEnable) {
+                                    break;
+                                }
                                 if (!s_mode_pick_active) {
                                     s_mode_pick_active = true;
                                     if (strcmp(g_audio_source, "bt") == 0) {
@@ -1579,12 +1677,13 @@ void core0(void* p) {
                                 break;
                         }
                     } else {
-                        if (data.state) {
+                        if (data.state && RadioConfig::encoderControlsVolume) {
                             angry_tmr.start();
                             data.vol += eb.dir();
-                            data.vol = constrain(data.vol, 0, 21);
+                            data.vol = constrain(data.vol, 0, RadioConfig::ampVolumeUiMax);
                             apply_output_volume();
                             syncWifiWithAudioSilence();
+                            Serial.printf("[Vol] %d\n", (int)data.vol);
                             print_val('v', data.vol);
                             s_batt_matrix_overlay = false;
                             matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
@@ -1637,8 +1736,5 @@ void core0(void* p) {
         if (RadioConfig::core0LoopDelayMs > 0) {
             delay(RadioConfig::core0LoopDelayMs);
         }
-        TIMERG0.wdt_wprotect = TIMG_WDT_WKEY_VALUE;  // write enable
-        TIMERG0.wdt_feed = 1;                        // feed dog
-        TIMERG0.wdt_wprotect = 0;                    // write protect
     }
 }

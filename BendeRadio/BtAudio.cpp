@@ -1,360 +1,313 @@
 #include "BtAudio.h"
 
 #include "RadioConfig.h"
-#include "core0.h"
 #include "pcm_analyzer.h"
 
-#include <BluetoothA2DPSink.h>
+#include <HardwareSerial.h>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <esp_avrc_api.h>
-#include <esp_system.h>
-#include <esp_idf_version.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/portmacro.h>
 
-static BluetoothA2DPSink g_a2dp_sink;
+// BK8000L: AT+XX + CRLF @ 9600 8N1. Аудио — аналог на CD4052 X1/Y1 (см. AudioMux).
+
+static HardwareSerial s_bt_uart(1);
+
 static bool g_sink_running = false;
+static bool g_link_connected = false;
+static bool g_is_playing = false;
+static bool g_uart_ready = false;
+static int8_t s_vol_applied = -1;
 
-static volatile uint32_t s_bt_track_duration_ms = 0;
-// Якорь для позиции: AVRCP play_pos обновляет редко или не приходит — при PLAYING добавляем (millis − anchor_wall).
-static volatile uint32_t s_bt_anchor_pos_ms = 0;
-static volatile uint32_t s_bt_anchor_wall_ms = 0;
-static volatile uint8_t s_bt_is_playing = 0;
-// После перемотки (AVRCP seek / next / prev) не экстраполировать, пока не придёт play_pos или таймаут.
-static volatile uint8_t s_bt_pos_resync_pending = 0;
-static volatile uint32_t s_bt_pos_resync_deadline_ms = 0;
-static volatile uint8_t s_bt_prev_playstat_u8 = 0xff;
-static volatile uint32_t s_bt_last_play_pos_rx_ms = 0u;
-static volatile uint32_t s_bt_last_play_pos_poll_ms = 0u;
-// До этой метки millis() чаще опрашиваем RN PLAY_POS (перемотка / resync).
-static uint32_t s_bt_pos_poll_burst_until_ms = 0u;
+static uint32_t s_track_duration_ms = 0;
+static uint32_t s_anchor_pos_ms = 0;
+static uint32_t s_anchor_wall_ms = 0;
+static uint32_t s_last_reconnect_ms = 0;
+static uint8_t s_cc_attempts = 0;
 
-static char s_bt_title[96];
-static char s_bt_artist[96];
-static volatile uint32_t s_bt_meta_serial = 0u;
-// 0 нет; 1 — пауза с телефона (как выкл. энкодером); 2 — плей с телефона. Читает только core0.
-static volatile uint8_t s_bt_remote_ui_req = 0u;
-static portMUX_TYPE s_bt_remote_ui_mux = portMUX_INITIALIZER_UNLOCKED;
+static char s_title[96];
+static char s_artist[96];
+static volatile uint32_t s_meta_serial = 0;
+static volatile uint8_t s_remote_ui_req = 0;
 
-static void bt_meta_bump_serial() {
-    s_bt_meta_serial++;
+static char s_rx_line[96];
+static uint8_t s_rx_len = 0;
+
+static void meta_bump() {
+    s_meta_serial++;
 }
 
-// Латиница a–z и типичная кириллица UTF‑8 (Ё/ё) → верхний регистр для бегущей строки.
-static void bt_fold_upper_in_place(char* s) {
-    auto* p = reinterpret_cast<unsigned char*>(s);
-    while (*p != 0u) {
-        if (*p >= 'a' && *p <= 'z') {
-            *p = static_cast<unsigned char>(*p - 32u);
-            ++p;
-            continue;
-        }
-        // а–п : D0 B0–BF → D0 90–AF
-        if (*p == 0xD0u && p[1] >= 0xB0u && p[1] <= 0xBFu) {
-            p[1] = static_cast<unsigned char>(p[1] - 0x20u);
-            p += 2;
-            continue;
-        }
-        // р–я : D1 80–8F → D0 A0–AF
-        if (*p == 0xD1u && p[1] >= 0x80u && p[1] <= 0x8Fu) {
-            *p = 0xD0u;
-            p[1] = static_cast<unsigned char>(p[1] + 0x20u);
-            p += 2;
-            continue;
-        }
-        // ё D1 91 → Ё D0 81
-        if (*p == 0xD1u && p[1] == 0x91u) {
-            p[0] = 0xD0u;
-            p[1] = 0x81u;
-            p += 2;
-            continue;
-        }
-        if ((*p & 0xE0u) == 0xC0u) {
-            p += 2;
-            continue;
-        }
-        if ((*p & 0xF0u) == 0xE0u) {
-            p += 3;
-            continue;
-        }
-        if ((*p & 0xF8u) == 0xF0u) {
-            p += 4;
-            continue;
-        }
-        ++p;
-    }
+static void meta_clear() {
+    s_title[0] = '\0';
+    s_artist[0] = '\0';
+    s_track_duration_ms = 0;
+    s_anchor_pos_ms = 0;
+    s_anchor_wall_ms = millis();
+    meta_bump();
 }
 
-static void bt_copy_meta_text(char* dst, size_t cap, const uint8_t* text) {
-    if (cap == 0u) {
+static void copy_meta_field(char* dst, size_t cap, const char* src) {
+    if (cap == 0) {
         return;
     }
-    if (text == nullptr) {
+    if (src == nullptr) {
         dst[0] = '\0';
         return;
     }
-    strncpy(dst, reinterpret_cast<const char*>(text), cap - 1u);
-    dst[cap - 1u] = '\0';
-    for (size_t i = 0; dst[i] != '\0'; i++) {
-        const char c = dst[i];
-        if (c == '\r' || c == '\n' || c == '\t') {
-            dst[i] = ' ';
+    strncpy(dst, src, cap - 1);
+    dst[cap - 1] = '\0';
+}
+
+static void bt_debug(const char* msg) {
+    if (RadioConfig::debugBtUartSerial) {
+        Serial.println(msg);
+    }
+}
+
+static void bt_send_cmd(const char* cmd) {
+    if (!g_uart_ready || cmd == nullptr) {
+        return;
+    }
+    char buf[32];
+    snprintf(buf, sizeof(buf), "AT+%s\r\n", cmd);
+    s_bt_uart.print(buf);
+    if (RadioConfig::debugBtUartSerial) {
+        Serial.print(F("[BT] >> "));
+        Serial.print(buf);
+    }
+}
+
+static void trim_rx_line(char* s) {
+    if (s == nullptr) {
+        return;
+    }
+    char* w = s;
+    while (*w == ' ' || *w == '\t') {
+        w++;
+    }
+    if (w != s) {
+        memmove(s, w, strlen(w) + 1);
+    }
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t')) {
+        s[--n] = '\0';
+    }
+}
+
+static bool line_is(const char* line, const char* token) {
+    return line != nullptr && token != nullptr && strcmp(line, token) == 0;
+}
+
+static void bt_handle_event_line(char* line) {
+    trim_rx_line(line);
+    if (line[0] == '\0') {
+        return;
+    }
+    if (RadioConfig::debugBtUartSerial) {
+        Serial.print(F("[BT] << "));
+        Serial.println(line);
+    }
+
+    if (line_is(line, "ON")) {
+        bt_debug("module ON");
+        return;
+    }
+    if (line_is(line, "II") || line_is(line, "M1")) {
+        bt_audio_set_link_connected(true);
+        return;
+    }
+    if (line_is(line, "IA") || line_is(line, "M0")) {
+        bt_audio_set_link_connected(false);
+        return;
+    }
+    if (line_is(line, "MB")) {
+        if (!g_link_connected) {
+            bt_audio_set_link_connected(true);
+        }
+        bt_audio_set_playing(true);
+        return;
+    }
+    if (line_is(line, "MA")) {
+        bt_audio_set_playing(false);
+        return;
+    }
+}
+
+static void bt_uart_push_char(char c) {
+    if (c == '\r') {
+        return;
+    }
+    if (c == '\n') {
+        if (s_rx_len > 0) {
+            s_rx_line[s_rx_len] = '\0';
+            bt_handle_event_line(s_rx_line);
+            s_rx_len = 0;
+        }
+        return;
+    }
+    if (s_rx_len + 1 >= sizeof(s_rx_line)) {
+        s_rx_len = 0;
+        return;
+    }
+    s_rx_line[s_rx_len++] = c;
+}
+
+static void bt_uart_poll() {
+    while (g_uart_ready && s_bt_uart.available() > 0) {
+        bt_uart_push_char((char)s_bt_uart.read());
+    }
+}
+
+static void bt_uart_begin() {
+    if (RadioConfig::bk8000UartRxPin == 255 || RadioConfig::bk8000UartTxPin == 255) {
+        g_uart_ready = false;
+        return;
+    }
+    s_bt_uart.end();
+    s_bt_uart.begin(RadioConfig::bk8000UartBaud, SERIAL_8N1, RadioConfig::bk8000UartRxPin,
+                    RadioConfig::bk8000UartTxPin);
+    g_uart_ready = true;
+    s_rx_len = 0;
+    delay(RadioConfig::bk8000UartBootMs);
+}
+
+static void bt_uart_end() {
+    if (g_uart_ready) {
+        s_bt_uart.end();
+    }
+    g_uart_ready = false;
+    s_rx_len = 0;
+}
+
+static void bt_module_power_set(bool on) {
+    if (RadioConfig::btModulePowerEnablePin == 255) {
+        return;
+    }
+    pinMode(RadioConfig::btModulePowerEnablePin, OUTPUT);
+    const bool level = on ? RadioConfig::btModulePowerActiveHigh
+                          : !RadioConfig::btModulePowerActiveHigh;
+    digitalWrite(RadioConfig::btModulePowerEnablePin, level ? HIGH : LOW);
+}
+
+static void bt_audio_shutdown_impl(bool send_at_powerdown) {
+    if (g_uart_ready && send_at_powerdown && RadioConfig::btModuleAtPowerDownOnWifi) {
+        bt_send_cmd("CD");
+        bt_send_cmd("CP");
+        delay(80);
+        while (s_bt_uart.available() > 0) {
+            (void)s_bt_uart.read();
         }
     }
-    bt_fold_upper_in_place(dst);
+    bt_uart_end();
+    bt_module_power_set(false);
+
+    g_sink_running = false;
+    g_link_connected = false;
+    g_is_playing = false;
+    s_vol_applied = -1;
+    s_cc_attempts = 0;
+    meta_clear();
+    s_remote_ui_req = 0;
+    pcm_analyzer_reset();
 }
 
-static bool bt_playstat_is_seek(esp_avrc_playback_stat_t st) {
-    return st == ESP_AVRC_PLAYBACK_FWD_SEEK || st == ESP_AVRC_PLAYBACK_REV_SEEK;
-}
-
-static void bt_remote_ui_queue_from_playstat(esp_avrc_playback_stat_t prev, esp_avrc_playback_stat_t st) {
-    if (!g_sink_running || strcmp(g_audio_source, "bt") != 0) {
+void bt_audio_set_link_connected(bool connected) {
+    if (g_link_connected == connected) {
         return;
     }
-    // Пока ползунок scrub — не меняем «спящий» режим.
-    if (bt_playstat_is_seek(st)) {
+    g_link_connected = connected;
+    if (!connected) {
+        g_is_playing = false;
+        meta_clear();
+        s_remote_ui_req = 0;
+        s_vol_applied = -1;
+        pcm_analyzer_reset();
+    } else {
+        s_cc_attempts = 0;
+        s_last_reconnect_ms = millis();
+    }
+}
+
+void bt_audio_set_playing(bool playing) {
+    if (g_is_playing == playing) {
         return;
     }
-    const bool now_play = (st == ESP_AVRC_PLAYBACK_PLAYING);
-    const bool now_idle =
-        (st == ESP_AVRC_PLAYBACK_PAUSED || st == ESP_AVRC_PLAYBACK_STOPPED);
-    const bool prev_active =
-        (prev == ESP_AVRC_PLAYBACK_PLAYING || bt_playstat_is_seek(prev));
-
-    portENTER_CRITICAL(&s_bt_remote_ui_mux);
-    // Пауза после PLAYING или после seek (телефон часто шлёт PAUSED с prev=SEEK).
-    if (now_idle && prev_active) {
-        s_bt_remote_ui_req = 1u;
-    } else if (now_play && prev != ESP_AVRC_PLAYBACK_PLAYING) {
-        s_bt_remote_ui_req = 2u;
-    }
-    portEXIT_CRITICAL(&s_bt_remote_ui_mux);
-}
-
-static void bt_avrc_play_pos_cb(uint32_t play_pos_ms);
-void bt_audio_poll_track_position();
-
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 0, 0)
-static void bt_avrcp_notify_play_pos_changed(uint32_t min_gap_ms) {
-    if (!g_sink_running || !g_a2dp_sink.is_connected() || !g_a2dp_sink.is_avrc_connected()) {
-        return;
-    }
-    const uint32_t now = millis();
-    if (min_gap_ms != 0u && (uint32_t)(now - s_bt_last_play_pos_poll_ms) < min_gap_ms) {
-        return;
-    }
-    s_bt_last_play_pos_poll_ms = now;
-    (void)esp_avrc_ct_send_register_notification_cmd(APP_RC_CT_TL_RN_PLAY_POS_CHANGE,
-                                                     (uint8_t)ESP_AVRC_RN_PLAY_POS_CHANGED, 1u);
-}
-#else
-static void bt_avrcp_notify_play_pos_changed(uint32_t min_gap_ms) {
-    (void)min_gap_ms;
-}
-#endif
-
-static void bt_request_pos_resync() {
-    s_bt_pos_resync_pending = 1u;
-    s_bt_pos_resync_deadline_ms = millis() + 10000u;
-    s_bt_pos_poll_burst_until_ms = millis() + 12000u;
-    g_a2dp_sink.set_avrc_rn_play_pos_callback(bt_avrc_play_pos_cb, 1);
-    bt_avrcp_notify_play_pos_changed(0u);
-}
-
-static void bt_avrc_metadata_cb(uint8_t attr_id, const uint8_t* text) {
-    if (attr_id == (uint8_t)ESP_AVRC_MD_ATTR_PLAYING_TIME && text != nullptr) {
-        const uint32_t v = (uint32_t)strtoul(reinterpret_cast<const char*>(text), nullptr, 10);
-        const uint32_t prev = s_bt_track_duration_ms;
-        s_bt_track_duration_ms = v;
-        if (prev != v) {
-            s_bt_anchor_pos_ms = 0;
-            s_bt_anchor_wall_ms = millis();
-        }
-        return;
-    }
-    if (attr_id == (uint8_t)ESP_AVRC_MD_ATTR_TITLE) {
-        char tmp[sizeof(s_bt_title)];
-        bt_copy_meta_text(tmp, sizeof(tmp), text);
-        if (strcmp(tmp, s_bt_title) != 0) {
-            strncpy(s_bt_title, tmp, sizeof(s_bt_title) - 1u);
-            s_bt_title[sizeof(s_bt_title) - 1u] = '\0';
-            bt_meta_bump_serial();
-        }
-        return;
-    }
-    if (attr_id == (uint8_t)ESP_AVRC_MD_ATTR_ARTIST) {
-        char tmp[sizeof(s_bt_artist)];
-        bt_copy_meta_text(tmp, sizeof(tmp), text);
-        if (strcmp(tmp, s_bt_artist) != 0) {
-            strncpy(s_bt_artist, tmp, sizeof(s_bt_artist) - 1u);
-            s_bt_artist[sizeof(s_bt_artist) - 1u] = '\0';
-            bt_meta_bump_serial();
-        }
+    g_is_playing = playing;
+    s_anchor_wall_ms = millis();
+    if (playing) {
+        s_remote_ui_req = 2;
+    } else {
+        s_remote_ui_req = 1;
     }
 }
 
-static void bt_avrc_play_pos_cb(uint32_t play_pos_ms) {
-    s_bt_anchor_pos_ms = play_pos_ms;
-    const uint32_t now = millis();
-    s_bt_anchor_wall_ms = now;
-    s_bt_last_play_pos_rx_ms = now;
-    s_bt_pos_resync_pending = 0u;
+void bt_audio_set_track_meta(const char* title, const char* artist) {
+    char t[sizeof(s_title)];
+    char a[sizeof(s_artist)];
+    copy_meta_field(t, sizeof(t), title);
+    copy_meta_field(a, sizeof(a), artist);
+    if (strcmp(t, s_title) != 0 || strcmp(a, s_artist) != 0) {
+        strncpy(s_title, t, sizeof(s_title) - 1);
+        strncpy(s_artist, a, sizeof(s_artist) - 1);
+        meta_bump();
+    }
 }
 
-static void bt_freeze_extrapolation_to_anchor() {
-    if (s_bt_is_playing == 0u) {
-        return;
-    }
-    const uint32_t dur = s_bt_track_duration_ms;
-    const uint32_t now = millis();
-    uint64_t pos = (uint64_t)s_bt_anchor_pos_ms + (uint64_t)(now - s_bt_anchor_wall_ms);
-    if (dur > 1u && pos >= dur) {
-        pos = dur - 1u;
-    }
-    s_bt_anchor_pos_ms = (uint32_t)pos;
-    s_bt_anchor_wall_ms = now;
+void bt_audio_set_track_times_ms(uint32_t position_ms, uint32_t duration_ms) {
+    s_track_duration_ms = duration_ms;
+    s_anchor_pos_ms = position_ms;
+    s_anchor_wall_ms = millis();
 }
 
-static void bt_avrc_playstatus_cb(esp_avrc_playback_stat_t st) {
-    const bool have_prev = (s_bt_prev_playstat_u8 != 0xffu);
-    esp_avrc_playback_stat_t prev =
-        have_prev ? (esp_avrc_playback_stat_t)s_bt_prev_playstat_u8 : st;
-    // После смены трека prev сбрасывается; телефон часто не шлёт повторный PLAYING.
-    // Без этого prev=st=PAUSED → «нет перехода» и первая пауза не зеркалится в UI.
-    if (!have_prev && s_bt_is_playing != 0u &&
-        (st == ESP_AVRC_PLAYBACK_PAUSED || st == ESP_AVRC_PLAYBACK_STOPPED)) {
-        prev = ESP_AVRC_PLAYBACK_PLAYING;
+void bt_audio_queue_remote_ui(uint8_t req) {
+    if (req <= 2u) {
+        s_remote_ui_req = req;
     }
-    // Заход в плеер часто даёт track-change → prev=0xff; первый PLAYING иначе даёт prev=st=PLAYING
-    // и «глаза» не выходят из сна до второго цикла пауза/play.
-    if (!have_prev && s_bt_is_playing == 0u && st == ESP_AVRC_PLAYBACK_PLAYING) {
-        prev = ESP_AVRC_PLAYBACK_PAUSED;
-    }
-
-    const bool was_extrap = (s_bt_is_playing != 0u);
-    const bool is_extrap = (st == ESP_AVRC_PLAYBACK_PLAYING);
-    const bool seek_now = bt_playstat_is_seek(st);
-    const bool seek_prev = bt_playstat_is_seek(prev);
-
-    if (was_extrap && seek_now) {
-        // PLAYING → перемотка: зафиксировать текущую оценку на время seek
-        bt_freeze_extrapolation_to_anchor();
-        // Часть телефонов не шлёт FWD/REV_SEEK только в конце — опрос и во время scrub.
-        s_bt_pos_poll_burst_until_ms = millis() + 15000u;
-        bt_avrcp_notify_play_pos_changed(0u);
-    } else if (was_extrap && !is_extrap && !seek_now) {
-        // пауза / стоп
-        bt_freeze_extrapolation_to_anchor();
-    }
-
-    if (seek_prev && is_extrap) {
-        // конец перемотки → снова PLAYING: ждём реальную позицию с телефона
-        s_bt_anchor_wall_ms = millis();
-        bt_request_pos_resync();
-    } else if (!was_extrap && is_extrap && !seek_prev) {
-        // пауза → play (не после seek)
-        s_bt_anchor_wall_ms = millis();
-    }
-
-    bt_remote_ui_queue_from_playstat(prev, st);
-
-    s_bt_is_playing = is_extrap ? 1u : 0u;
-    s_bt_prev_playstat_u8 = (uint8_t)st;
 }
 
-static void bt_avrc_track_change_cb(uint8_t* /*uid*/) {
-    s_bt_track_duration_ms = 0;
-    s_bt_title[0] = '\0';
-    s_bt_artist[0] = '\0';
-    bt_meta_bump_serial();
-    s_bt_anchor_pos_ms = 0;
-    s_bt_anchor_wall_ms = millis();
-    // На некоторых телефонах PLAY_STATUS после смены трека не приходит: не сбрасываем play-state в 0 принудительно.
-    s_bt_pos_resync_pending = 1u;
-    s_bt_pos_resync_deadline_ms = millis() + 10000u;
-    s_bt_pos_poll_burst_until_ms = millis() + 12000u;
-    s_bt_prev_playstat_u8 = 0xffu;
-    bt_avrcp_notify_play_pos_changed(0u);
-}
-
-// До volume_control() в BluetoothA2DPSink — иначе после громкости телефона/синка уровень для анализа часто у нуля.
-static void bt_a2dp_pcm_raw_cb(const uint8_t* data, uint32_t len) {
-    pcm_analyzer_on_bt_pcm_bytes(data, len);
-}
-
-static uint32_t s_bt_next_reconnect_ms = 0;
-static uint8_t s_bt_reconnect_attempts = 0;
-
-static void bt_audio_start_sink_impl(bool reconnect_last_device) {
-    if (g_sink_running) {
-        return;
-    }
-    s_bt_next_reconnect_ms = 0;
-    s_bt_reconnect_attempts = 0;
-
-    i2s_pin_config_t pin_config = {};
-    pin_config.bck_io_num = RadioConfig::i2sBclk;
-    pin_config.ws_io_num = RadioConfig::i2sLrc;
-    pin_config.data_out_num = RadioConfig::i2sDout;
-    pin_config.data_in_num = I2S_PIN_NO_CHANGE;
-
-    g_a2dp_sink.set_pin_config(pin_config);
-    g_a2dp_sink.set_reconnect_delay((int)RadioConfig::btA2dpLastConnPreStackDelayMs);
-    g_a2dp_sink.set_raw_stream_reader(bt_a2dp_pcm_raw_cb);
-    g_a2dp_sink.set_avrc_metadata_attribute_mask(ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST |
-                                                 ESP_AVRC_MD_ATTR_ALBUM | ESP_AVRC_MD_ATTR_TRACK_NUM |
-                                                 ESP_AVRC_MD_ATTR_NUM_TRACKS | ESP_AVRC_MD_ATTR_GENRE |
-                                                 ESP_AVRC_MD_ATTR_PLAYING_TIME);
-    g_a2dp_sink.set_avrc_metadata_callback(bt_avrc_metadata_cb);
-    g_a2dp_sink.set_avrc_rn_play_pos_callback(bt_avrc_play_pos_cb, 1);
-    g_a2dp_sink.set_avrc_rn_playstatus_callback(bt_avrc_playstatus_cb);
-    g_a2dp_sink.set_avrc_rn_track_change_callback(bt_avrc_track_change_cb);
-    // Второй аргумент: autoreconnect + last BDA из NVS (если true).
-    g_a2dp_sink.start(RadioConfig::btSinkName, reconnect_last_device);
-    g_sink_running = true;
+void bt_audio_shutdown_for_wifi_mode() {
+    bt_audio_shutdown_impl(true);
 }
 
 void bt_audio_start_sink() {
-    bt_audio_start_sink_impl(true);
+    if (g_sink_running) {
+        return;
+    }
+    bt_module_power_set(true);
+    if (RadioConfig::btModulePowerEnablePin != 255) {
+        delay(RadioConfig::btModulePowerOnDelayMs);
+    }
+    g_sink_running = true;
+    g_link_connected = false;
+    g_is_playing = false;
+    s_vol_applied = -1;
+    meta_clear();
+    s_remote_ui_req = 0;
+    s_last_reconnect_ms = millis();
+    s_cc_attempts = 0;
+
+    bt_uart_begin();
+    bt_send_cmd("CC");
+    s_cc_attempts = 1;
 }
 
 void bt_audio_stop_sink() {
-    if (!g_sink_running) {
-        return;
-    }
-    g_a2dp_sink.set_avrc_metadata_callback(nullptr);
-    g_a2dp_sink.set_avrc_rn_play_pos_callback(nullptr, 1);
-    g_a2dp_sink.set_avrc_rn_playstatus_callback(nullptr);
-    g_a2dp_sink.set_avrc_rn_track_change_callback(nullptr);
-    s_bt_track_duration_ms = 0;
-    s_bt_anchor_pos_ms = 0;
-    s_bt_anchor_wall_ms = 0;
-    s_bt_is_playing = 0;
-    s_bt_pos_resync_pending = 0u;
-    s_bt_prev_playstat_u8 = 0xffu;
-    s_bt_last_play_pos_rx_ms = 0u;
-    s_bt_last_play_pos_poll_ms = 0u;
-    s_bt_pos_poll_burst_until_ms = 0u;
-    s_bt_title[0] = '\0';
-    s_bt_artist[0] = '\0';
-    bt_meta_bump_serial();
-    portENTER_CRITICAL(&s_bt_remote_ui_mux);
-    s_bt_remote_ui_req = 0u;
-    portEXIT_CRITICAL(&s_bt_remote_ui_mux);
-    g_a2dp_sink.set_raw_stream_reader(nullptr);
-    g_a2dp_sink.set_stream_reader(nullptr, true);
-    g_a2dp_sink.end(true);
-    g_sink_running = false;
-    s_bt_next_reconnect_ms = 0;
-    s_bt_reconnect_attempts = 0;
+    bt_audio_shutdown_impl(true);
 }
 
 void bt_audio_forget_paired_devices() {
-    g_a2dp_sink.disconnect();
-    g_a2dp_sink.set_auto_reconnect(false);
+    if (!g_sink_running) {
+        bt_audio_start_sink();
+    }
+    bt_send_cmd("CD");
+    bt_send_cmd("CZ");
+    g_link_connected = false;
+    g_is_playing = false;
+    s_vol_applied = -1;
+    meta_clear();
+    s_remote_ui_req = 0;
+    pcm_analyzer_reset();
+    delay(120);
+    bt_send_cmd("CA");
+    s_last_reconnect_ms = millis();
 }
 
 bool bt_audio_is_sink_running() {
@@ -362,175 +315,131 @@ bool bt_audio_is_sink_running() {
 }
 
 bool bt_audio_needs_pairing_ui() {
-    if (!g_sink_running) {
+    if (!RadioConfig::btShowPairingSearchEyes) {
         return false;
     }
-    return !g_a2dp_sink.is_connected();
+    return g_sink_running && !g_link_connected;
 }
 
 void bt_audio_tick() {
     if (!g_sink_running) {
         return;
     }
-    if (g_a2dp_sink.is_connected()) {
-        s_bt_reconnect_attempts = 0;
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 0, 0)
-        if (g_a2dp_sink.is_avrc_connected() && s_bt_track_duration_ms > 1u) {
-            const uint32_t now = millis();
-            const bool burst =
-                ((int32_t)(s_bt_pos_poll_burst_until_ms - now) > 0) || (s_bt_pos_resync_pending != 0u);
-            if (burst) {
-                bt_avrcp_notify_play_pos_changed(400u);
-            } else if (s_bt_is_playing != 0u &&
-                       (uint32_t)(now - s_bt_last_play_pos_rx_ms) >= 4000u) {
-                // Телефон мог «тихо» перемотать в состоянии PLAYING без FWD/REV_SEEK.
-                bt_avrcp_notify_play_pos_changed(2000u);
-            }
-        }
-#endif
+    bt_uart_poll();
+
+    if (g_link_connected) {
         return;
+    }
+
+    uint32_t interval = RadioConfig::bk8000ReconnectIntervalMs;
+    if (s_cc_attempts >= RadioConfig::bk8000ReconnectMaxAttempts) {
+        interval = 60000;
     }
     const uint32_t now = millis();
-    if (s_bt_next_reconnect_ms == 0) {
-        s_bt_next_reconnect_ms = now + RadioConfig::btReconnectFirstDelayMs;
-    }
-    if ((int32_t)(now - s_bt_next_reconnect_ms) < 0) {
+    if ((uint32_t)(now - s_last_reconnect_ms) < interval) {
         return;
     }
-    (void)g_a2dp_sink.reconnect();
-    s_bt_reconnect_attempts++;
-    if (s_bt_reconnect_attempts < RadioConfig::btReconnectBurstCount) {
-        s_bt_next_reconnect_ms = now + RadioConfig::btReconnectRetryMs;
-    } else {
-        s_bt_next_reconnect_ms = now + 45000u;
+    s_last_reconnect_ms = now;
+    if (s_cc_attempts < 255) {
+        s_cc_attempts++;
     }
+    bt_send_cmd("CC");
 }
 
 void bt_audio_volume_apply(bool audio_on, int8_t vol_ui) {
-    if (!g_sink_running) {
+    if (!g_sink_running || !g_uart_ready) {
         return;
     }
-    if (!audio_on || vol_ui <= 0) {
-        g_a2dp_sink.set_volume(0);
+    if (!audio_on) {
+        s_vol_applied = -1;
         return;
     }
-    uint8_t v = (uint8_t)(((int)vol_ui * 127 + 10) / 21);
-    if (v > 127) {
-        v = 127;
+    int target = constrain((int)vol_ui, 0, 21);
+    if (s_vol_applied < 0) {
+        s_vol_applied = target;
+        return;
     }
-    g_a2dp_sink.set_volume(v);
+    while (s_vol_applied < target) {
+        bt_send_cmd("CK");
+        s_vol_applied++;
+    }
+    while (s_vol_applied > target) {
+        bt_send_cmd("CL");
+        s_vol_applied--;
+    }
 }
 
 void bt_audio_avrcp_pause() {
-    if (!g_sink_running || !g_a2dp_sink.is_connected() || !g_a2dp_sink.is_avrc_connected()) {
+    if (!g_link_connected) {
         return;
     }
-    g_a2dp_sink.pause();
-    bt_freeze_extrapolation_to_anchor();
-    s_bt_is_playing = 0;
-    s_bt_pos_resync_pending = 0u;
+    bt_send_cmd("MA");
+    g_is_playing = false;
+    s_anchor_wall_ms = millis();
 }
 
 void bt_audio_avrcp_play() {
-    if (!g_sink_running || !g_a2dp_sink.is_connected() || !g_a2dp_sink.is_avrc_connected()) {
+    if (!g_link_connected) {
         return;
     }
-    g_a2dp_sink.play();
-    s_bt_is_playing = 1;
-    s_bt_anchor_wall_ms = millis();
-    s_bt_pos_resync_pending = 0u;
+    bt_send_cmd("MA");
+    g_is_playing = true;
+    s_anchor_wall_ms = millis();
 }
 
 void bt_audio_avrcp_next() {
-    if (!g_sink_running || !g_a2dp_sink.is_connected() || !g_a2dp_sink.is_avrc_connected()) {
-        return;
-    }
-    if (s_bt_is_playing != 0u) {
-        bt_freeze_extrapolation_to_anchor();
-    }
-    g_a2dp_sink.next();
-    bt_request_pos_resync();
+    bt_send_cmd("MF");
 }
 
 void bt_audio_avrcp_previous() {
-    if (!g_sink_running || !g_a2dp_sink.is_connected() || !g_a2dp_sink.is_avrc_connected()) {
-        return;
-    }
-    if (s_bt_is_playing != 0u) {
-        bt_freeze_extrapolation_to_anchor();
-    }
-    g_a2dp_sink.previous();
-    bt_request_pos_resync();
+    bt_send_cmd("MH");
 }
 
 uint32_t bt_audio_track_duration_ms() {
-    return s_bt_track_duration_ms;
+    return s_track_duration_ms;
 }
 
 void bt_audio_poll_track_position() {
-    bt_avrcp_notify_play_pos_changed(1500u);
+    // MV по UART иногда даёт щелчок в аналоге — метаданные позже с BK8000L.
 }
 
 uint32_t bt_audio_track_meta_serial() {
-    return s_bt_meta_serial;
+    return s_meta_serial;
 }
 
 uint8_t bt_audio_take_remote_ui_request() {
-    portENTER_CRITICAL(&s_bt_remote_ui_mux);
-    const uint8_t v = s_bt_remote_ui_req;
-    s_bt_remote_ui_req = 0u;
-    portEXIT_CRITICAL(&s_bt_remote_ui_mux);
+    const uint8_t v = s_remote_ui_req;
+    s_remote_ui_req = 0;
     return v;
 }
 
 const char* bt_audio_track_scroll_cstr() {
-    if (s_bt_title[0] == '\0' && s_bt_artist[0] == '\0') {
-        return "BT";
+    if (s_title[0] == '\0' && s_artist[0] == '\0') {
+        return g_link_connected ? "BT" : "BT pair";
     }
-    if (s_bt_artist[0] == '\0') {
-        return s_bt_title;
+    if (s_artist[0] == '\0') {
+        return s_title;
     }
-    if (s_bt_title[0] == '\0') {
-        return s_bt_artist;
+    if (s_title[0] == '\0') {
+        return s_artist;
     }
-    static char line[sizeof(s_bt_title) + sizeof(s_bt_artist) + 8u];
-    (void)snprintf(line, sizeof(line), "%s  |  %s", s_bt_title, s_bt_artist);
-    line[sizeof(line) - 1u] = '\0';
+    static char line[sizeof(s_title) + sizeof(s_artist) + 8];
+    snprintf(line, sizeof(line), "%s  |  %s", s_title, s_artist);
+    line[sizeof(line) - 1] = '\0';
     return line;
 }
 
 uint32_t bt_audio_track_position_ms() {
-    const uint32_t dur = s_bt_track_duration_ms;
+    const uint32_t dur = s_track_duration_ms;
     if (dur <= 1u) {
         return 0;
     }
-    if (s_bt_pos_resync_pending != 0u) {
-        const uint32_t now = millis();
-        if ((int32_t)(now - s_bt_pos_resync_deadline_ms) >= 0) {
-            s_bt_pos_resync_pending = 0u;
-        } else if (s_bt_is_playing != 0u) {
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 0, 0)
-            bt_avrcp_notify_play_pos_changed(400u);
-#endif
-            uint32_t p = s_bt_anchor_pos_ms;
-            if (p >= dur) {
-                p = dur - 1u;
-            }
-            return p;
-        }
-    }
-    if (s_bt_is_playing == 0u) {
-        uint32_t p = s_bt_anchor_pos_ms;
-        if (p >= dur) {
-            p = dur - 1u;
-        }
-        return p;
+    if (!g_is_playing) {
+        uint32_t p = s_anchor_pos_ms;
+        return (p >= dur) ? (dur - 1u) : p;
     }
     const uint32_t now = millis();
-    if ((uint32_t)(now - s_bt_last_play_pos_rx_ms) >= 3500u) {
-        bt_audio_poll_track_position();
-    }
-    uint64_t pos = (uint64_t)s_bt_anchor_pos_ms + (uint64_t)(now - s_bt_anchor_wall_ms);
+    uint64_t pos = (uint64_t)s_anchor_pos_ms + (uint64_t)(now - s_anchor_wall_ms);
     if (pos >= dur) {
         return dur - 1u;
     }

@@ -16,3 +16,6 @@ bool battery_is_charging();
 
 // 0 веселий (≥batteryMoodCheerfulMinPct), 1 звичайний, 2 сумний (<batteryMoodNormalMinPct).
 uint8_t battery_eye_mood();
+
+// true — можно уводить в deep sleep по критическому % (нужны и АЦП, и пин зарядки).
+bool battery_low_power_sleep_active();

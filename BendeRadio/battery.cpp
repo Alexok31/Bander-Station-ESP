@@ -172,6 +172,12 @@ bool battery_is_charging() {
     return s_charging_cached;
 }
 
+bool battery_low_power_sleep_active() {
+    // Без линии зарядки с IP2326 нельзя отличить «идёт зарядка» от «сел АКБ» — не уходим в вечный deep sleep.
+    return RadioConfig::batteryShutdownEnable && RadioConfig::batteryMonitorEnable &&
+           RadioConfig::chargingDetectEnable;
+}
+
 uint8_t battery_eye_mood() {
     if (!RadioConfig::batteryMonitorEnable) {
         return 1u;

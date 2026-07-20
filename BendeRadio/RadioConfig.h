@@ -14,39 +14,78 @@ class RadioConfig {
     // Пароль AP не короче 8 символов (WPA2). Пустая строка = открытая сеть (только для отладки).
     static constexpr const char* apPassDefault = "benderadio";
 
-    static constexpr uint8_t i2sDout = 25;
-    static constexpr uint8_t i2sBclk = 27;
-    static constexpr uint8_t i2sLrc = 26;
-    // Имя Bluetooth A2DP sink (телефон увидит это в списке сопряжения).
+    // Плата Bender V3 (ESP32-S3-N16R8): I2S → два MAX98357A (L+R). Пины как myoptions.h / bender.cpp.
+    static constexpr uint8_t i2sDout = 21;
+    static constexpr uint8_t i2sBclk = 44;
+    static constexpr uint8_t i2sLrc = 2;
+    // Как yoRadio: MUTE_PIN=41, MUTE_VAL=HIGH когда плеер остановлен; при play — !MUTE_VAL.
+    // false снова «всегда unmute» (хуже для щелчков на SD).
+    static constexpr bool ampUseHardwareMute = true;
+    static constexpr uint8_t ampMutePin = 41;
+    static constexpr bool ampMuteWhenIdleHigh = true;  // MUTE_VAL HIGH
+    static constexpr uint16_t ampUnmuteAfterStreamMs = 700;
+    static constexpr int8_t ampVolumeUiMax = 21;
+    // Стерео: L и R через SD-резисторы схемы (как yoRadio PLAYER_FORCE_MONO=false).
+    static constexpr bool ampForceMono = false;
+    // false — энкодер не крутит громкость (диагностика). true — обычный режим.
+    static constexpr bool encoderControlsVolume = true;
+    // Старый PCM5102 XSMT — на этой плате не используется.
+    static constexpr uint8_t pcm5102XsmtPin = 255;
+    static constexpr bool pcm5102XsmtActiveHigh = true;
+    // CD4052 / BK8000L на этой плате нет.
+    static constexpr uint8_t audioMuxSelectPin = 255;
+    static constexpr bool audioMuxWifiIsGpioLow = true;
+    static constexpr uint16_t audioMuxSettleUs = 50;
+    static constexpr bool bluetoothEnable = false;
+    static constexpr uint8_t bk8000UartTxPin = 255;
+    static constexpr uint8_t bk8000UartRxPin = 255;
+    static constexpr uint32_t bk8000UartBaud = 9600;
+    static constexpr uint32_t bk8000UartBootMs = 400;
+    static constexpr uint32_t bk8000ReconnectIntervalMs = 12000;
+    static constexpr uint8_t bk8000ReconnectMaxAttempts = 3;
+    static constexpr bool debugBtUartSerial = false;
+    static constexpr uint8_t btModulePowerEnablePin = 255;
+    static constexpr bool btModulePowerActiveHigh = true;
+    static constexpr uint16_t btModulePowerOnDelayMs = 150;
+    static constexpr bool btModuleAtPowerDownOnWifi = false;
     static constexpr const char* btSinkName = "Bender Station";
-    // Автоподключение к последнему телефону: пауза перед первым reconnect из loop; интервал повторов.
     static constexpr uint32_t btReconnectFirstDelayMs = 1200;
     static constexpr uint32_t btReconnectRetryMs = 2500;
     static constexpr uint8_t btReconnectBurstCount = 16;
-    // Пауза внутри ESP32-A2DP при наличии last_bda в NVS (до init Bluetooth) — больше = спокойнее после подачи питания.
     static constexpr uint32_t btA2dpLastConnPreStackDelayMs = 600;
-    // Визуализация рта/EQ по BT: в библиотеке set_stream_reader вызывается ПОСЛЕ цифровой громкости A2DP — сигнал часто «ниже» Wi‑Fi.
-    // Берём raw_stream_reader (до volume) + отдельные пороги. gain 100 = без усиления; 120…200 — если всё ещё бідно.
+    static constexpr bool btShowPairingSearchEyes = false;
+    // Визуализация рта/EQ по PCM с BK8000L (pcm_analyzer_on_bt_pcm_bytes): отдельные пороги от Wi‑Fi.
     static constexpr uint16_t btPcmAnalyzerGainPercent = 145;
     // Аналог pcmSilenceAbs, но для сырого A2DP PCM (обычно ниже, чем у Wi‑Fi декодера).
     static constexpr uint32_t btPcmSilenceAbs = 220;
     // В core0 noise gate: для BT сравниваем g_pcm_level_adc с data.trsh * percent / 100 (меньше % — раньше «открывается» рот).
     static constexpr uint8_t btPcmNoiseGateTrshPercent = 50;
 
-    static constexpr uint8_t mtrxCs = 22;
-    static constexpr uint8_t mtrxDat = 23;
-    static constexpr uint8_t mtrxClk = 21;
+    // MAX7219×5: CLK / DIN / CS как в bender.cpp (15=CS, 17=DIN, 16=CLK)
+    static constexpr uint8_t mtrxClk = 16;
+    static constexpr uint8_t mtrxCs = 15;
+    static constexpr uint8_t mtrxDat = 17;
     static constexpr uint8_t matrixModuleCount = 5;
+    static constexpr uint8_t matrixBrightnessIdleBase = 8;
+    // Пока играет радио — яркость матриц не выше этого (общий 5 V с MAX98357; иначе «хрип при тихом»).
+    static constexpr uint8_t matrixBrightnessWhenPlayingCap = 4;
+    // Период кадра рта/EQ (мс). Было ~42; 56–80 снижает нагрузку SPI MAX7219.
+    static constexpr uint16_t matrixVizRefreshMs = 56;
+    static constexpr uint16_t matrixEyeRefreshMs = 150;
+    // 0 = без лимита SPI (на плату лучше без throttle для стабильности кадра).
+    static constexpr uint16_t matrixUpdateMinIntervalMs = 0;
     // Калибровка модулей как абсолютный offset от минимального (0..15).
     // Итоговая яркость каждого модуля = base + offset[i], где base двигается энкодером.
     static constexpr int8_t matrixBrightnessTrimMin = 0;
     static constexpr int8_t matrixBrightnessTrimMax = 15;
 
-    static constexpr uint8_t encS1 = 19;
-    static constexpr uint8_t encS2 = 18;
-    static constexpr uint8_t encBtn = 4;
-    // Жесты (EncButton): удерж.+поворот — Wi‑Fi: станция; BT: AVRCP next/prev; двойной+поворот — режим рта (6 вар.); 1 клик — пуск/пауза; 3 тапа — порог; 4×клик+удерж.+поворот — wfi/bt; 4×клик+удерж. без поворота (BT) — сброс сопряжений; 4×клик+удерж. без поворота (Wi‑Fi) — SoftAP; 5 — АКБ; 6 — Pong.
-    // Кнопка энкодера (GPIO 4 = RTC): отпустить после 5–9 с удержания — deep sleep (если за удержание не было поворота с нажатой кнопкой);
+    // Энкодер: ENC_BTNR / ENC_BTNL / ENC_BTNB из myoptions.h
+    static constexpr uint8_t encS1 = 4;
+    static constexpr uint8_t encS2 = 5;
+    static constexpr uint8_t encBtn = 6;
+    // Жесты (EncButton): удерж.+поворот — станция; двойной+поворот — режим рта; 1 клик — пуск/пауза; 3 тапа — порог;
+    // 4×клик+удерж. без поворота — SoftAP; 5 — АКБ; 6 — Pong. (Bluetooth на этой плате отключён.)
+    // Кнопка энкодера (GPIO 6): отпустить после 5–9 с удержания — deep sleep (если за удержание не было поворота с нажатой кнопкой);
     // держать ≥10 с без отпускания — ESP.restart() (то же: при удерж.+повороте станция/яркость/громкость — не срабатывает).
     static constexpr uint16_t encoderSleepHoldMs = 5000;
     static constexpr uint16_t encoderHardResetHoldMs = 10000;
@@ -60,7 +99,8 @@ class RadioConfig {
     // АКБ 2S Li-ion через делитель на ADC1 (тільки input-only), напр. GPIO 32:
     // Ubat —[Rверх 100k]— вузол —[Rниз 47k]— GND; ratio = (100+47)/47.
     // Якщо у тебе навпаки (47k до батареї, 100k до землі), постав ratio = (47+100)/100.
-    static constexpr bool batteryMonitorEnable = true;
+    // false — делитель АКБ на ADC не подключён (иначе «0 %» и сон по разряду). Включи, когда проводишь GPIO 32.
+    static constexpr bool batteryMonitorEnable = false;
     static constexpr uint8_t batteryAdcPin = 32;
     static constexpr float batteryDividerRatio = (100.0f + 47.0f) / 47.0f;
     // % з напруги: ступінчаста таблиця U→% у battery.cpp (без інтерполяції між точками).
@@ -71,7 +111,7 @@ class RadioConfig {
     // Ниже этого % опрашиваем АКБ чаще (batteryLowSampleIntervalMs) — для порога выключения и стабильности.
     static constexpr uint8_t batteryLowAttentionPercent = 10;
     static constexpr uint32_t batteryLowSampleIntervalMs = 60000;  // 1 мин при < batteryLowAttentionPercent
-    // Ниже порога без зарядки: глубокий сон без источников пробуждения (меньше тока, чем цикл Brownout).
+    // Ниже порога без зарядки: глубокий сон (только если batteryMonitorEnable и chargingDetectEnable).
     static constexpr bool batteryShutdownEnable = true;
     static constexpr uint8_t batteryShutdownBelowPercent = 5;
     // Подряд столько замеров (с интервалом выше) должны быть < порога — защита от шума АЦП.
@@ -87,8 +127,8 @@ class RadioConfig {
     static constexpr int8_t batterySadEyesPupilOffsetY = 0;
     // 4 кліки: % АКБ на «роті»; скільки мс показувати (потім зникає).
     static constexpr uint32_t batteryPercentShowDurationMs = 3000;
-    // Линия индикации зарядки IP2326 (через делитель 68k/100k): HIGH ≈ идёт зарядка, LOW ≈ завершена.
-    static constexpr bool chargingDetectEnable = true;
+    // Линия зарядки IP2326 на GPIO: HIGH ≈ зарядка. false — пин не подключён, deep sleep по АКБ отключён.
+    static constexpr bool chargingDetectEnable = false;
     static constexpr uint8_t chargingDetectPin = 33;
     // Крок анімації заливки батареї (мс на кадр; кадр = лічильник для battery_matrix_rows_charging).
     static constexpr uint16_t batteryChargeIconAnimStepMs = 420;
@@ -101,7 +141,7 @@ class RadioConfig {
     static constexpr uint16_t matrixOverlayDigitsMs = 1000;
 
     static constexpr int analyzWidth = 3 * 8;
-    static constexpr int radioBuffer = 1600 * 25;  // default 1600*5 — мало для потока
+    static constexpr int radioBuffer = 1600 * 28;  // underrun → «захлеб» / скачет громкость
 
     // Режим 0: синусоида «струна» + FM и шум — хаотичнее, чем одна гладкая sin.
     static constexpr float analyzSinePeriodsAcross = 1.5f;
@@ -175,7 +215,7 @@ class RadioConfig {
     static constexpr uint32_t coldStartBootMs = 250;
     // Пауза перед mtrx.begin(): питание на цепочке MAX7219 (несколько модулей) должно стабилизироваться,
     // иначе часть дисплеев не инициализируется при первом включении. Подберите под свой DC‑DC/линейник.
-    static constexpr uint32_t matrixPowerStabilizeBeforeBeginMs = 2000;
+    static constexpr uint32_t matrixPowerStabilizeBeforeBeginMs = 500;
     // После пробуждения из deep sleep (ext0): короче, чем холодный старт (0 = всегда matrixPowerStabilizeBeforeBeginMs).
     static constexpr uint32_t matrixPowerStabilizeBeforeBeginMsAfterWakeMs = 400;
     // Холодное включение после долгого простоя: повторный begin() и «промывка» регистров MAX7219 (артефакты / нет глаз).
@@ -185,7 +225,7 @@ class RadioConfig {
     static constexpr uint32_t matrixColdBootFlushGapMs = 10;
     // После инициализации MAX7219: не подсвечивать матрицу N мс (прогрев/стабилизация). 0 = сразу показ.
     // После пробуждения из deep sleep обычно 0 — не ждать лишнего.
-    static constexpr uint32_t matrixDisplayEnableDelayMs = 2000;
+    static constexpr uint32_t matrixDisplayEnableDelayMs = 0;
     static constexpr uint32_t matrixDisplayEnableDelayMsAfterWakeMs = 0;
     static constexpr uint32_t coldStartMatrixZeroMs = 200;
     static constexpr uint32_t coldStartAfterMatrixMs = 300;
@@ -228,8 +268,8 @@ class RadioConfig {
 
     // Wi‑Fi в экономичный режим только после wifiIdleSleepAfterMs без активности (не сразу при паузе).
     // Активность: воспроизведение, энкодер, открытие веб‑страницы. Если обрывается поток — выставьте false.
-    static constexpr bool wifiSleepWhenSilent = true;
-    // 0 = не уводить STA в modem sleep по таймеру (стабильнее стрим/переподключение). Иначе мс бездействия.
+    static constexpr bool wifiSleepWhenSilent = false;
+    // 0 = не уводить STA в modem sleep по таймеру.
     static constexpr uint32_t wifiIdleSleepAfterMs = 0;
     // После таймера: true = WIFI_PS_MAX_MODEM (максимум экономии, часто ломает TCP/аудио);
     // false = WIFI_PS_MIN_MODEM (мягче, меньше «системных» сбоев при энергосбережении).
