@@ -83,8 +83,7 @@ class RadioConfig {
     static constexpr uint8_t encS1 = 4;
     static constexpr uint8_t encS2 = 5;
     static constexpr uint8_t encBtn = 6;
-    // Жесты (EncButton): удерж.+поворот — станция; двойной+поворот — режим рта; 1 клик — пуск/пауза; 3 тапа — порог;
-    // 4×клик+удерж. без поворота — SoftAP; 5 — АКБ; 6 — Pong. (Bluetooth на этой плате отключён.)
+    // 5 кликов — % АКБ на «роте»; 4×клик+удерж. без поворота — SoftAP; 6 — Pong.
     // Кнопка энкодера (GPIO 6): отпустить после 5–9 с удержания — deep sleep (если за удержание не было поворота с нажатой кнопкой);
     // держать ≥10 с без отпускания — ESP.restart() (то же: при удерж.+повороте станция/яркость/громкость — не срабатывает).
     static constexpr uint16_t encoderSleepHoldMs = 5000;
@@ -96,13 +95,13 @@ class RadioConfig {
     // Раньше: АЦП для VolAnalyzer. Сейчас уровень берётся из PCM в audio_process_extern (см. BendeRadio.ino).
     static constexpr uint8_t analyzPin = 34;
 
-    // АКБ 2S Li-ion через делитель на ADC1 (тільки input-only), напр. GPIO 32:
-    // Ubat —[Rверх 100k]— вузол —[Rниз 47k]— GND; ratio = (100+47)/47.
-    // Якщо у тебе навпаки (47k до батареї, 100k до землі), постав ratio = (47+100)/100.
-    // false — делитель АКБ на ADC не подключён (иначе «0 %» и сон по разряду). Включи, когда проводишь GPIO 32.
-    static constexpr bool batteryMonitorEnable = false;
-    static constexpr uint8_t batteryAdcPin = 32;
-    static constexpr float batteryDividerRatio = (100.0f + 47.0f) / 47.0f;
+    // АКБ 2S Li-ion через делитель на ADC1 (ESP32-S3: GPIO 1…10).
+    // На S3-N16R8 GPIO 32/33 заняты Octal Flash/PSRAM — не использовать.
+    // Ubat —[Rверх 100k]— вузол —[Rниз 47k]— GND; ratio = U_пакета / U_на_ADC.
+    // Номинал (100+47)/47 ≈ 3.13; калибровка по мультиметру: 8.20 V / 2.468 V ≈ 3.32.
+    static constexpr bool batteryMonitorEnable = true;
+    static constexpr uint8_t batteryAdcPin = 1;
+    static constexpr float batteryDividerRatio = 8200.0f / 2468.0f;
     // % з напруги: ступінчаста таблиця U→% у battery.cpp (без інтерполяції між точками).
     // Пороги для battery_eye_mood() (якщо підключиш настрій очей за АКБ).
     static constexpr uint8_t batteryMoodCheerfulMinPct = 70;
@@ -125,17 +124,34 @@ class RadioConfig {
     static constexpr uint16_t batterySadEyesPupilStepMs = 1200;
     // Грустные глаза: зрачок позиционируется от центра (dx,dy) в core0; сдвиг не используется.
     static constexpr int8_t batterySadEyesPupilOffsetY = 0;
-    // 4 кліки: % АКБ на «роті»; скільки мс показувати (потім зникає).
+    // 5 кликов: % АКБ на «роте»; скільки мс показувати (потім зникає).
     static constexpr uint32_t batteryPercentShowDurationMs = 3000;
-    // Линия зарядки IP2326 на GPIO: HIGH ≈ зарядка. false — пин не подключён, deep sleep по АКБ отключён.
-    static constexpr bool chargingDetectEnable = false;
-    static constexpr uint8_t chargingDetectPin = 33;
+    // Пока идёт зарядка — дольше держим иконку (анимация заливки).
+    static constexpr uint32_t batteryPercentShowDurationChargingMs = 12000;
+    // Детект зарядки IP2326: линия CHG/LED через делитель → GPIO12 (ADC2_CH1).
+    // НЕ GPIO19/20 — USB D+/D− (убьёт Serial). Без провода на пине — INPUT_PULLDOWN в battery.cpp.
+    static constexpr bool chargingDetectEnable = true;
+    static constexpr uint8_t chargingDetectPin = 12;
+    static constexpr bool chargingDetectUseAdc = true;
+    static constexpr uint16_t chargingDetectMinMv = 1000;  // >1.0 V = идёт зарядка
+    static constexpr bool chargingDetectActiveHigh = true;   // только для digital-режима
+    static constexpr uint32_t chargingDebugSerialMs = 15000;
     // Крок анімації заливки батареї (мс на кадр; кадр = лічильник для battery_matrix_rows_charging).
     static constexpr uint16_t batteryChargeIconAnimStepMs = 420;
     // Повна заливка внутрішньої зони 8×8 батареї лише при pct > цього (див. battery_matrix.cpp).
     static constexpr uint8_t batteryMatrixFullMinPct = 95;
     // true — віддзеркалити батарею по вертикалі (ряд 0 ↔ 7).
     static constexpr bool batteryMatrixInvertY = false;
+
+    // INMP441 (I2S1, отдельная шина от MAX98357). Справочник для будущего AI/записи — в прошивке не используется.
+    // VDD=3.3V, GND и L/R=GND, SCK(BCK)=9, WS=10, SD=8.
+    static constexpr uint8_t micBclkPin = 9;
+    static constexpr uint8_t micWsPin = 10;
+    static constexpr uint8_t micDinPin = 8;
+    static constexpr uint32_t micSampleRate = 16000;
+    // INMP441 в 32-bit I2S-слоте: 14 — баланс громкости; 8 клиппит (peak=32768), 16 часто тихо.
+    static constexpr uint8_t micPcmShiftRight = 14;
+
     // SoftAP: см. encoderSoftApToggleHoldMs + жест 4×клик+удерж. в режиме Wi‑Fi.
     // Станція / гучність на роті — фіксований період matrix_tmr (не довше за batteryPercentShowDurationMs після батареї).
     static constexpr uint16_t matrixOverlayDigitsMs = 1000;

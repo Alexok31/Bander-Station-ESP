@@ -113,6 +113,10 @@ void setup() {
                   (unsigned)RadioConfig::encS1, (unsigned)RadioConfig::encS2,
                   (unsigned)RadioConfig::encBtn, (unsigned)RadioConfig::mtrxCs,
                   (unsigned)RadioConfig::mtrxDat, (unsigned)RadioConfig::mtrxClk);
+    Serial.printf("Batt: ADC GPIO%u | Charge: ADC GPIO%u >%umV | Mic INMP441 BCK=%u WS=%u SD=%u\n",
+                  (unsigned)RadioConfig::batteryAdcPin, (unsigned)RadioConfig::chargingDetectPin,
+                  (unsigned)RadioConfig::chargingDetectMinMv, (unsigned)RadioConfig::micBclkPin,
+                  (unsigned)RadioConfig::micWsPin, (unsigned)RadioConfig::micDinPin);
 
     WifiStored w;
     nvsLoadWifi(w);

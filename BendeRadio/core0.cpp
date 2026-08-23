@@ -27,11 +27,10 @@ static inline uint8_t mouth_gfx_off(bool invert) {
     return invert ? GFX_FILL : GFX_CLEAR;
 }
 
+// Встроенные станции (0…1). Дополнительные — только через Web UI → NVS.
 const char* stations[] = {
-    "https://uk3.internet-radio.com/proxy/majesticjukebox?mp=/live",
-    "http://prmstrm.1.fm:8000/electronica",
-    "http://prmstrm.1.fm:8000/x",
-    "http://stream81.metacast.eu/radio1rock128",
+    "https://uk3.internet-radio.com/proxy/majesticjukebox?mp=/live",  // 0 Majestic Jukebox
+    "http://stream81.metacast.eu/radio1rock128",                      // 1 Radio1 Rock
 };
 static constexpr uint8_t kStationBuiltInCount = (uint8_t)(sizeof(stations) / sizeof(stations[0]));
 static String s_custom_stations[RadioConfig::customStationMaxCount];
@@ -1196,6 +1195,12 @@ void core0(void* p) {
     }
     nvsLoadCustomStations(s_custom_stations, RadioConfig::customStationMaxCount, s_custom_station_count);
     nvsLoadMatrixBrightnessTrim(s_matrix_brightness_trim, RadioConfig::matrixModuleCount);
+    Serial.printf("[Radio] stations: %u built-in + %u NVS = %u total\n",
+                  (unsigned)kStationBuiltInCount, (unsigned)s_custom_station_count,
+                  (unsigned)station_total_count());
+    for (uint8_t i = 0; i < kStationBuiltInCount; i++) {
+        Serial.printf("[Radio]  %u %s\n", (unsigned)i, stations[i]);
+    }
 
     {
         uint32_t matrixPreDelay = RadioConfig::matrixPowerStabilizeBeforeBeginMs;
@@ -1597,7 +1602,13 @@ void core0(void* p) {
                                 s_batt_icon_step_ms = millis();
                                 s_batt_overlay_prev_chg = battery_is_charging();
                                 print_batt_overlay(s_batt_matrix_overlay_pct);
-                                matrix_tmr.start((uint16_t)RadioConfig::batteryPercentShowDurationMs);
+                                {
+                                    const uint16_t show_ms =
+                                        s_batt_overlay_prev_chg
+                                            ? (uint16_t)RadioConfig::batteryPercentShowDurationChargingMs
+                                            : (uint16_t)RadioConfig::batteryPercentShowDurationMs;
+                                    matrix_tmr.start(show_ms);
+                                }
                             }
                             break;
                         case 6:
@@ -1630,6 +1641,9 @@ void core0(void* p) {
                                     data.station += eb.dir();
                                     station_clamp_index();
                                     print_val('s', data.station);
+                                    Serial.printf("[Radio] pick station %d/%u %s\n", (int)data.station,
+                                                  (unsigned)station_total_count(),
+                                                  station_url_by_index(data.station));
                                     s_batt_matrix_overlay = false;
                                     matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
                                     station_changed = 1;
@@ -1716,6 +1730,8 @@ void core0(void* p) {
                     if (station_changed) {
                         station_changed = 0;
                         reconnect = station_url_by_index(data.station);
+                        Serial.printf("[Radio] switch → station %d %s\n", (int)data.station,
+                                      reconnect ? reconnect : "(null)");
                     }
                     s_bt_forget_pair_hold_ready = false;
                     s_softap_hold_ready = false;

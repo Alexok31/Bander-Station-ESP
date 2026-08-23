@@ -53,17 +53,39 @@ static uint32_t adc_pin_millivolts() {
 #endif
 }
 
+static bool charging_detect_uses_usb_phy_pin() {
+    const uint8_t p = RadioConfig::chargingDetectPin;
+    return p == 19u || p == 20u;
+}
+
+static uint16_t charging_pin_millivolts() {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 2)
+    return (uint16_t)analogReadMilliVolts(RadioConfig::chargingDetectPin);
+#else
+    const uint32_t raw = analogRead(RadioConfig::chargingDetectPin);
+    return (uint16_t)((uint64_t)raw * 3300u / 4095u);
+#endif
+}
+
 static bool charging_pin_majority_high() {
-    if (!RadioConfig::chargingDetectEnable) {
+    if (!RadioConfig::chargingDetectEnable || charging_detect_uses_usb_phy_pin()) {
         return false;
     }
-    uint8_t n = 0;
-    for (uint8_t i = 0; i < 8u; i++) {
-        if (digitalRead(RadioConfig::chargingDetectPin) == HIGH) {
-            n++;
+    uint32_t acc = 0;
+    constexpr uint8_t kSamples = 8;
+    for (uint8_t i = 0; i < kSamples; i++) {
+        if (RadioConfig::chargingDetectUseAdc) {
+            acc += charging_pin_millivolts();
+        } else if (digitalRead(RadioConfig::chargingDetectPin) == HIGH) {
+            acc += 3300u;
         }
+        delayMicroseconds(120);
     }
-    return n >= 5u;
+    if (RadioConfig::chargingDetectUseAdc) {
+        return (acc / kSamples) >= RadioConfig::chargingDetectMinMv;
+    }
+    const bool majority = acc >= (3300u * 5u);
+    return RadioConfig::chargingDetectActiveHigh ? majority : !majority;
 }
 
 void battery_init() {
@@ -74,13 +96,35 @@ void battery_init() {
     s_charging_read_ms = 0;
     s_charging_cached = false;
     if (RadioConfig::chargingDetectEnable) {
-        pinMode(RadioConfig::chargingDetectPin, INPUT);
+        if (charging_detect_uses_usb_phy_pin()) {
+            Serial.printf(
+                "[Batt] SKIP charge pin GPIO%u — USB D+/D-, would kill Serial.\n",
+                (unsigned)RadioConfig::chargingDetectPin);
+        } else {
+            pinMode(RadioConfig::chargingDetectPin, INPUT_PULLDOWN);
+            if (RadioConfig::chargingDetectUseAdc) {
+                analogSetPinAttenuation(RadioConfig::chargingDetectPin, ADC_11db);
+                uint32_t acc = 0;
+                for (uint8_t i = 0; i < 8u; i++) {
+                    acc += charging_pin_millivolts();
+                    delayMicroseconds(120);
+                }
+                Serial.printf("[Batt] charge ADC GPIO%u thresh=%umV boot_avg=%umV\n",
+                              (unsigned)RadioConfig::chargingDetectPin,
+                              (unsigned)RadioConfig::chargingDetectMinMv, (unsigned)(acc / 8u));
+            } else {
+                Serial.printf("[Batt] charge DIGITAL GPIO%u (pull-down)\n",
+                              (unsigned)RadioConfig::chargingDetectPin);
+            }
+        }
     }
     if (!RadioConfig::batteryMonitorEnable) {
         return;
     }
     pinMode(RadioConfig::batteryAdcPin, INPUT);
     analogSetPinAttenuation(RadioConfig::batteryAdcPin, ADC_11db);
+    Serial.printf("[Batt] pack ADC GPIO%u divider=%.2f\n", (unsigned)RadioConfig::batteryAdcPin,
+                  (double)RadioConfig::batteryDividerRatio);
 }
 
 static void battery_sample_apply() {
@@ -132,9 +176,30 @@ bool battery_gauge_ready() {
 
 bool battery_update() {
     if (!RadioConfig::batteryMonitorEnable) {
+        if (RadioConfig::chargingDetectEnable && RadioConfig::chargingDebugSerialMs > 0) {
+            static uint32_t s_batt_dbg_ms = 0;
+            const uint32_t now = millis();
+            if ((uint32_t)(now - s_batt_dbg_ms) >= RadioConfig::chargingDebugSerialMs) {
+                s_batt_dbg_ms = now;
+                const bool chg = battery_is_charging();
+                Serial.printf("[Batt] chg=%d pin_mv=%u (gauge off)\n", (int)chg,
+                              (unsigned)(RadioConfig::chargingDetectUseAdc ? charging_pin_millivolts() : 0u));
+            }
+        }
         return false;
     }
     const uint32_t now = millis();
+    if (RadioConfig::chargingDetectEnable && RadioConfig::chargingDebugSerialMs > 0) {
+        static uint32_t s_batt_dbg_ms = 0;
+        if ((uint32_t)(now - s_batt_dbg_ms) >= RadioConfig::chargingDebugSerialMs) {
+            s_batt_dbg_ms = now;
+            (void)battery_is_charging();
+            Serial.printf("[Batt] chg=%d pin_mv=%u thresh=%u pct=%u mv=%u\n", (int)s_charging_cached,
+                          (unsigned)(RadioConfig::chargingDetectUseAdc ? charging_pin_millivolts() : 0u),
+                          (unsigned)RadioConfig::chargingDetectMinMv, (unsigned)s_percent,
+                          (unsigned)s_smooth_mv);
+        }
+    }
     uint32_t interval = (!data.state && RadioConfig::batterySampleIntervalIdleMs > 0)
                             ? RadioConfig::batterySampleIntervalIdleMs
                             : RadioConfig::batterySampleIntervalMs;
