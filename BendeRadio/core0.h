@@ -17,7 +17,8 @@ struct Data {
     int8_t station = 0;
 };
 
-extern Data data;
+// Не называть глобал data — на ESP32 Arduino 3.x конфликт с std::data.
+extern Data radioState;
 extern Audio audio;
 extern const char* reconnect;
 extern volatile bool wifiConnecting;

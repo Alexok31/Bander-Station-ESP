@@ -37,7 +37,7 @@ static String s_custom_stations[RadioConfig::customStationMaxCount];
 static uint8_t s_custom_station_count = 0;
 static int8_t s_matrix_brightness_trim[RadioConfig::matrixModuleCount] = {0, 0, 0, 0, 0};
 static volatile bool s_matrix_brightness_trim_dirty = false;
-extern Data data;
+extern Data radioState;
 
 static uint8_t station_total_count() {
     return (uint8_t)(kStationBuiltInCount + s_custom_station_count);
@@ -58,22 +58,22 @@ static const char* station_url_by_index(int idx) {
 }
 
 const char* station_url_for_current() {
-    return station_url_by_index(data.station);
+    return station_url_by_index(radioState.station);
 }
 
 static void station_clamp_index() {
     const int total = (int)station_total_count();
     if (total <= 0) {
-        data.station = 0;
+        radioState.station = 0;
         return;
     }
-    data.station = constrain(data.station, 0, total - 1);
+    radioState.station = constrain(radioState.station, 0, total - 1);
 }
 
 // data
 MAX7219<5, 1, RadioConfig::mtrxCs, RadioConfig::mtrxDat, RadioConfig::mtrxClk> mtrx;
-Data data;
-EEManager memory(data);
+Data radioState;
+EEManager memory(radioState);
 Audio audio;
 String streamname;
 const char* reconnect = nullptr;
@@ -141,22 +141,22 @@ static int matrix_base_max() {
 }
 
 void upd_bright() {
-    if (!data.state) {
+    if (!radioState.state) {
         matrix_apply_brightness((int)RadioConfig::matrixBrightnessIdleBase);
         return;
     }
-    int v = max((int)data.bright_mouth, (int)data.bright_eyes);
+    int v = max((int)radioState.bright_mouth, (int)radioState.bright_eyes);
     v = constrain(v, 0, matrix_base_max());
     if (RadioConfig::matrixBrightnessWhenPlayingCap < 15) {
         v = min(v, (int)RadioConfig::matrixBrightnessWhenPlayingCap);
     }
-    data.bright_mouth = (int8_t)v;
-    data.bright_eyes = (int8_t)v;
+    radioState.bright_mouth = (int8_t)v;
+    radioState.bright_eyes = (int8_t)v;
     matrix_apply_brightness(v);
 }
 
 uint8_t matrix_get_base_brightness() {
-    const int v = constrain(max((int)data.bright_mouth, (int)data.bright_eyes), 0, matrix_base_max());
+    const int v = constrain(max((int)radioState.bright_mouth, (int)radioState.bright_eyes), 0, matrix_base_max());
     return (uint8_t)v;
 }
 
@@ -297,7 +297,7 @@ void draw_eyeb(uint8_t i, int x, int y, int w = 2) {
     mtrx.rect(x, y, x + w - 1, y + w - 1, GFX_CLEAR);
 }
 
-// Радио выкл.: статичные «спящие» глаза (тот же вид, что в change_state при !data.state).
+// Радио выкл.: статичные «спящие» глаза (тот же вид, что в change_state при !radioState.state).
 static void draw_eyes_radio_idle_off() {
     draw_eye(0);
     draw_eye(1);
@@ -477,7 +477,7 @@ static void draw_eyes_follow_ball(int8_t ball_x, int8_t ball_y) {
         return;
     }
 
-    if (!data.state) {
+    if (!radioState.state) {
         draw_eyes_radio_idle_off();
         return;
     }
@@ -509,7 +509,7 @@ void anim_search() {
         pos += dir;
         if (pos >= 6) dir = -1;
         if (pos <= 0) dir = 1;
-        // Полный кадр: иначе после «спящих» глаз (change_state при !data.state, яркость 0) остаётся
+        // Полный кадр: иначе после «спящих» глаз (change_state при !radioState.state, яркость 0) остаётся
         // старый рисунок слева/справа и смешивается с бегающими бровями (Wi‑Fi / BT / после сна).
         upd_bright();
         mtrx.clear();
@@ -525,7 +525,7 @@ void change_state() {
         return;
     }
     mtrx.clear();
-    if (data.state) {
+    if (radioState.state) {
         upd_bright();
         if (battery_sad_eyes_wanted()) {
             draw_battery_sad_eyes_both();
@@ -549,14 +549,14 @@ void change_state() {
 }
 
 // ========================= ANALYZ =========================
-// g_pcm_level_adc в 0…4095 (inst*4095/100 в BendeRadio.ino). Порог тишины data.trsh — в тех же единицах.
+// g_pcm_level_adc в 0…4095 (inst*4095/100 в BendeRadio.ino). Порог тишины radioState.trsh — в тех же единицах.
 // Раньше нарастание было +120 счётчиков ADC — при полной шкале 4095 это ~3% над порогом → «рот» почти всегда 1 px.
 static uint16_t pcm_noise_gate_trsh_effective() {
     if (strcmp(g_audio_source, "bt") != 0) {
-        return data.trsh;
+        return radioState.trsh;
     }
     const uint32_t t =
-        (uint32_t)data.trsh * (uint32_t)RadioConfig::btPcmNoiseGateTrshPercent / 100u;
+        (uint32_t)radioState.trsh * (uint32_t)RadioConfig::btPcmNoiseGateTrshPercent / 100u;
     if (t < 4u) {
         return 4u;
     }
@@ -1007,7 +1007,7 @@ void wifi_ap_toggle_from_core0() {
         }
         wifiConnecting = false;
         if (WiFi.status() == WL_CONNECTED) {
-            reconnect = station_url_by_index(data.station);
+            reconnect = station_url_by_index(radioState.station);
         }
         wifi_touch_activity();
         syncWifiWithAudioSilence();
@@ -1032,7 +1032,7 @@ void wifi_ap_toggle_from_core0() {
 }
 
 void apply_output_volume() {
-    int8_t vol = data.vol;
+    int8_t vol = radioState.vol;
     if (vol > RadioConfig::ampVolumeUiMax) {
         vol = RadioConfig::ampVolumeUiMax;
     }
@@ -1040,9 +1040,9 @@ void apply_output_volume() {
         vol = 0;
     }
     if (strcmp(g_audio_source, "bt") == 0) {
-        bt_audio_volume_apply(data.state, vol);
+        bt_audio_volume_apply(radioState.state, vol);
     } else {
-        audio.setVolume(data.state ? vol : 0);
+        audio.setVolume(radioState.state ? vol : 0);
     }
     if (RadioConfig::ampMutePin == 255) {
         return;
@@ -1053,7 +1053,7 @@ void apply_output_volume() {
         digitalWrite(RadioConfig::ampMutePin, RadioConfig::ampMuteWhenIdleHigh ? LOW : HIGH);
         return;
     }
-    const bool silent = !data.state || vol <= 0;
+    const bool silent = !radioState.state || vol <= 0;
     const bool mute_high = RadioConfig::ampMuteWhenIdleHigh ? silent : !silent;
     digitalWrite(RadioConfig::ampMutePin, mute_high ? HIGH : LOW);
 }
@@ -1102,14 +1102,14 @@ void audio_hw_init(bool log_serial) {
         Serial.printf("I2S BCK=%u LRCK=%u DIN=%u mute=%u set_pin=%s vol=%d state=%d\n",
                       (unsigned)RadioConfig::i2sBclk, (unsigned)RadioConfig::i2sLrc,
                       (unsigned)RadioConfig::i2sDout, (unsigned)RadioConfig::ampMutePin,
-                      pins_ok ? "OK" : "FAIL", (int)data.vol, (int)data.state);
+                      pins_ok ? "OK" : "FAIL", (int)radioState.vol, (int)radioState.state);
     }
 }
 
 // Критический заряд: уводим в deep sleep без wake sources — меньше ток, чем у «живой» прошивки
 // (типичный цикл: Brownout → reset → снова нагрузка → снова Brownout).
 static void low_battery_enter_deep_sleep_forever() {
-    data.state = false;
+    radioState.state = false;
     if (strcmp(g_audio_source, "wifi") == 0) {
         audio.setVolume(0);
         if (audio.isRunning()) {
@@ -1181,16 +1181,16 @@ void core0(void* p) {
     EEPROM.begin(memory.blockSize());
     memory.begin(0, 'b');
     // Не поднимать стрим на холодном старте из EEPROM — connecttohost + I2S + усилители → brownout.
-    data.state = false;
-    if (data.vol > RadioConfig::ampVolumeUiMax) {
-        data.vol = RadioConfig::ampVolumeUiMax;
+    radioState.state = false;
+    if (radioState.vol > RadioConfig::ampVolumeUiMax) {
+        radioState.vol = RadioConfig::ampVolumeUiMax;
     }
     apply_output_volume();
     {
         uint8_t b = 0;
         if (nvsTakePendingBrightnessOverride(b)) {
-            data.bright_eyes = (int8_t)b;
-            data.bright_mouth = (int8_t)b;
+            radioState.bright_eyes = (int8_t)b;
+            radioState.bright_mouth = (int8_t)b;
         }
     }
     nvsLoadCustomStations(s_custom_stations, RadioConfig::customStationMaxCount, s_custom_station_count);
@@ -1260,7 +1260,7 @@ void core0(void* p) {
     audio_hw_init(true);
     apply_output_volume();
     station_clamp_index();
-    // Стрим только после клика play (data.state) — иначе ребут-цикл при Wi‑Fi+I2S на старте.
+    // Стрим только после клика play (radioState.state) — иначе ребут-цикл при Wi‑Fi+I2S на старте.
     reconnect = nullptr;
 
     battery_init();
@@ -1343,7 +1343,7 @@ void core0(void* p) {
         }
 
         const bool eb_tick = eb.tick();
-        if (data.state) {
+        if (radioState.state) {
             s_wifi_last_activity_ms = millis();
         } else if (eb_tick && (eb.press() || eb.release() || eb.turn())) {
             s_wifi_last_activity_ms = millis();
@@ -1361,7 +1361,7 @@ void core0(void* p) {
                 dur >= RadioConfig::encoderSleepHoldMs &&
                 dur < RadioConfig::encoderHardResetHoldMs) {
                 memory.update();
-                if (data.state) {
+                if (radioState.state) {
                     if (strcmp(g_audio_source, "bt") == 0) {
                         bt_audio_volume_apply(false, 0);
                     } else {
@@ -1396,13 +1396,13 @@ void core0(void* p) {
         if (matrix_display_ready()) {
             if (strcmp(g_audio_source, "bt") == 0) {
                 const uint8_t r = bt_audio_take_remote_ui_request();
-                if (r == 1u && data.state) {
-                    data.state = false;
+                if (r == 1u && radioState.state) {
+                    radioState.state = false;
                     apply_output_volume();
                     syncWifiWithAudioSilence();
                     change_state();
-                } else if (r == 2u && !data.state) {
-                    data.state = true;
+                } else if (r == 2u && !radioState.state) {
+                    radioState.state = true;
                     apply_output_volume();
                     syncWifiWithAudioSilence();
                     change_state();
@@ -1455,7 +1455,7 @@ void core0(void* p) {
                 !s_mode_pick_active) {
                 anim_search();
             } else {
-            if (data.state) {
+            if (radioState.state) {
                 if (eye_tmr) {
                     if (battery_sad_eyes_wanted()) {
                         draw_battery_sad_eyes_both();
@@ -1515,24 +1515,24 @@ void core0(void* p) {
             }
 
             // Режимы рта 0…5: волна / волна инв. / EQ / рот / рот инв. / прогресс трека (BT).
-            if (data.mode > 5) {
-                data.mode = 0;
+            if (radioState.mode > 5) {
+                radioState.mode = 0;
             }
             if (s_mode_pick_active) {
                 upd_bright();
                 draw_mode_pick_mouth();
                 matrix_flush();
-            } else if (viz_tmr && !matrix_tmr.state() && data.state && data.mode <= 5) {
+            } else if (viz_tmr && !matrix_tmr.state() && radioState.state && radioState.mode <= 5) {
                 const uint8_t vol = pcm_vis_after_noise_gate(g_pcm_vis);
                 if (vol > pcm_pulse_l + 12) {
                     pulse = 1;
                 }
                 pcm_pulse_l = (uint8_t)((pcm_pulse_l * 3u + vol) / 4u);
 
-                const bool mouth_invert = (data.mode == 1 || data.mode == 4);
+                const bool mouth_invert = (radioState.mode == 1 || radioState.mode == 4);
                 mtrx.rect(0, 0, RadioConfig::analyzWidth - 1, 7, mouth_gfx_off(mouth_invert));
                 const uint8_t v_mouth = pcm_wave_level_after_gate();
-                switch (data.mode) {
+                switch (radioState.mode) {
                     case 0:
                         analyz0(v_mouth, false);
                         break;
@@ -1552,7 +1552,7 @@ void core0(void* p) {
                         analyz_bt_track_progress(mouth_invert);
                         break;
                     default:
-                        data.mode = 0;
+                        radioState.mode = 0;
                         analyz0(v_mouth, false);
                         break;
                 }
@@ -1568,8 +1568,8 @@ void core0(void* p) {
                 if (eb.hasClicks()) {
                     switch (eb.getClicks()) {
                         case 1:
-                            data.state = !data.state;
-                            if (!data.state) {
+                            radioState.state = !radioState.state;
+                            if (!radioState.state) {
                                 if (strcmp(g_audio_source, "bt") == 0) {
                                     bt_audio_avrcp_pause();
                                 } else {
@@ -1578,7 +1578,7 @@ void core0(void* p) {
                                 }
                             } else {
                                 if (strcmp(g_audio_source, "wifi") == 0) {
-                                    reconnect = station_url_by_index(data.station);
+                                    reconnect = station_url_by_index(radioState.station);
                                 }
                                 if (strcmp(g_audio_source, "bt") == 0) {
                                     bt_audio_avrcp_play();
@@ -1591,7 +1591,7 @@ void core0(void* p) {
                         case 2:
                             break;
                         case 3:
-                            data.trsh = (uint16_t)constrain((int)g_pcm_level_adc * 2 / 3, 4, 3800);
+                            radioState.trsh = (uint16_t)constrain((int)g_pcm_level_adc * 2 / 3, 4, 3800);
                             break;
                         case 5:
                             if (RadioConfig::batteryMonitorEnable) {
@@ -1638,12 +1638,12 @@ void core0(void* p) {
                                         bt_audio_avrcp_previous();
                                     }
                                 } else {
-                                    data.station += eb.dir();
+                                    radioState.station += eb.dir();
                                     station_clamp_index();
-                                    print_val('s', data.station);
-                                    Serial.printf("[Radio] pick station %d/%u %s\n", (int)data.station,
+                                    print_val('s', radioState.station);
+                                    Serial.printf("[Radio] pick station %d/%u %s\n", (int)radioState.station,
                                                   (unsigned)station_total_count(),
-                                                  station_url_by_index(data.station));
+                                                  station_url_by_index(radioState.station));
                                     s_batt_matrix_overlay = false;
                                     matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
                                     station_changed = 1;
@@ -1651,17 +1651,17 @@ void core0(void* p) {
                                 break;
                             case 1: {
                                 const int8_t d = eb.dir();
-                                int m = (int)data.mode + (int)d;
+                                int m = (int)radioState.mode + (int)d;
                                 m = (m % 6 + 6) % 6;
-                                data.mode = (uint8_t)m;
+                                radioState.mode = (uint8_t)m;
                                 break;
                             }
                             case 2: {
                                 const int8_t d = eb.dir();
-                                int v = max((int)data.bright_mouth, (int)data.bright_eyes) + (int)d;
+                                int v = max((int)radioState.bright_mouth, (int)radioState.bright_eyes) + (int)d;
                                 v = constrain(v, 0, matrix_base_max());
-                                data.bright_mouth = (int8_t)v;
-                                data.bright_eyes = (int8_t)v;
+                                radioState.bright_mouth = (int8_t)v;
+                                radioState.bright_eyes = (int8_t)v;
                                 upd_bright();
                                 break;
                             }
@@ -1691,14 +1691,14 @@ void core0(void* p) {
                                 break;
                         }
                     } else {
-                        if (data.state && RadioConfig::encoderControlsVolume) {
+                        if (radioState.state && RadioConfig::encoderControlsVolume) {
                             angry_tmr.start();
-                            data.vol += eb.dir();
-                            data.vol = constrain(data.vol, 0, RadioConfig::ampVolumeUiMax);
+                            radioState.vol += eb.dir();
+                            radioState.vol = constrain(radioState.vol, 0, RadioConfig::ampVolumeUiMax);
                             apply_output_volume();
                             syncWifiWithAudioSilence();
-                            Serial.printf("[Vol] %d\n", (int)data.vol);
-                            print_val('v', data.vol);
+                            Serial.printf("[Vol] %d\n", (int)radioState.vol);
+                            print_val('v', radioState.vol);
                             s_batt_matrix_overlay = false;
                             matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
                         }
@@ -1729,8 +1729,8 @@ void core0(void* p) {
                     }
                     if (station_changed) {
                         station_changed = 0;
-                        reconnect = station_url_by_index(data.station);
-                        Serial.printf("[Radio] switch → station %d %s\n", (int)data.station,
+                        reconnect = station_url_by_index(radioState.station);
+                        Serial.printf("[Radio] switch → station %d %s\n", (int)radioState.station,
                                       reconnect ? reconnect : "(null)");
                     }
                     s_bt_forget_pair_hold_ready = false;

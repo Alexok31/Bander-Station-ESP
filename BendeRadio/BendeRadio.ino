@@ -37,7 +37,7 @@ void commitSourceModeSwitch(const char* new_mode) {
     esp_restart();
 }
 
-extern Data data;
+extern Data radioState;
 
 void audio_process_extern(int16_t* buff, uint16_t len, bool* continueI2S) {
     *continueI2S = true;
@@ -169,7 +169,7 @@ void setup() {
 void loop() {
     if (strcmp(g_audio_source, "bt") == 0) {
         bt_audio_tick();
-        if (!data.state || data.vol <= 0 || bt_audio_needs_pairing_ui()) {
+        if (!radioState.state || radioState.vol <= 0 || bt_audio_needs_pairing_ui()) {
             pcm_analyzer_reset();
         }
         delay(5);
@@ -177,7 +177,7 @@ void loop() {
     }
 
     // Пока играет — Wi‑Fi без modem sleep (иначе то тише/то громче, то срыв буфера).
-    if (data.state) {
+    if (radioState.state) {
         WiFi.setSleep(false);
         esp_wifi_set_ps(WIFI_PS_NONE);
         wifi_touch_activity();
@@ -194,13 +194,13 @@ void loop() {
     audio.loop();
     audio.loop();
     audio.loop();
-    if (!data.state || data.vol <= 0 || !audio.isRunning()) {
+    if (!radioState.state || radioState.vol <= 0 || !audio.isRunning()) {
         pcm_analyzer_reset();
     }
 
     // Стрим умер при включённом радио — мягкий reconnect без переинициализации I2S.
     static uint32_t s_stream_dead_ms = 0;
-    if (data.state && WiFi.status() == WL_CONNECTED && !audio.isRunning()) {
+    if (radioState.state && WiFi.status() == WL_CONNECTED && !audio.isRunning()) {
         if (s_stream_dead_ms == 0) {
             s_stream_dead_ms = millis();
         } else if ((uint32_t)(millis() - s_stream_dead_ms) > 2500u && reconnect == nullptr) {
@@ -216,7 +216,7 @@ void loop() {
         const char* host = reconnect;
         reconnect = nullptr;
 
-        if (!data.state) {
+        if (!radioState.state) {
             if (audio.isRunning()) {
                 audio.stopSong();
             }
@@ -251,7 +251,7 @@ void loop() {
         }
     }
 
-    if (!data.state && RadioConfig::loopDelayMsWhenRadioOff > 0) {
+    if (!radioState.state && RadioConfig::loopDelayMsWhenRadioOff > 0) {
         delay(RadioConfig::loopDelayMsWhenRadioOff);
     }
 }

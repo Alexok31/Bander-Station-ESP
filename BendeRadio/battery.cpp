@@ -5,7 +5,7 @@
 #include "RadioConfig.h"
 #include "core0.h"
 
-extern Data data;
+extern Data radioState;
 
 static uint32_t s_last_sample_ms;
 static uint16_t s_smooth_mv;
@@ -200,7 +200,7 @@ bool battery_update() {
                           (unsigned)s_smooth_mv);
         }
     }
-    uint32_t interval = (!data.state && RadioConfig::batterySampleIntervalIdleMs > 0)
+    uint32_t interval = (!radioState.state && RadioConfig::batterySampleIntervalIdleMs > 0)
                             ? RadioConfig::batterySampleIntervalIdleMs
                             : RadioConfig::batterySampleIntervalMs;
     if (s_gauge_ready && s_percent < RadioConfig::batteryLowAttentionPercent) {

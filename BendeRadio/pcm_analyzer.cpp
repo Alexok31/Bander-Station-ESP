@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <math.h>
 
-extern Data data;
+extern Data radioState;
 
 volatile uint16_t g_pcm_level_adc = 0;
 volatile uint8_t g_pcm_vis = 0;
@@ -40,7 +40,7 @@ static uint8_t pcm_vis_stretch(uint8_t x) {
         return x;
     }
     const uint32_t y = (uint32_t)(10.f * sqrtf((float)x));
-    return (uint8_t)min(100u, y);
+    return (uint8_t)min((uint32_t)100u, y);
 }
 
 static int32_t pcm_gain_sample(int32_t s, uint16_t gain_pct) {
@@ -138,7 +138,7 @@ static void pcm_analyzer_feed_impl(const int16_t* buff,
         if (m_viz > 0u) {
             if (m_viz > s_mviz_ref) {
                 const uint32_t gap = m_viz - s_mviz_ref;
-                const uint32_t step = max(1u, gap >> RadioConfig::pcmAnalyzerRefAttackShift);
+                const uint32_t step = max((uint32_t)1u, gap >> RadioConfig::pcmAnalyzerRefAttackShift);
                 s_mviz_ref = min((uint32_t)RadioConfig::pcmAnalyzerRefCeil, s_mviz_ref + step);
             } else {
                 const uint32_t sub = (s_mviz_ref * (uint32_t)RadioConfig::pcmAnalyzerRefRelease) >> 8;
@@ -159,7 +159,7 @@ static void pcm_analyzer_feed_impl(const int16_t* buff,
     const uint32_t ref_dbg =
         RadioConfig::pcmUseAdaptiveAnalyzerRef ? s_mviz_ref : RadioConfig::pcmMetricFullScale;
     const uint8_t inst_target =
-        m_viz > 0u ? (uint8_t)min(100u, m_viz * 100u / ref_div) : (uint8_t)0;
+        m_viz > 0u ? (uint8_t)min((uint32_t)100u, m_viz * 100u / ref_div) : (uint8_t)0;
 
     {
         const uint8_t sh = RadioConfig::pcmInstSmoothShift;
@@ -226,7 +226,7 @@ static void pcm_analyzer_feed_impl(const int16_t* buff,
             }
             uint8_t tgt = 0;
             if (m_viz > 0u && ref_div > 0u) {
-                tgt = (uint8_t)min(100u, pkb * 100u / ref_div);
+                tgt = (uint8_t)min((uint32_t)100u, pkb * 100u / ref_div);
             }
             if (RadioConfig::pcmEqDecorrelAmount > 0.f && tgt > 0u) {
                 const float a = RadioConfig::pcmEqDecorrelAmount;
@@ -242,7 +242,7 @@ static void pcm_analyzer_feed_impl(const int16_t* buff,
                     clamped = 1.f;
                 }
                 const float mul = (1.f - a) + a * clamped;
-                tgt = (uint8_t)min(100u, (uint32_t)((float)tgt * mul + 0.5f));
+                tgt = (uint8_t)min((uint32_t)100u, (uint32_t)((float)tgt * mul + 0.5f));
             }
             const uint32_t acc = (uint32_t)s_eq_ema[b] * num + (uint32_t)tgt;
             s_eq_ema[b] = (uint8_t)(acc >> sh);
@@ -255,15 +255,15 @@ static void pcm_analyzer_feed_impl(const int16_t* buff,
 }
 
 void pcm_analyzer_on_decoder_buffer(int16_t* buff, uint16_t len_frames, uint8_t ch, bool stream_running) {
-    if (!data.state || data.vol <= 0 || !stream_running) {
+    if (!radioState.state || radioState.vol <= 0 || !stream_running) {
         pcm_analyzer_reset();
         if (RadioConfig::debugAudioPcmSerial) {
             static uint32_t s_pcm_skip_ms;
             const uint32_t now = millis();
             if ((int32_t)(now - s_pcm_skip_ms) >= 2000) {
                 s_pcm_skip_ms = now;
-                Serial.printf("[PCM] skip radio off: state=%d vol=%d run=%d\n", (int)data.state,
-                              (int)data.vol, stream_running ? 1 : 0);
+                Serial.printf("[PCM] skip radio off: state=%d vol=%d run=%d\n", (int)radioState.state,
+                              (int)radioState.vol, stream_running ? 1 : 0);
             }
         }
         return;
@@ -287,7 +287,7 @@ void pcm_analyzer_on_bt_pcm_bytes(const uint8_t* pcm_bytes, uint32_t len_bytes) 
     if (!pcm_bytes || len_bytes < 4u) {
         return;
     }
-    if (!data.state || data.vol <= 0) {
+    if (!radioState.state || radioState.vol <= 0) {
         pcm_analyzer_reset();
         return;
     }
