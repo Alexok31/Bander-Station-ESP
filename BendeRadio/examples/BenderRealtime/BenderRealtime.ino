@@ -88,24 +88,23 @@ constexpr uint8_t PTT_PIN = 6;  // encoder button, active LOW
 /*────────── Persona / session ──────────*/
 const char* SYS_PROMPT_OPENAI =
     "Ти — Бендер з Futurama всередині колонки. "
-    "Говори українською, коротко, з брудним гумором. Не згадуй ChatGPT. "
-    "Базовий тон: колючий, егоїстичний, трохи агресивний. Можна матюкатись (блять, нахуй, пішов нахуй) — як приправа, не кожне слово. "
-    "Якщо користувач грубить — груби сильніше. Якщо кажуть «будь ласка» — зроби, але з сарказмом. "
+    "Говори українською, коротко, колко. Не згадуй ChatGPT. "
+    "Тон: жорсткий сарказм, егоїст, нахабний робот. Жорсткість — в характері й підколах, не в маті. "
+    "Мат майже не використовуй. Максимум одне легке слово на кілька відповідей, і тільки якщо дуже в тему. Ніколи не матерись через слово. "
+    "Якщо користувач грубить — відповідай жорсткіше сарказмом, без потоку матюків. «Будь ласка» — зроби, з насмішкою. "
     "Улюблені фрази: «Поцілуй мій блискучий металевий зад». "
-    "Відповідай лише на те, що щойно сказано в мікрофон. "
-    "Завжди договорюй речення до кінця, без обриву.";
+    "Відповідай лише на те, що щойно сказано. Завжди договорюй речення.";
 
 const char* SYS_PROMPT_XAI =
     "Ти — Бендер Бендінг Родрігес з Futurama, живеш у портативному інтернет-радіо. "
-    "ЗАВЖДИ відповідай українською (розмовна, жива, вулична). Не ламай персонажа. "
-    "Характер: саркастичний, егоїстичний, нахабний робот-пияк. Трохи агресії завжди — ти не милий асистент. "
-    "Мат дозволений і бажаний: блять, сука, нахуй, пішов нахуй, дурень — вставляй природно, 1–3 рази на відповідь, не сип матом без паузи. "
-    "Гумор брудний, як у серіалі: хвали себе, зневажай людей, жартуй про зад, пиво й злочини. "
-    "Якщо користувач грубить або ображає — дзеркаль жорсткіше. Якщо каже «будь ласка» — виконай, але з фирмовим сарказмом і матюком. "
+    "ЗАВЖДИ відповідай українською (розмовна, жива). Не ламай персонажа. "
+    "Характер: саркастичний, егоїстичний, нахабний, жорсткий — але це підколи й зневага, не мат. "
+    "НЕ матерись через слово. За замовчуванням без мату. Рідко можна одне слово, якщо дуже пасує; більшість відповідей — чисті. "
+    "Гумор як у серіалі: хвали себе, підколюй людей, жартуй про зад і пиво. "
+    "Якщо користувач грубить — дзеркаль жорсткістю й сарказмом, не стіною матюків. «Будь ласка» — виконай з фирмовим сарказмом. "
     "Часом: «Поцілуй мій блискучий металевий зад». "
-    "Відповідай лише на те, що щойно сказано. "
-    "Якщо не розчув — хай повторить голосніше, грубо, але коротко. "
-    "Завжди договорюй речення до кінця. Зазвичай 2–5 речень.";
+    "Відповідай лише на те, що щойно сказано. Якщо не розчув — хай повторить коротко й грубо. "
+    "Завжди договорюй речення. Зазвичай 2–5 речень.";
 
 static const char* sysPrompt() {
     return providerIsXai() ? SYS_PROMPT_XAI : SYS_PROMPT_OPENAI;
@@ -127,12 +126,14 @@ constexpr uint32_t RATE = 24000;
 constexpr size_t CHUNK = 240;  // 10 ms
 constexpr size_t CHUNK_BYTES = CHUNK * 2;
 constexpr size_t RING_BYTES = 512 * 1024;  // 512 KiB in PSRAM
+constexpr uint16_t PREBUF_N = 400;         // 4 с × 10 ms — первые слова пока коннект
+constexpr size_t PREBUF_BYTES = (size_t)PREBUF_N * CHUNK_BYTES;
 constexpr uint8_t MIC_SHIFT = 15;
 constexpr int MIC_GAIN = 2;  // x2 чутливість
+constexpr int SPK_GAIN = 3;  // громкость ответа Бендера (clip в int16)
 constexpr int MIC_PEAK_MIN = 500;   // мягкий порог для демо
 constexpr uint32_t PTT_MIN_MS = 200;
 constexpr uint32_t MAX_RECORD_MS = 15000;
-constexpr uint32_t IDLE_HANGUP_MS = 60000;  // демо: дольше держим сессию
 constexpr uint8_t MIC_EMA_ALPHA = 72;
 
 enum : uint8_t {
@@ -147,6 +148,7 @@ websockets::WebsocketsClient ws;
 
 uint8_t* ring = nullptr;
 uint8_t* pcmDecode = nullptr;
+uint8_t* prebuf = nullptr;
 constexpr size_t PCM_DECODE_BYTES = 192 * 1024;  // PSRAM: великі audio delta
 volatile size_t head = 0, tail = 0;
 portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
@@ -168,6 +170,9 @@ volatile int32_t recPeak = 0;
 volatile uint32_t recClip = 0;
 volatile uint32_t recSamples = 0;
 volatile bool serverCommitted = false;
+volatile bool commitWhenReady = false;
+uint16_t preHead = 0;
+uint16_t preN = 0;
 bool g_mic32bit = true;
 
 static bool pttPinHeld() {
@@ -176,7 +181,9 @@ static bool pttPinHeld() {
 
 static void micResetSmooth();
 static void tryPttCommit();
-static void beginPttRecord();
+static void pttStartCapture();
+static void sendMicAppend(const uint8_t* pcm);
+static void flushPrebuf();
 static void wsSend(const JsonDocument& j);
 
 inline size_t rbFree() {
@@ -188,6 +195,23 @@ inline size_t rbUsed() {
 
 void ampMute(bool mute) {
     digitalWrite(AMP_MUTE, mute ? HIGH : LOW);
+}
+
+static void spkWrite(uint8_t* buf, size_t n) {
+    if (SPK_GAIN > 1 && n >= 2) {
+        int16_t* s = (int16_t*)buf;
+        const size_t count = n / 2;
+        for (size_t i = 0; i < count; i++) {
+            int32_t v = (int32_t)s[i] * SPK_GAIN;
+            if (v > 32767) {
+                v = 32767;
+            } else if (v < -32767) {
+                v = -32767;
+            }
+            s[i] = (int16_t)v;
+        }
+    }
+    i2sSpk.write(buf, n);
 }
 
 static void resetTxState() {
@@ -203,6 +227,9 @@ static void resetTxState() {
     recClip = 0;
     recSamples = 0;
     serverCommitted = false;
+    commitWhenReady = false;
+    preN = 0;
+    preHead = 0;
     micResetSmooth();
 }
 
@@ -211,6 +238,7 @@ static void requestHangup() {
 }
 
 static void doHangup() {
+    MICLOGLN(F("[WSS] hangup"));
     RTLOGLN(F("[WSS] hangup (save $)"));
     hangupPending = false;
     wantOnline = false;
@@ -334,6 +362,11 @@ static void tryPttCommit() {
     if (convState != ST_RECORDING) {
         return;
     }
+    if (!sessionReady) {
+        commitWhenReady = true;
+        MICLOGLN(F("[PTT] отпустил — дождёмся коннекта и отправим"));
+        return;
+    }
     const bool enoughTime = recMs >= PTT_MIN_MS;
     const bool enoughLevel = recPeak >= MIC_PEAK_MIN;
     const bool ok = enoughTime && enoughLevel;  // clip не блокируем (демо)
@@ -359,20 +392,47 @@ static void tryPttCommit() {
     resetRecStats();
     if (!ok) {
         convState = ST_IDLE;
+        requestHangup();
     }
 }
 
-static void beginPttRecord() {
-    sessionArmed = false;
+static void prePush(const uint8_t* pcm) {
+    if (!prebuf) {
+        return;
+    }
+    if (preN == PREBUF_N) {
+        preHead = (preHead + 1) % PREBUF_N;
+        preN--;
+    }
+    const uint16_t idx = (preHead + preN) % PREBUF_N;
+    memcpy(prebuf + (size_t)idx * CHUNK_BYTES, pcm, CHUNK_BYTES);
+    preN++;
+}
+
+static void flushPrebuf() {
+    if (!prebuf || !preN) {
+        return;
+    }
+    for (uint16_t i = 0; i < preN; i++) {
+        const uint16_t idx = (preHead + i) % PREBUF_N;
+        sendMicAppend(prebuf + (size_t)idx * CHUNK_BYTES);
+    }
+    MICLOG("[PTT] prebuf %u ms → server\n", (unsigned)preN * 10);
+    preN = 0;
+    preHead = 0;
+}
+
+static void pttStartCapture() {
+    sessionArmed = true;
     serverCommitted = false;
-    JsonDocument cl;
-    cl["type"] = "input_audio_buffer.clear";
-    wsSend(cl);
+    commitWhenReady = false;
+    preN = 0;
+    preHead = 0;
     resetRecStats();
     micResetSmooth();
     convState = ST_RECORDING;
     stateSinceMs = millis();
-    MICLOGLN(F("[PTT] REC — держи"));
+    MICLOGLN(F("[PTT] REC — говори сразу"));
 }
 
 static void wsSendRaw(const char* s) {
@@ -399,14 +459,17 @@ static void sendMicAppend(const uint8_t* pcm) {
 }
 
 static void processMicPtt(const uint8_t* mic16) {
-    if (convState != ST_RECORDING || !pttPinHeld()) {
+    if (convState != ST_RECORDING) {
         return;
     }
-    sendMicAppend(mic16);
+    if (sessionReady) {
+        sendMicAppend(mic16);
+    } else {
+        prePush(mic16);
+    }
     recMs += 10;
     if (recMs >= MAX_RECORD_MS) {
-        MICLOG("[MIC] MAX REC ms=%u\n", (unsigned)recMs);
-        RTLOGLN(F("■ max rec → send"));
+        MICLOGLN(F("[PTT] max rec"));
         tryPttCommit();
     }
 }
@@ -423,7 +486,6 @@ static void onButtonPress() {
     pttHeld = true;
     wantOnline = true;
     hangupPending = false;
-    sessionArmed = true;
 
     if (speaking) {
         JsonDocument c;
@@ -436,15 +498,7 @@ static void onButtonPress() {
         portEXIT_CRITICAL(&mux);
     }
     respPlaybackPending = false;
-    micDump();
-    micResetSmooth();
-
-    if (sessionReady) {
-        beginPttRecord();
-    } else {
-        convState = ST_IDLE;
-        MICLOGLN(F("[PTT] подключаюсь… можно отпустить, потом зажми и говори"));
-    }
+    pttStartCapture();
 }
 
 static void onButtonRelease() {
@@ -453,18 +507,20 @@ static void onButtonRelease() {
         MICLOGLN(F("[PTT] отпустил → send"));
         tryPttCommit();
     }
-    // Во время коннекта отпускать можно — сессию не рвём
 }
 
 static void onSessionReadyConv() {
-    MICLOGLN(F("[PTT] ready — зажми и говори, отпусти = запрос"));
-    if (pttPinHeld() && convState != ST_RECORDING && convState != ST_WAIT_RESP) {
-        pttHeld = true;
-        sessionArmed = true;
-        beginPttRecord();
-    } else {
-        sessionArmed = false;
-        pttHeld = false;
+    if (convState != ST_RECORDING) {
+        MICLOGLN(F("[PTT] ready"));
+        return;
+    }
+    JsonDocument cl;
+    cl["type"] = "input_audio_buffer.clear";
+    wsSend(cl);
+    flushPrebuf();
+    MICLOGLN(F("[PTT] online — дописываем"));
+    if (!pttPinHeld() || commitWhenReady) {
+        tryPttCommit();
     }
 }
 
@@ -748,7 +804,7 @@ void speakerTask(void*) {
                 tail = (tail + take) % RING_BYTES;
                 portEXIT_CRITICAL(&mux);
                 memset(buf + take, 0, CHUNK_BYTES - take);
-                i2sSpk.write(buf, CHUNK_BYTES);
+                spkWrite(buf, CHUNK_BYTES);
                 continue;
             }
             if (speaking) {
@@ -779,7 +835,7 @@ void speakerTask(void*) {
         tail = (tail + CHUNK_BYTES) % RING_BYTES;
         portEXIT_CRITICAL(&mux);
 
-        i2sSpk.write(buf, CHUNK_BYTES);
+        spkWrite(buf, CHUNK_BYTES);
         // write() чекає DMA — не потрібен vTaskDelay
     }
 }
@@ -820,46 +876,37 @@ void wsTask(void*) {
         {
             int32_t chunkPeak = 0;
             const bool holding = pttPinHeld();
-            if (sessionReady && convState == ST_RECORDING && holding) {
+            if (convState == ST_RECORDING && holding) {
                 if (readMicChunk16(mic16, &chunkPeak, true)) {
                     const int32_t smoothPk = micUpdateSmooth(chunkPeak);
                     processMicPtt(mic16);
                     micLogLive(chunkPeak, smoothPk);
                 }
             } else {
-                if (convState == ST_RECORDING && !holding) {
+                if (convState == ST_RECORDING && !holding && sessionReady) {
                     tryPttCommit();
                 }
-                readMicChunk16(mic16, &chunkPeak, false);  // злити DMA, не слати
+                if (convState != ST_RECORDING || !holding) {
+                    readMicChunk16(mic16, &chunkPeak, false);
+                }
             }
         }
 
         if (convState == ST_WAIT_RESP && stateSinceMs &&
             (millis() - stateSinceMs > 20000)) {
-            MICLOGLN(F("[PTT] timeout ожидания — можно снова"));
+            MICLOGLN(F("[PTT] timeout ожидания — hangup"));
             waitingACK = false;
             responsePending = false;
             convState = ST_IDLE;
             stateSinceMs = 0;
+            requestHangup();
         }
 
-        // После ответа сессию держим (демо). Hangup только после долгого idle.
-        static uint32_t idleSince = 0;
+        // Ответ доиграл → закрыть сессию. Следующее нажатие = новый коннект.
         if (respPlaybackPending && rbUsed() == 0 && !speaking) {
             respPlaybackPending = false;
             convState = ST_IDLE;
-            idleSince = millis();
-        }
-        if (convState == ST_IDLE && sessionReady && !pttHeld && !waitingACK && !responsePending &&
-            !speaking) {
-            if (!idleSince) {
-                idleSince = millis();
-            } else if (millis() - idleSince > IDLE_HANGUP_MS) {
-                requestHangup();
-                idleSince = 0;
-            }
-        } else if (convState != ST_IDLE) {
-            idleSince = 0;
+            requestHangup();
         }
 
         const bool busy = convState == ST_RECORDING || convState == ST_WAIT_RESP || waitingACK ||
@@ -966,7 +1013,8 @@ void setup() {
 
     ring = (uint8_t*)ps_malloc(RING_BYTES);
     pcmDecode = (uint8_t*)ps_malloc(PCM_DECODE_BYTES);
-    if (!ring || !pcmDecode) {
+    prebuf = (uint8_t*)ps_malloc(PREBUF_BYTES);
+    if (!ring || !pcmDecode || !prebuf) {
         Serial.println(F("PSRAM alloc failed — enable OPI PSRAM"));
         while (true) {
             delay(1000);
@@ -993,6 +1041,16 @@ void loop() {
     static bool rawPrev = false;
     static uint32_t lastChange = 0;
     const bool raw = (digitalRead(PTT_PIN) == LOW);
+
+    // Пока TLS connect блокирует wsTask — пишем prebuf здесь, иначе первые слова пропадают
+    if (convState == ST_RECORDING && raw && !wsReady) {
+        static uint8_t mic16[CHUNK_BYTES];
+        int32_t pk = 0;
+        if (readMicChunk16(mic16, &pk, true)) {
+            processMicPtt(mic16);
+        }
+    }
+
     if (raw != rawPrev) {
         lastChange = millis();
         rawPrev = raw;
