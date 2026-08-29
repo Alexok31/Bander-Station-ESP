@@ -1,0 +1,9 @@
+{
+  "llm": "local",
+  "ollama_model": "aya-expanse:8b",
+  "grok_model": "grok-4.3",
+  "xai_api_key": "",
+  "piper_length": 0.84,
+  "history_turns": 40,
+  "summary_chars": 2000
+}

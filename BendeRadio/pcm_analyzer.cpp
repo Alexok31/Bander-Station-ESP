@@ -86,7 +86,8 @@ static void pcm_analyzer_feed_impl(const int16_t* buff,
                                    uint8_t ch,
                                    int dbg_run_flag,
                                    uint16_t linear_gain_pct,
-                                   uint32_t silence_abs_threshold) {
+                                   uint32_t silence_abs_threshold,
+                                   bool snap_up = false) {
     if (!buff || len == 0) {
         return;
     }
@@ -166,6 +167,9 @@ static void pcm_analyzer_feed_impl(const int16_t* buff,
         const uint32_t num = (1u << sh) - 1u;
         const uint32_t acc = (uint32_t)s_inst_ema * num + (uint32_t)inst_target;
         s_inst_ema = (uint8_t)(acc >> sh);
+        if (snap_up && inst_target > s_inst_ema) {
+            s_inst_ema = inst_target;
+        }
     }
     const uint8_t inst = s_inst_ema;
 
@@ -182,7 +186,9 @@ static void pcm_analyzer_feed_impl(const int16_t* buff,
     }
 
     uint8_t vis_blend;
-    if (inst >= gv) {
+    if (snap_up && inst >= gv) {
+        vis_blend = inst;
+    } else if (inst >= gv) {
         vis_blend = (uint8_t)((gv * 2u + inst * 6u) >> 3);
     } else {
         vis_blend = (uint8_t)((gv * 11u + inst * 5u) >> 4);
@@ -302,4 +308,11 @@ void pcm_analyzer_on_bt_pcm_bytes(const uint8_t* pcm_bytes, uint32_t len_bytes) 
     const int16_t* s = reinterpret_cast<const int16_t*>(pcm_bytes);
     pcm_analyzer_feed_impl(s, (uint16_t)min((uint32_t)UINT16_MAX, n_frames), 2, 1,
                            RadioConfig::btPcmAnalyzerGainPercent, RadioConfig::btPcmSilenceAbs);
+}
+
+void pcm_analyzer_on_bender_pcm16(const int16_t* samples, uint16_t n_samples) {
+    if (!samples || n_samples == 0) {
+        return;
+    }
+    pcm_analyzer_feed_impl(samples, n_samples, 1, 1, 100u, RadioConfig::pcmBenderSilenceAbs, true);
 }

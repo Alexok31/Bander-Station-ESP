@@ -71,6 +71,10 @@ class RadioConfig {
     static constexpr uint8_t matrixBrightnessWhenPlayingCap = 4;
     // Период кадра рта/EQ (мс). Было ~42; 56–80 снижает нагрузку SPI MAX7219.
     static constexpr uint16_t matrixVizRefreshMs = 56;
+    // Під TTS рот малюємо частіше за радіо; 16 мс — як радіо-колбек по часу кадру.
+    static constexpr uint16_t matrixVizTtsRefreshMs = 16;
+    // Пауза в мові: vis 0 стільки мс → спокійний кадр. Відкриття одразу, без порога 18.
+    static constexpr uint16_t benderMouthRestAfterQuietMs = 60;
     static constexpr uint16_t matrixEyeRefreshMs = 150;
     // 0 = без лимита SPI (на плату лучше без throttle для стабильности кадра).
     static constexpr uint16_t matrixUpdateMinIntervalMs = 0;
@@ -83,9 +87,16 @@ class RadioConfig {
     static constexpr uint8_t encS1 = 4;
     static constexpr uint8_t encS2 = 5;
     static constexpr uint8_t encBtn = 6;
-    // 5 кликов — % АКБ на «роте»; 4×клик+удерж. без поворота — SoftAP; 6 — Pong.
-    // Кнопка энкодера (GPIO 6): отпустить после 5–9 с удержания — deep sleep (если за удержание не было поворота с нажатой кнопкой);
-    // держать ≥10 с без отпускания — ESP.restart() (то же: при удерж.+повороте станция/яркость/громкость — не срабатывает).
+    // 5 кліків — % АКБ; 6 — Pong; 7 — deep sleep; 8 — restart.
+    // Утримання без кліків/повороту (~0.4 с) — PTT Бендера (запис до відпускання).
+    static constexpr uint16_t encoderPttHoldMs = 520;
+    static constexpr uint8_t encoderSleepClicks = 7;
+    static constexpr uint8_t encoderRestartClicks = 8;
+    // Без музики і без розмови з Бендером — очі/рот у спокійний режим (не deep sleep).
+    static constexpr uint32_t benderFaceCalmAfterMs = 5ul * 60ul * 1000ul;
+    // Далі бездіяльність (немає музики, PTT, енкодера, WebUI) — deep sleep, будить кнопка.
+    static constexpr uint32_t benderIdleDeepSleepMs = 30ul * 60ul * 1000ul;
+    // Застарілі пороги hold-sleep/reset (сон і restart тепер кліками).
     static constexpr uint16_t encoderSleepHoldMs = 5000;
     static constexpr uint16_t encoderHardResetHoldMs = 10000;
     static constexpr uint16_t btForgetPairedHoldMs = 1400;
@@ -175,35 +186,26 @@ class RadioConfig {
     // Сдвиг центра по Y (строки): −1 — вся «полоска» рота/волни на 1 піксель вгору; +1 — нижче.
     static constexpr int8_t analyzWaveRowOffset = -1;
 
-    // Рот робота (у прошивці data.mode 3 і 4): параметри губ; див. core0 mouth_robot_*.
-    // Перші та останні analyzMouthEdgeCols колонок: верх/низ завжди на цих рядках (+ analyzWaveRowOffset).
+    // Рот робота (data.mode 3 і 4): параметри губ; див. core0 mouth_robot_*.
     static constexpr uint8_t analyzMouthEdgeCols = 3;
     static constexpr int8_t analyzMouthEdgeUpperRow = 3;
     static constexpr int8_t analyzMouthEdgeLowerRow = 6;
-    // true — без вертикального bob (інакше краї «відриваються» візуально від якорів).
     static constexpr bool analyzMouthAnchorNoBob = true;
-    // Форма «звідності» відкриття тільки по середині: 0 — парабола (1−t²), 1 — гіпербола 1/(1+k·t²), t по внутрішній ширині.
     static constexpr uint8_t analyzMouthCurveKind = 0;
     static constexpr float analyzMouthHyperK = 4.2f;
-    // Додаткове розкриття в центрі (напів-інтервал у float), множиться на open_mask і chomp·vol.
     static constexpr float analyzMouthHalfSepMin = 0.15f;
     static constexpr float analyzMouthHalfSepMax = 2.15f;
-    // Кивок усього рта (вимикається, якщо analyzMouthAnchorNoBob).
     static constexpr float analyzMouthPhiOmegaMin = 0.055f;
     static constexpr float analyzMouthPhiOmegaMax = 0.26f;
     static constexpr float analyzMouthBobAmp = 0.28f;
-    // φ₂ — «челюсть»; друга гармоніка + повільна фаза + шум кроку — менш рівний ритм.
     static constexpr float analyzMouthPhi2OmegaMin = 0.072f;
     static constexpr float analyzMouthPhi2OmegaMax = 0.34f;
     static constexpr float analyzMouthChompHarm = 1.83f;
     static constexpr float analyzMouthSlowOmegaMin = 0.021f;
     static constexpr float analyzMouthSlowOmegaMax = 0.058f;
     static constexpr float analyzMouthOmegaNoiseAmp = 0.26f;
-    // Дрібна хвиля по open_mask у середині (0 = вимк.); краї якорів не чіпає (×0 там).
     static constexpr float analyzMouthMaskRipple = 0.11f;
-    // Нижняя граница множителя chomp при sin=-1 (узкий зев, но см. analyzMouthMinPixelGap).
     static constexpr float analyzMouthChompFloor = 0.12f;
-    // Мінімальний відступ між верхньою і нижньою лініями (рядки матриці).
     static constexpr uint8_t analyzMouthMinPixelGap = 1;
 
     // EQ (у прошивці data.mode 2): по колонке на пиксель ширины рта; уровень из буфера + лёгкий разброс EMA.
@@ -273,6 +275,8 @@ class RadioConfig {
     static constexpr uint8_t pcmAnalyzerRefAttackShift = 3;
     // Ниже — тишина (те же единицы, что m_src).
     static constexpr uint32_t pcmSilenceAbs = 400;
+    // TTS Бендера: нижчий поріг, щоб приголосні/атака слова вже відкривали рот.
+    static constexpr uint32_t pcmBenderSilenceAbs = 80;
     // Верхняя граница g_pcm_level_adc (BendeRadio.ino: inst * 4095 / 100); порог data.trsh в тех же единицах.
     static constexpr uint16_t pcmLevelAdcMax = 4095;
     // true — выше data.trsh сразу полный g_pcm_vis (без доп. умножения по «пандусу» ADC).

@@ -19,12 +19,24 @@
 #include "NvsConfig.h"
 #include "pong.h"
 #include "tmr.h"
+#include "BenderAi.h"
 
 static inline uint8_t mouth_gfx_on(bool invert) {
     return invert ? GFX_CLEAR : GFX_FILL;
 }
 static inline uint8_t mouth_gfx_off(bool invert) {
     return invert ? GFX_FILL : GFX_CLEAR;
+}
+
+static uint32_t s_face_last_live_ms = 0;
+
+static bool matrix_face_awake() {
+    if (radioState.state || bender_ai_busy()) {
+        s_face_last_live_ms = millis();
+        return true;
+    }
+    return RadioConfig::benderFaceCalmAfterMs > 0 &&
+           (uint32_t)(millis() - s_face_last_live_ms) < RadioConfig::benderFaceCalmAfterMs;
 }
 
 // Встроенные станции (0…1). Дополнительные — только через Web UI → NVS.
@@ -141,7 +153,7 @@ static int matrix_base_max() {
 }
 
 void upd_bright() {
-    if (!radioState.state) {
+    if (!radioState.state && !bender_ai_busy()) {
         matrix_apply_brightness((int)RadioConfig::matrixBrightnessIdleBase);
         return;
     }
@@ -591,11 +603,14 @@ static uint8_t pcm_vis_after_noise_gate(uint8_t vw) {
 }
 
 static uint8_t pcm_wave_level_after_gate() {
+    if (bender_ai_tts_playing()) {
+        return g_pcm_vis;
+    }
     return pcm_vis_after_noise_gate(g_pcm_vis);
 }
 
 // Режим 1: колонки 1 px; фиксированные веса по X (две «горки» sin, произведение) — без бегущей фазы, движение только от PCM.
-static void analyz_eq_bars(uint8_t v_gate, bool invert) {
+static void analyz_eq_bars(uint8_t v_gate, bool invert, bool rest = false) {
     const float floor = RadioConfig::pcmEqShapeFloor;
     const float span = 1.f - floor;
     const float deep = RadioConfig::pcmEqShapeDeep;
@@ -608,7 +623,7 @@ static void analyz_eq_bars(uint8_t v_gate, bool invert) {
     const int B = RadioConfig::pcmEqBandCount;
     const int n = (W < B) ? W : B;
     for (int col = 0; col < n; col++) {
-        const uint8_t raw = g_pcm_eq_band[col];
+        const uint8_t raw = rest ? (uint8_t)100 : g_pcm_eq_band[col];
         const uint32_t gated = (uint32_t)raw * (uint32_t)v_gate / 100u;
         const float c = (float)col;
         const float w1 = 0.5f + 0.5f * sinf(k1 * c + p1);
@@ -692,30 +707,55 @@ static void analyz_bt_track_progress(bool invert) {
     }
 }
 
-void analyz0(uint8_t vol, bool invert) {
+// Фаза хвилі нормована до matrixVizRefreshMs (56 мс). Інакше TTS-кадр крутить лінії швидше.
+static float s_analyz_dt_scale = 1.f;
+
+static void analyz_note_frame_dt(bool tts) {
+    static uint32_t s_last_ms;
+    const uint32_t now = millis();
+    uint32_t dt = now - s_last_ms;
+    s_last_ms = now;
+    const uint32_t ref = tts ? RadioConfig::matrixVizTtsRefreshMs : RadioConfig::matrixVizRefreshMs;
+    if (dt < 1u) {
+        dt = 1u;
+    }
+    if (dt > ref * 3u) {
+        dt = ref;
+    }
+    s_analyz_dt_scale = (float)dt / (float)ref;
+}
+
+void analyz0(uint8_t vol, bool invert, bool animate = true) {
     static float phi;
     static float phi_chaos;
     static float omega_filt;
     constexpr float two_pi = 6.2831853f;
+    const float kdt = s_analyz_dt_scale;
 
-    const float omega_tgt = RadioConfig::analyzSineOmegaMin +
-                            (float)vol / 100.f * (RadioConfig::analyzSineOmegaMax - RadioConfig::analyzSineOmegaMin);
-    const float ease = RadioConfig::analyzSineOmegaEase;
-    omega_filt += (omega_tgt - omega_filt) * ease;
-    phi += omega_filt;
-    phi_chaos += omega_filt * RadioConfig::analyzWaveChaosOmegaRatio;
-    while (phi > two_pi * 16.f) {
-        phi -= two_pi * 16.f;
-    }
-    while (phi_chaos > two_pi * 24.f) {
-        phi_chaos -= two_pi * 24.f;
+    if (!animate) {
+        phi = 0.f;
+        phi_chaos = 0.f;
+        omega_filt = RadioConfig::analyzSineOmegaMin;
+    } else {
+        const float omega_tgt = RadioConfig::analyzSineOmegaMin +
+                                (float)vol / 100.f * (RadioConfig::analyzSineOmegaMax - RadioConfig::analyzSineOmegaMin);
+        const float ease = RadioConfig::analyzSineOmegaEase;
+        omega_filt += (omega_tgt - omega_filt) * ease * kdt;
+        phi += omega_filt * kdt;
+        phi_chaos += omega_filt * RadioConfig::analyzWaveChaosOmegaRatio * kdt;
+        while (phi > two_pi * 16.f) {
+            phi -= two_pi * 16.f;
+        }
+        while (phi_chaos > two_pi * 24.f) {
+            phi_chaos -= two_pi * 24.f;
+        }
     }
 
     const int W = RadioConfig::analyzWidth;
     const float k = two_pi * RadioConfig::analyzSinePeriodsAcross / (float)W;
     const float k2 = RadioConfig::analyzWaveChaosK2;
-    const float fm = RadioConfig::analyzWaveFmDepth;
-    const float nmix = RadioConfig::analyzWaveNoiseMix;
+    const float fm = animate ? RadioConfig::analyzWaveFmDepth : 0.f;
+    const float nmix = animate ? RadioConfig::analyzWaveNoiseMix : 0.f;
     const float mid = 3.5f + (float)RadioConfig::analyzWaveRowOffset;
     const float amp = (float)vol / 100.f * RadioConfig::analyzSineAmpMax;
 
@@ -765,7 +805,7 @@ struct MouthRobotCtx {
     uint8_t curve_kind;
 };
 
-static void mouth_robot_fill_ctx(uint8_t vol, MouthRobotCtx* c) {
+static void mouth_robot_fill_ctx(uint8_t vol, MouthRobotCtx* c, bool animate) {
     static float phi;
     static float phi2;
     static float phi_slow;
@@ -773,31 +813,40 @@ static void mouth_robot_fill_ctx(uint8_t vol, MouthRobotCtx* c) {
 
     c->v = (float)vol / 100.f;
     const float v = c->v;
-    const float omega = RadioConfig::analyzMouthPhiOmegaMin +
-                        v * (RadioConfig::analyzMouthPhiOmegaMax - RadioConfig::analyzMouthPhiOmegaMin);
-    phi += omega;
-    while (phi > two_pi * 8.f) {
-        phi -= two_pi * 8.f;
-    }
-    const float o2 = RadioConfig::analyzMouthPhi2OmegaMin +
-                     v * (RadioConfig::analyzMouthPhi2OmegaMax - RadioConfig::analyzMouthPhi2OmegaMin);
-    const float nz = (float)inoise8((uint8_t)(phi2 * 37.f + phi * 11.f), (uint8_t)(millis() >> 5)) / 255.f;
-    const float na = fminf(0.95f, fmaxf(0.f, RadioConfig::analyzMouthOmegaNoiseAmp));
-    phi2 += o2 * (1.f - na + na * (0.38f + 0.62f * nz));
-    while (phi2 > two_pi * 8.f) {
-        phi2 -= two_pi * 8.f;
-    }
-    const float o_s = RadioConfig::analyzMouthSlowOmegaMin +
-                      v * (RadioConfig::analyzMouthSlowOmegaMax - RadioConfig::analyzMouthSlowOmegaMin);
-    phi_slow += o_s * (0.82f + 0.18f * nz);
-    while (phi_slow > two_pi * 8.f) {
-        phi_slow -= two_pi * 8.f;
+    const float kdt = s_analyz_dt_scale;
+    if (!animate) {
+        phi = 0.f;
+        phi2 = 0.f;
+        phi_slow = 0.f;
+    } else {
+        const float omega = RadioConfig::analyzMouthPhiOmegaMin +
+                            v * (RadioConfig::analyzMouthPhiOmegaMax - RadioConfig::analyzMouthPhiOmegaMin);
+        phi += omega * kdt;
+        while (phi > two_pi * 8.f) {
+            phi -= two_pi * 8.f;
+        }
+        const float o2 = RadioConfig::analyzMouthPhi2OmegaMin +
+                         v * (RadioConfig::analyzMouthPhi2OmegaMax - RadioConfig::analyzMouthPhi2OmegaMin);
+        const float nz_step =
+            (float)inoise8((uint8_t)(phi2 * 37.f + phi * 11.f), (uint8_t)(millis() >> 5)) / 255.f;
+        const float na = fminf(0.95f, fmaxf(0.f, RadioConfig::analyzMouthOmegaNoiseAmp));
+        phi2 += o2 * (1.f - na + na * (0.38f + 0.62f * nz_step)) * kdt;
+        while (phi2 > two_pi * 8.f) {
+            phi2 -= two_pi * 8.f;
+        }
+        const float o_s = RadioConfig::analyzMouthSlowOmegaMin +
+                          v * (RadioConfig::analyzMouthSlowOmegaMax - RadioConfig::analyzMouthSlowOmegaMin);
+        phi_slow += o_s * (0.82f + 0.18f * nz_step) * kdt;
+        while (phi_slow > two_pi * 8.f) {
+            phi_slow -= two_pi * 8.f;
+        }
     }
 
     c->phi = phi;
     c->phi2 = phi2;
     c->phi_slow = phi_slow;
-    c->nz = nz;
+    c->nz = animate ? ((float)inoise8((uint8_t)(phi2 * 37.f + phi * 11.f), (uint8_t)(millis() >> 5)) / 255.f)
+                    : 0.5f;
 
     const float a = 0.5f + 0.5f * sinf(phi2);
     const float b = 0.5f + 0.5f * sinf(phi2 * RadioConfig::analyzMouthChompHarm + phi_slow);
@@ -813,7 +862,7 @@ static void mouth_robot_fill_ctx(uint8_t vol, MouthRobotCtx* c) {
 
     const float extra_base = RadioConfig::analyzMouthHalfSepMin +
                              v * (RadioConfig::analyzMouthHalfSepMax - RadioConfig::analyzMouthHalfSepMin);
-    c->lip_wobble = 0.5f + 0.5f * sinf(phi_slow * 1.47f + phi * 1.9f + nz * 4.f);
+    c->lip_wobble = 0.5f + 0.5f * sinf(phi_slow * 1.47f + phi * 1.9f + c->nz * 4.f);
     c->extra_open = extra_base * c->chomp * (0.74f + 0.26f * c->lip_wobble);
     c->ripple = fminf(0.35f, fmaxf(0.f, RadioConfig::analyzMouthMaskRipple));
     c->bob =
@@ -922,9 +971,9 @@ static void mouth_robot_draw_lips(int W, const int8_t* up, const int8_t* lo, boo
     }
 }
 
-static void mouth_robot_one_frame(uint8_t vol, bool invert) {
+static void mouth_robot_one_frame(uint8_t vol, bool invert, bool animate) {
     MouthRobotCtx ctx;
-    mouth_robot_fill_ctx(vol, &ctx);
+    mouth_robot_fill_ctx(vol, &ctx, animate);
     int8_t up[32];
     int8_t lo[32];
     mouth_robot_compute_up_lo(&ctx, up, lo);
@@ -933,9 +982,66 @@ static void mouth_robot_one_frame(uint8_t vol, bool invert) {
 
 }  // namespace
 
-// Режим 4/5 (у прошивці 3/4): «рот робота» — invert задається з switch.
-void analyz_mouth_robot_backup(uint8_t vol, bool invert) {
-    mouth_robot_one_frame(vol, invert);
+static void analyz_mouth_robot_backup(uint8_t vol, bool invert, bool animate = true) {
+    mouth_robot_one_frame(vol, invert, animate);
+}
+
+// 0 хвиля; 1 інв.; 2 EQ; 3 рот; 4 рот інв.; 5 прогрес BT.
+static uint8_t mouth_anim_mode() {
+    uint8_t m = radioState.mode;
+    if (m > 5) {
+        m = 0;
+        radioState.mode = 0;
+    }
+    return m;
+}
+
+static void draw_mouth_anim(uint8_t v_mouth, bool invert) {
+    switch (mouth_anim_mode()) {
+        case 1:
+            analyz0(v_mouth, true);
+            break;
+        case 2:
+            analyz_eq_bars(v_mouth, false);
+            break;
+        case 3:
+            analyz_mouth_robot_backup(v_mouth, false);
+            break;
+        case 4:
+            analyz_mouth_robot_backup(v_mouth, true);
+            break;
+        case 5:
+            analyz_bt_track_progress(invert);
+            break;
+        default:
+            analyz0(v_mouth, false);
+            break;
+    }
+}
+
+// Пауза: той самий режим, перший кадр (фаза 0), без бігу анімації.
+static void draw_mouth_anim_rest(bool invert) {
+    constexpr uint8_t kRestVis = 42;
+    switch (mouth_anim_mode()) {
+        case 1:
+            analyz0(kRestVis, true, false);
+            break;
+        case 2:
+            analyz_eq_bars(kRestVis, false, true);
+            break;
+        case 3:
+            analyz_mouth_robot_backup(0, false, false);
+            break;
+        case 4:
+            analyz_mouth_robot_backup(0, true, false);
+            break;
+        case 5:
+            analyz_bt_track_progress(invert);
+            break;
+        default:
+            analyz0(kRestVis, false, false);
+            break;
+    }
 }
 
 // ========================= SYSTEM =========================
@@ -1032,6 +1138,9 @@ void wifi_ap_toggle_from_core0() {
 }
 
 void apply_output_volume() {
+    if (bender_ai_owns_speaker()) {
+        return;
+    }
     int8_t vol = radioState.vol;
     if (vol > RadioConfig::ampVolumeUiMax) {
         vol = RadioConfig::ampVolumeUiMax;
@@ -1086,6 +1195,7 @@ void audio_hw_init(bool log_serial) {
     }
     amp_force_mute();
     free_uart0_from_i2s_pins();
+    (void)audio.reclaimI2SChannel();
     if (RadioConfig::pcm5102XsmtPin != 255) {
         pinMode(RadioConfig::pcm5102XsmtPin, OUTPUT);
         digitalWrite(RadioConfig::pcm5102XsmtPin, RadioConfig::pcm5102XsmtActiveHigh ? HIGH : LOW);
@@ -1155,6 +1265,26 @@ static void battery_shutdown_guard_on_sample() {
     s_batt_shutdown_consecutive = 0;
 }
 
+static void radio_enter_deep_sleep() {
+    memory.update();
+    if (radioState.state) {
+        if (strcmp(g_audio_source, "bt") == 0) {
+            bt_audio_volume_apply(false, 0);
+        } else {
+            audio.setVolume(0);
+            audio.stopSong();
+        }
+    }
+    {
+        uint8_t br_off[] = {0, 0, 0, 0, 0};
+        mtrx.setBright(br_off);
+        mtrx.clear();
+        matrix_flush();
+    }
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)RadioConfig::encBtn, 0);
+    esp_deep_sleep_start();
+}
+
 void core0(void* p) {
     // ========================= SETUP =========================
     EncButton eb(RadioConfig::encS1, RadioConfig::encS2, RadioConfig::encBtn);
@@ -1162,6 +1292,7 @@ void core0(void* p) {
     eb.setDebTimeout(80);
     eb.setEncType(EB_STEP4_LOW);
     Tmr viz_tmr(RadioConfig::matrixVizRefreshMs);
+    Tmr tts_mouth_tmr(RadioConfig::matrixVizTtsRefreshMs);
     Tmr eye_tmr(RadioConfig::matrixEyeRefreshMs);
     Tmr matrix_tmr(1000);
     Tmr angry_tmr(800);
@@ -1177,6 +1308,7 @@ void core0(void* p) {
     static bool s_bt_forget_pair_hold_ready = false;
     // Wi‑Fi: то же число кликов + удержание — вкл/выкл SoftAP для веб‑настройки.
     static bool s_softap_hold_ready = false;
+    static bool s_ptt_this_press = false;
 
     EEPROM.begin(memory.blockSize());
     memory.begin(0, 'b');
@@ -1343,7 +1475,7 @@ void core0(void* p) {
         }
 
         const bool eb_tick = eb.tick();
-        if (radioState.state) {
+        if (radioState.state || bender_ai_busy()) {
             s_wifi_last_activity_ms = millis();
         } else if (eb_tick && (eb.press() || eb.release() || eb.turn())) {
             s_wifi_last_activity_ms = millis();
@@ -1353,32 +1485,20 @@ void core0(void* p) {
             s_enc_hold_had_turn_while_pressed = false;
             s_bt_forget_pair_hold_ready = false;
             s_softap_hold_ready = false;
+            s_ptt_this_press = false;
         }
         if (eb_tick && eb.release()) {
-            const uint32_t dur = millis() - enc_btn_press_ms;
-            // Сон только для «чистого» удержания кнопки без предшествующей серии кликов.
-            if (!s_enc_hold_had_turn_while_pressed && eb.getClicks() == 0 &&
-                dur >= RadioConfig::encoderSleepHoldMs &&
-                dur < RadioConfig::encoderHardResetHoldMs) {
-                memory.update();
-                if (radioState.state) {
-                    if (strcmp(g_audio_source, "bt") == 0) {
-                        bt_audio_volume_apply(false, 0);
-                    } else {
-                        audio.setVolume(0);
-                        audio.stopSong();
-                    }
-                }
-                {
-                    uint8_t br_off[] = {0, 0, 0, 0, 0};
-                    mtrx.setBright(br_off);
-                    mtrx.clear();
-                    matrix_flush();
-                }
-                // ext0: RTC GPIO encBtn, пробуждение при нажатии кнопки (LOW к GND, подтяжка вверх).
-                esp_sleep_enable_ext0_wakeup((gpio_num_t)RadioConfig::encBtn, 0);
-                esp_deep_sleep_start();
+            if (s_ptt_this_press) {
+                bender_ai_ptt_up();
+                s_ptt_this_press = false;
             }
+        }
+        if (eb_tick && eb.pressing() && !s_ptt_this_press && !s_enc_hold_had_turn_while_pressed &&
+            eb.getClicks() == 0 && !pong_active() && !s_mode_pick_active &&
+            !show_wake_after_sleep_anim && strcmp(g_audio_source, "bt") != 0 &&
+            eb.pressFor() >= RadioConfig::encoderPttHoldMs && !bender_ai_recording()) {
+            s_ptt_this_press = true;
+            bender_ai_ptt_down();
         }
         // Энкодер не глушим на время STA-подключения — иначе жест «4 клика + поворот» не работает до ~25 с.
         const bool eb_e = (!show_wake_after_sleep_anim && eb_tick);
@@ -1446,6 +1566,11 @@ void core0(void* p) {
                         pong_set_active(false);
                         upd_bright();
                         matrix_flush();
+                    } else if (n == RadioConfig::encoderSleepClicks) {
+                        radio_enter_deep_sleep();
+                    } else if (n == RadioConfig::encoderRestartClicks) {
+                        memory.update();
+                        ESP.restart();
                     }
                 }
                 memory.update();
@@ -1455,8 +1580,9 @@ void core0(void* p) {
                 !s_mode_pick_active) {
                 anim_search();
             } else {
-            if (radioState.state) {
+            if (matrix_face_awake()) {
                 if (eye_tmr) {
+                    upd_bright();
                     if (battery_sad_eyes_wanted()) {
                         draw_battery_sad_eyes_both();
                         matrix_flush();
@@ -1514,47 +1640,46 @@ void core0(void* p) {
                 }
             }
 
-            // Режимы рта 0…5: волна / волна инв. / EQ / рот / рот инв. / прогресс трека (BT).
-            if (radioState.mode > 5) {
-                radioState.mode = 0;
-            }
+            // Режимы рта 0…5: хвиля / інв. / EQ / рот / рот інв. / прогрес трека (BT).
+            (void)mouth_anim_mode();
             if (s_mode_pick_active) {
                 upd_bright();
                 draw_mode_pick_mouth();
                 matrix_flush();
-            } else if (viz_tmr && !matrix_tmr.state() && radioState.state && radioState.mode <= 5) {
-                const uint8_t vol = pcm_vis_after_noise_gate(g_pcm_vis);
+            } else if ((viz_tmr || (bender_ai_tts_playing() && tts_mouth_tmr)) && !matrix_tmr.state() &&
+                       radioState.mode <= 5 && matrix_face_awake()) {
+                const bool talk = bender_ai_tts_playing() || (radioState.state && !bender_ai_busy());
+                const uint8_t anim_mode = mouth_anim_mode();
+                const bool mouth_invert = (anim_mode == 1 || anim_mode == 4);
+                mtrx.rect(0, 0, RadioConfig::analyzWidth - 1, 7, mouth_gfx_off(mouth_invert));
+                analyz_note_frame_dt(bender_ai_tts_playing());
+                if (talk) {
+                const bool bender_talk = bender_ai_tts_playing();
+                const uint8_t vol =
+                    bender_talk ? (uint8_t)g_pcm_vis : pcm_vis_after_noise_gate(g_pcm_vis);
                 if (vol > pcm_pulse_l + 12) {
                     pulse = 1;
                 }
                 pcm_pulse_l = (uint8_t)((pcm_pulse_l * 3u + vol) / 4u);
 
-                const bool mouth_invert = (radioState.mode == 1 || radioState.mode == 4);
-                mtrx.rect(0, 0, RadioConfig::analyzWidth - 1, 7, mouth_gfx_off(mouth_invert));
-                const uint8_t v_mouth = pcm_wave_level_after_gate();
-                switch (radioState.mode) {
-                    case 0:
-                        analyz0(v_mouth, false);
-                        break;
-                    case 1:
-                        analyz0(v_mouth, true);
-                        break;
-                    case 2:
-                        analyz_eq_bars(v_mouth, false);
-                        break;
-                    case 3:
-                        analyz_mouth_robot_backup(v_mouth, false);
-                        break;
-                    case 4:
-                        analyz_mouth_robot_backup(v_mouth, true);
-                        break;
-                    case 5:
-                        analyz_bt_track_progress(mouth_invert);
-                        break;
-                    default:
-                        radioState.mode = 0;
-                        analyz0(v_mouth, false);
-                        break;
+                uint8_t v_mouth = pcm_wave_level_after_gate();
+                static bool s_bender_live = false;
+                static uint32_t s_bender_quiet_ms = 0;
+                if (bender_talk) {
+                    s_bender_live = true;
+                    s_bender_quiet_ms = 0;
+                    draw_mouth_anim(v_mouth > 0 ? v_mouth : (uint8_t)22, mouth_invert);
+                } else {
+                    s_bender_live = false;
+                    s_bender_quiet_ms = 0;
+                    if (v_mouth < 22) {
+                        v_mouth = 22;
+                    }
+                    draw_mouth_anim(v_mouth, mouth_invert);
+                }
+                } else {
+                    pcm_pulse_l = 0;
+                    draw_mouth_anim_rest(mouth_invert);
                 }
                 matrix_flush();
             }
@@ -1565,7 +1690,7 @@ void core0(void* p) {
                 static bool station_changed = 0;
 
                 // hasClicks() до turn(): иначе на том же тике поворот уходит в громкость.
-                if (eb.hasClicks()) {
+                if (eb.hasClicks() && !s_ptt_this_press) {
                     switch (eb.getClicks()) {
                         case 1:
                             radioState.state = !radioState.state;
@@ -1619,10 +1744,17 @@ void core0(void* p) {
                             pong_sync_matrix_brightness();
                             matrix_flush();
                             break;
+                        case RadioConfig::encoderSleepClicks:
+                            radio_enter_deep_sleep();
+                            break;
+                        case RadioConfig::encoderRestartClicks:
+                            memory.update();
+                            ESP.restart();
+                            break;
                     }
                 }
 
-                if (eb.turn()) {
+                if (eb.turn() && !s_ptt_this_press && !bender_ai_recording()) {
                     if (eb.pressing()) {
                         s_enc_hold_had_turn_while_pressed = true;
                         s_bt_forget_pair_hold_ready = false;
@@ -1691,7 +1823,8 @@ void core0(void* p) {
                                 break;
                         }
                     } else {
-                        if (radioState.state && RadioConfig::encoderControlsVolume) {
+                        if ((radioState.state || bender_ai_owns_speaker()) &&
+                            RadioConfig::encoderControlsVolume) {
                             angry_tmr.start();
                             radioState.vol += eb.dir();
                             radioState.vol = constrain(radioState.vol, 0, RadioConfig::ampVolumeUiMax);
@@ -1741,13 +1874,23 @@ void core0(void* p) {
         }
         }
 
-        // Hard reset только для «чистого» удержания без серии кликов.
-        if (eb_tick && eb.pressing() && !s_enc_hold_had_turn_while_pressed && eb.getClicks() == 0 &&
-            eb.pressFor() >= RadioConfig::encoderHardResetHoldMs) {
-            ESP.restart();
-        }
-
         syncWifiWithAudioSilence();
+
+        {
+            const bool ap_up = (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA);
+            const bool stay_awake =
+                radioState.state || bender_ai_busy() || pong_active() || s_mode_pick_active ||
+                wifiConnecting || show_wake_after_sleep_anim || ap_up ||
+                (strcmp(g_audio_source, "bt") == 0 && bt_audio_needs_pairing_ui());
+            if (stay_awake) {
+                s_wifi_last_activity_ms = millis();
+            } else if (RadioConfig::benderIdleDeepSleepMs > 0 &&
+                       (uint32_t)(millis() - s_wifi_last_activity_ms) >=
+                           RadioConfig::benderIdleDeepSleepMs) {
+                Serial.println(F("[Sleep] idle 30 min"));
+                radio_enter_deep_sleep();
+            }
+        }
 
         if (RadioConfig::core0LoopDelayMs > 0) {
             delay(RadioConfig::core0LoopDelayMs);

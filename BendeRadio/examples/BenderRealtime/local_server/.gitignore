@@ -1,0 +1,15 @@
+models/
+voice_clone/raw/*
+!voice_clone/raw/.gitkeep
+voice_clone/dataset/*
+!voice_clone/dataset/.gitkeep
+voice_clone/models/*
+!voice_clone/models/.gitkeep
+chat.json
+config.local.json
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.pth
+*.index

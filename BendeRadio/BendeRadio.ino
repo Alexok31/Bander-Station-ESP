@@ -11,6 +11,7 @@
 #include "RadioConfig.h"
 #include "WebUi.h"
 #include "core0.h"
+#include "BenderAi.h"
 
 TaskHandle_t Task0;
 
@@ -38,19 +39,35 @@ void commitSourceModeSwitch(const char* new_mode) {
 }
 
 extern Data radioState;
+String g_api_host;
 
-void audio_process_extern(int16_t* buff, uint16_t len, bool* continueI2S) {
+static void radio_pcm_viz(int16_t* buff, uint16_t len, uint8_t ch, bool* continueI2S) {
     *continueI2S = true;
-
+    if (bender_ai_owns_speaker()) {
+        return;
+    }
     if (strcmp(g_audio_source, "bt") == 0) {
         return;
     }
-
-    uint8_t ch = audio.getChannels();
     if (ch == 0) {
-        ch = 2;
+        ch = audio.getChannels();
+        if (ch == 0) {
+            ch = 2;
+        }
     }
     pcm_analyzer_on_decoder_buffer(buff, len, ch, audio.isRunning());
+}
+
+// ESP32-audioI2S 2.x (якщо колись знову підключиться).
+void audio_process_extern(int16_t* buff, uint16_t len, bool* continueI2S) {
+    radio_pcm_viz(buff, len, 0, continueI2S);
+}
+
+// ESP32-audioI2S 3.1 (Wolle): рот і EQ під музику.
+void audio_process_i2s(int16_t* outBuff, uint16_t validSamples, uint8_t bitsPerSample, uint8_t channels,
+                       bool* continueI2S) {
+    (void)bitsPerSample;
+    radio_pcm_viz(outBuff, validSamples, channels, continueI2S);
 }
 
 void setup() {
@@ -102,7 +119,7 @@ void setup() {
     audio_mux_init(AudioSource::Wifi);
     // I2S/громкость — в core0 после EEPROM.
 
-    xTaskCreatePinnedToCore(core0, "Task0", 16000, NULL, 1, &Task0, 0);
+    xTaskCreatePinnedToCore(core0, "Task0", 16000, NULL, 4, &Task0, 0);
     if (!g_warm_boot_after_mode_switch) {
         delay(RadioConfig::coldStartBeforeWifiMs);
     }
@@ -159,6 +176,8 @@ void setup() {
     }
 
     webUiBegin();
+    bender_ai_begin();
+    Serial.println(F("Bender AI: hold=talk; 7 clicks=sleep; 8=restart; idle 5 min=calm, 30 min=sleep"));
 
     if (!(esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 && RadioConfig::wakeAfterSleepAnimMs > 0)) {
         change_state();
@@ -176,6 +195,16 @@ void loop() {
         return;
     }
 
+    webUiLoop();
+    bender_ai_tick();
+    if (bender_ai_busy()) {
+        WiFi.setSleep(false);
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        wifi_touch_activity();
+        delay(1);
+        return;
+    }
+
     // Пока играет — Wi‑Fi без modem sleep (иначе то тише/то громче, то срыв буфера).
     if (radioState.state) {
         WiFi.setSleep(false);
@@ -190,7 +219,6 @@ void loop() {
         }
     }
 
-    webUiLoop();
     audio.loop();
     audio.loop();
     audio.loop();

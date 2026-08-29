@@ -16,5 +16,8 @@ void pcm_analyzer_begin_stream_settle();
 // Колбэк декодера Wi‑Fi: len_frames — число кадров (стерео пары), ch — каналы из audio.getChannels().
 void pcm_analyzer_on_decoder_buffer(int16_t* buff, uint16_t len_frames, uint8_t ch, bool stream_running);
 
-// PCM из A2DP (s16le стерео), len_bytes — длина буфера в байтах.
+// PCM з A2DP (s16le стерео), len_bytes — довжина буфера в байтах.
 void pcm_analyzer_on_bt_pcm_bytes(const uint8_t* pcm_bytes, uint32_t len_bytes);
+
+// Моно s16 PCM відповіді Бендера (рот/EQ без стріму радіо).
+void pcm_analyzer_on_bender_pcm16(const int16_t* samples, uint16_t n_samples);

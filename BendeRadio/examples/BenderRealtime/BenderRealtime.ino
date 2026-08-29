@@ -53,7 +53,14 @@ static bool providerIsXai() {
     return strcmp(AI_PROVIDER, "xai") == 0;
 }
 
+static bool providerIsLocal() {
+    return strcmp(AI_PROVIDER, "local") == 0;
+}
+
 static const char* apiKey() {
+    if (providerIsLocal()) {
+        return "";
+    }
     return providerIsXai() ? XAI_API_KEY : OPENAI_API_KEY;
 }
 
@@ -62,10 +69,21 @@ static const char* realtimeModel() {
 }
 
 static const char* apiHost() {
+    if (providerIsLocal()) {
+        return LOCAL_WS_HOST;
+    }
     return providerIsXai() ? "api.x.ai" : "api.openai.com";
 }
 
 static String wsUrl() {
+    if (providerIsLocal()) {
+        String u = "ws://";
+        u += LOCAL_WS_HOST;
+        u += ":";
+        u += String(LOCAL_WS_PORT);
+        u += "/v1/realtime";
+        return u;
+    }
     String u = "wss://";
     u += apiHost();
     u += "/v1/realtime?model=";
@@ -84,6 +102,8 @@ constexpr uint8_t MIC_WS = 10;
 constexpr uint8_t MIC_DIN = 8;
 
 constexpr uint8_t PTT_PIN = 6;  // encoder button, active LOW
+constexpr uint8_t ENC_S1 = 4;   // encoder A (CLK)
+constexpr uint8_t ENC_S2 = 5;   // encoder B (DT)
 
 /*────────── Persona / session ──────────*/
 const char* SYS_PROMPT_OPENAI =
@@ -102,12 +122,12 @@ const char* SYS_PROMPT_XAI =
     "НЕ матерись через слово. За замовчуванням без мату. Рідко можна одне слово, якщо дуже пасує; більшість відповідей — чисті. "
     "Гумор як у серіалі: хвали себе, підколюй людей, жартуй про зад і пиво. "
     "Якщо користувач грубить — дзеркаль жорсткістю й сарказмом, не стіною матюків. «Будь ласка» — виконай з фирмовим сарказмом. "
-    "Часом: «Поцілуй мій блискучий металевий зад». "
     "Відповідай лише на те, що щойно сказано. Якщо не розчув — хай повторить коротко й грубо. "
-    "Завжди договорюй речення. Зазвичай 2–5 речень.";
+    "Ніколи не згадуй кнопки, повідомлення, сповіщення, екрани чи додатки — ти радіо, не чат. "
+    "Завжди договорюй речення. Зазвичай 2–4 короткі речення.";
 
 static const char* sysPrompt() {
-    return providerIsXai() ? SYS_PROMPT_XAI : SYS_PROMPT_OPENAI;
+    return providerIsXai() || providerIsLocal() ? SYS_PROMPT_XAI : SYS_PROMPT_OPENAI;
 }
 
 // OpenAI: ash (чоловічий). xAI: sirius / leo / rex — чоловічі; eve — жіночий.
@@ -130,7 +150,13 @@ constexpr uint16_t PREBUF_N = 400;         // 4 с × 10 ms — первые с�
 constexpr size_t PREBUF_BYTES = (size_t)PREBUF_N * CHUNK_BYTES;
 constexpr uint8_t MIC_SHIFT = 15;
 constexpr int MIC_GAIN = 2;  // x2 чутливість
-constexpr int SPK_GAIN = 3;  // громкость ответа Бендера (clip в int16)
+// PCM-шкала 0…256 (256 = без ослабления). Энкодер крутит spkVol.
+constexpr int SPK_VOL_DEFAULT = 48;
+constexpr int SPK_VOL_MIN = 0;
+constexpr int SPK_VOL_MAX = 192;
+constexpr int SPK_VOL_STEP = 8;
+volatile int spkVol = SPK_VOL_DEFAULT;
+volatile bool spkVolDirty = false;
 constexpr int MIC_PEAK_MIN = 500;   // мягкий порог для демо
 constexpr uint32_t PTT_MIN_MS = 200;
 constexpr uint32_t MAX_RECORD_MS = 15000;
@@ -197,12 +223,57 @@ void ampMute(bool mute) {
     digitalWrite(AMP_MUTE, mute ? HIGH : LOW);
 }
 
+// KY-040 / EC11: 4 перехода на щелчок. По часовой — громче (как основное радио).
+static void encoderPoll() {
+    static uint8_t prev = 0;
+    static int8_t acc = 0;
+    static bool inited = false;
+    const uint8_t curr = (uint8_t)((digitalRead(ENC_S1) << 1) | digitalRead(ENC_S2));
+    if (!inited) {
+        prev = curr;
+        inited = true;
+        return;
+    }
+    if (curr == prev) {
+        return;
+    }
+    static const int8_t dirTable[4][4] = {
+        {0, -1, 1, 0},
+        {1, 0, 0, -1},
+        {-1, 0, 0, 1},
+        {0, 1, -1, 0},
+    };
+    const int8_t d = dirTable[prev][curr];
+    prev = curr;
+    if (!d) {
+        return;
+    }
+    acc = (int8_t)(acc + d);
+    if (acc < 4 && acc > -4) {
+        return;
+    }
+    const int step = acc > 0 ? SPK_VOL_STEP : -SPK_VOL_STEP;
+    acc = 0;
+    int v = spkVol + step;
+    if (v < SPK_VOL_MIN) {
+        v = SPK_VOL_MIN;
+    } else if (v > SPK_VOL_MAX) {
+        v = SPK_VOL_MAX;
+    }
+    if (v != spkVol) {
+        spkVol = v;
+        spkVolDirty = true;
+    }
+}
+
 static void spkWrite(uint8_t* buf, size_t n) {
-    if (SPK_GAIN > 1 && n >= 2) {
+    encoderPoll();
+    const int vol = spkVol;
+    if (n >= 2 && vol != 256) {
         int16_t* s = (int16_t*)buf;
         const size_t count = n / 2;
         for (size_t i = 0; i < count; i++) {
-            int32_t v = (int32_t)s[i] * SPK_GAIN;
+            int32_t v = ((int32_t)s[i] * vol) >> 8;
             if (v > 32767) {
                 v = 32767;
             } else if (v < -32767) {
@@ -234,6 +305,10 @@ static void resetTxState() {
 }
 
 static void requestHangup() {
+    if (providerIsLocal()) {
+        hangupPending = false;
+        return;
+    }
     hangupPending = true;
 }
 
@@ -626,6 +701,11 @@ void onMessage(websockets::WebsocketsMessage m) {
         return;
     }
 
+    // Сервер жив (pong / audio / любое событие) — не рвать PTT по таймауту.
+    if (convState == ST_WAIT_RESP) {
+        stateSinceMs = millis();
+    }
+
     // Не парсити ASR-події — зайвий JsonDocument під час append = heap crash
     if (strstr(payload, "input_audio_transcription")) {
         return;
@@ -652,7 +732,8 @@ void onMessage(websockets::WebsocketsMessage m) {
     if (strcmp(t, "response.output_audio_transcript.delta") &&
         strcmp(t, "response.audio_transcript.delta") &&
         strcmp(t, "conversation.item.input_audio_transcription.delta") &&
-        strcmp(t, "response.output_audio.delta") && strcmp(t, "response.audio.delta")) {
+        strcmp(t, "response.output_audio.delta") && strcmp(t, "response.audio.delta") &&
+        strcmp(t, "pong")) {
         MICLOG("[WSS] %s\n", t);
         RTLOG("[WSS] %s\n", t);
     }
@@ -668,7 +749,7 @@ void onMessage(websockets::WebsocketsMessage m) {
         if (providerIsXai()) {
             JsonObject reas = s["reasoning"].to<JsonObject>();
             reas["effort"] = "none";
-        } else {
+        } else if (!providerIsLocal()) {
             s["type"] = "realtime";
             JsonArray outMods = s["output_modalities"].to<JsonArray>();
             outMods.add("audio");
@@ -701,6 +782,9 @@ void onMessage(websockets::WebsocketsMessage m) {
         }
     } else if (!strcmp(t, "response.created")) {
         speaking = true;
+        if (convState == ST_WAIT_RESP) {
+            stateSinceMs = millis();
+        }
         MICLOGLN(F("[PTT] response.created"));
     } else if (!strcmp(t, "response.output_audio.delta") || !strcmp(t, "response.audio.delta")) {
         // Зазвичай обробляється fast-path вище; fallback якщо type інший
@@ -775,13 +859,20 @@ void speakerTask(void*) {
     static uint8_t buf[CHUNK_BYTES];
     bool primed = false;
     uint32_t quietSince = 0;
-    constexpr size_t PRIME_BYTES = RATE * 2 * 1000 / 1000;  // ~1 с перед стартом
 
     for (;;) {
+        encoderPoll();
         size_t avail = rbUsed();
 
         if (!primed) {
-            if (avail < PRIME_BYTES) {
+            // 80 ms хватает против underrun. 1 с ждал раньше — короткие фразы Piper так и не играли.
+            constexpr size_t PRIME_BYTES = RATE * 2 * 80 / 1000;
+            const bool gotWholeReply = respPlaybackPending && avail >= CHUNK_BYTES;
+            if (avail < PRIME_BYTES && !gotWholeReply) {
+                vTaskDelay(1);
+                continue;
+            }
+            if (avail < CHUNK_BYTES) {
                 vTaskDelay(1);
                 continue;
             }
@@ -858,7 +949,8 @@ void wsTask(void*) {
             MICLOGLN(F("[WSS] connecting…"));
             sessionReady = false;
             if (!ws.connect(wsUrl())) {
-                MICLOGLN(F("[WSS] connect failed"));
+                MICLOG("[WSS] connect failed %s (файрвол ПК / IP / сервер не слушает)\n",
+                       wsUrl().c_str());
                 backoff = minOf(backoff ? backoff * 2 : (uint32_t)500, (uint32_t)8000);
             } else {
                 backoff = 0;
@@ -892,9 +984,10 @@ void wsTask(void*) {
             }
         }
 
+        const uint32_t waitLim = providerIsLocal() ? 90000u : 20000u;
         if (convState == ST_WAIT_RESP && stateSinceMs &&
-            (millis() - stateSinceMs > 20000)) {
-            MICLOGLN(F("[PTT] timeout ожидания — hangup"));
+            (millis() - stateSinceMs > waitLim)) {
+            MICLOGLN(F("[PTT] timeout ожидания"));
             waitingACK = false;
             responsePending = false;
             convState = ST_IDLE;
@@ -902,7 +995,7 @@ void wsTask(void*) {
             requestHangup();
         }
 
-        // Ответ доиграл → закрыть сессию. Следующее нажатие = новый коннект.
+        // Облако: после ответа закрыть сокет. Локально — держим коннект.
         if (respPlaybackPending && rbUsed() == 0 && !speaking) {
             respPlaybackPending = false;
             convState = ST_IDLE;
@@ -979,10 +1072,13 @@ void setup() {
     RTLOG("\nBender Realtime provider=%s model=%s\n", AI_PROVIDER, realtimeModel());
 
     pinMode(PTT_PIN, INPUT_PULLUP);
+    pinMode(ENC_S1, INPUT_PULLUP);
+    pinMode(ENC_S2, INPUT_PULLUP);
     pinMode(AMP_MUTE, OUTPUT);
     ampMute(true);
+    encoderPoll();
 
-    if (apiKey()[0] == '\0') {
+    if (!providerIsLocal() && apiKey()[0] == '\0') {
         Serial.printf("Set %s in secrets.h\n", providerIsXai() ? "XAI_API_KEY" : "OPENAI_API_KEY");
         while (true) {
             delay(1000);
@@ -1025,8 +1121,13 @@ void setup() {
         return;
     }
 
-    ws.setInsecure();
-    ws.addHeader("Authorization", String("Bearer ") + apiKey());
+    if (providerIsLocal()) {
+        wantOnline = true;
+        MICLOG("[WSS] local always-on %s\n", wsUrl().c_str());
+    } else {
+        ws.setInsecure();
+        ws.addHeader("Authorization", String("Bearer ") + apiKey());
+    }
     ws.onEvent(onEvent);
     ws.onMessage(onMessage);
 
@@ -1034,9 +1135,16 @@ void setup() {
     xTaskCreatePinnedToCore(wsTask, "ws", 16384, nullptr, 3, nullptr, 0);
 
     RTLOGLN(F("PTT: зажал = запись, отпустил = запрос"));
+    MICLOG("[Vol] encoder GPIO4/5  now=%d (0..%d)\n", SPK_VOL_DEFAULT, SPK_VOL_MAX);
 }
 
 void loop() {
+    encoderPoll();
+    if (spkVolDirty) {
+        spkVolDirty = false;
+        MICLOG("[Vol] %d/%d\n", (int)spkVol, SPK_VOL_MAX);
+    }
+
     static bool stable = false;
     static bool rawPrev = false;
     static uint32_t lastChange = 0;
