@@ -14,5 +14,7 @@ bool bender_ai_owns_speaker();
 bool bender_ai_tts_playing();
 
 // Чисте утримання (без кліків і повороту). EncButton тримає той самий GPIO6.
+void bender_ai_ptt_arm();
 void bender_ai_ptt_down();
 void bender_ai_ptt_up();
+void bender_ai_ptt_cancel();

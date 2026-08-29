@@ -88,7 +88,7 @@ class RadioConfig {
     static constexpr uint8_t encS2 = 5;
     static constexpr uint8_t encBtn = 6;
     // 5 кліків — % АКБ; 6 — Pong; 7 — deep sleep; 8 — restart.
-    // Утримання без кліків/повороту (~0.4 с) — PTT Бендера (запис до відпускання).
+    // Утримання без кліків/повороту (~0.5 с) підтверджує PTT (не клік). Мікрофон пише з моменту натискання.
     static constexpr uint16_t encoderPttHoldMs = 520;
     static constexpr uint8_t encoderSleepClicks = 7;
     static constexpr uint8_t encoderRestartClicks = 8;

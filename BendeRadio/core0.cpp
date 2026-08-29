@@ -1486,11 +1486,17 @@ void core0(void* p) {
             s_bt_forget_pair_hold_ready = false;
             s_softap_hold_ready = false;
             s_ptt_this_press = false;
+            if (!pong_active() && !s_mode_pick_active && !show_wake_after_sleep_anim &&
+                strcmp(g_audio_source, "bt") != 0) {
+                bender_ai_ptt_arm();
+            }
         }
         if (eb_tick && eb.release()) {
             if (s_ptt_this_press) {
                 bender_ai_ptt_up();
                 s_ptt_this_press = false;
+            } else {
+                bender_ai_ptt_cancel();
             }
         }
         if (eb_tick && eb.pressing() && !s_ptt_this_press && !s_enc_hold_had_turn_while_pressed &&
@@ -1546,6 +1552,7 @@ void core0(void* p) {
                         s_enc_hold_had_turn_while_pressed = true;
                         s_bt_forget_pair_hold_ready = false;
                         s_softap_hold_ready = false;
+                        bender_ai_ptt_cancel();
                     } else {
                         pong_paddle_nudge(eb.dir());
                         pong_draw();
@@ -1759,6 +1766,7 @@ void core0(void* p) {
                         s_enc_hold_had_turn_while_pressed = true;
                         s_bt_forget_pair_hold_ready = false;
                         s_softap_hold_ready = false;
+                        bender_ai_ptt_cancel();
                         // getClicks() при удержании = число уже завершённых кликов в серии:
                         // 0 — один клик + поворот; 1 — двойной; 2 — тройной (яркость); 3 — четверной (Wi‑Fi / Bluetooth).
                         switch (eb.getClicks()) {

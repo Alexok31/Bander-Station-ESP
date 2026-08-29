@@ -95,6 +95,7 @@ constexpr size_t CHUNK = 240;
 constexpr size_t CHUNK_BYTES = CHUNK * 2;
 constexpr size_t RING_BYTES = 512 * 1024;
 constexpr uint16_t PREBUF_N = 400;
+constexpr uint16_t PRE_IDLE_N = 80;
 constexpr size_t PREBUF_BYTES = (size_t)PREBUF_N * CHUNK_BYTES;
 constexpr size_t PCM_DECODE_BYTES = 192 * 1024;
 constexpr uint8_t MIC_SHIFT = 15;
@@ -122,6 +123,9 @@ static volatile bool wantOnline = false;
 static volatile bool hangupPending = false;
 static volatile bool sessionArmed = false;
 static volatile bool pttHeld = false;
+static volatile bool s_ptt_armed = false;
+static volatile bool s_need_mic_clear = false;
+static volatile bool s_need_commit = false;
 static volatile bool respPlaybackPending = false;
 static volatile uint8_t convState = ST_IDLE;
 static volatile uint32_t stateSinceMs = 0;
@@ -177,9 +181,10 @@ static int pcmScaleFromRadioVol() {
         v = vmax;
     }
     if (vmax <= 0) {
-        return 48;
+        return 0;
     }
-    return (v * 192) / vmax;
+    // Як Audio::setVolume curve 0: gain = (vol/steps)^2; 256 = ×1.0.
+    return (v * v * 256) / (vmax * vmax);
 }
 
 static void i2sWriteAll(const uint8_t* p, size_t n) {
@@ -326,6 +331,9 @@ static void resetTxState() {
     responsePending = false;
     sessionArmed = false;
     pttHeld = false;
+    s_ptt_armed = false;
+    s_need_mic_clear = false;
+    s_need_commit = false;
     respPlaybackPending = false;
     convState = ST_IDLE;
     stateSinceMs = 0;
@@ -469,48 +477,37 @@ static void prePush(const uint8_t* pcm) {
     preN++;
 }
 
-static void flushPrebuf() {
-    if (!prebuf || !preN) {
+static void preTrimIdle() {
+    while (preN > PRE_IDLE_N) {
+        preHead = (preHead + 1) % PREBUF_N;
+        preN--;
+    }
+}
+
+static void drainPrebufToWs(uint8_t max_n) {
+    if (!sessionReady || !prebuf || !preN) {
         return;
     }
-    for (uint16_t i = 0; i < preN; i++) {
-        const uint16_t idx = (preHead + i) % PREBUF_N;
+    uint8_t n = 0;
+    while (preN && n < max_n) {
+        const uint16_t idx = preHead % PREBUF_N;
         sendMicAppend(prebuf + (size_t)idx * CHUNK_BYTES);
+        preHead = (preHead + 1) % PREBUF_N;
+        preN--;
+        n++;
     }
-    ALOG("[PTT] prebuf %u ms\n", (unsigned)preN * 10);
-    preN = 0;
-    preHead = 0;
 }
 
 static void tryPttCommit();
-
-static void processMicPtt(const uint8_t* mic16) {
-    if (convState != ST_RECORDING) {
-        return;
-    }
-    if (sessionReady) {
-        sendMicAppend(mic16);
-    } else {
-        prePush(mic16);
-    }
-    recMs += 10;
-    if (recMs >= MAX_RECORD_MS) {
-        ALOGLN(F("[PTT] max rec"));
-        tryPttCommit();
-    }
-}
 
 static void pttStartCapture() {
     sessionArmed = true;
     serverCommitted = false;
     commitWhenReady = false;
-    preN = 0;
-    preHead = 0;
-    resetRecStats();
     micResetSmooth();
     convState = ST_RECORDING;
     stateSinceMs = millis();
-    ALOGLN(F("[PTT] REC"));
+    ALOG("[PTT] REC queued=%u ms\n", (unsigned)preN * 10);
 }
 
 static void tryPttCommit() {
@@ -548,13 +545,12 @@ static void tryPttCommit() {
 }
 
 static void onSessionReadyConv() {
-    if (convState != ST_RECORDING) {
+    if (convState != ST_RECORDING && !s_ptt_armed) {
         return;
     }
-    JsonDocument cl;
-    cl["type"] = "input_audio_buffer.clear";
-    wsSend(cl);
-    flushPrebuf();
+    while (preN) {
+        drainPrebufToWs(16);
+    }
     if (!pttHeld || commitWhenReady) {
         tryPttCommit();
     }
@@ -835,16 +831,39 @@ static void wsTask(void*) {
         }
 
         int32_t chunkPeak = 0;
-        if (convState == ST_RECORDING && pttHeld) {
-            if (readMicChunk16(mic16, &chunkPeak, true)) {
-                processMicPtt(mic16);
+        const bool capturing = s_ptt_armed || (convState == ST_RECORDING && pttHeld);
+        if (s_need_mic_clear) {
+            s_need_mic_clear = false;
+            if (sessionReady) {
+                JsonDocument cl;
+                cl["type"] = "input_audio_buffer.clear";
+                wsSend(cl);
             }
-        } else {
+        }
+        if (readMicChunk16(mic16, &chunkPeak, capturing)) {
+            prePush(mic16);
+            if (capturing) {
+                recMs += 10;
+                if (recMs >= MAX_RECORD_MS) {
+                    ALOGLN(F("[PTT] max rec"));
+                    s_need_commit = true;
+                }
+            } else {
+                preTrimIdle();
+            }
+        }
+        if (capturing && sessionReady) {
+            drainPrebufToWs(8);
+        }
+        if (s_need_commit && convState == ST_RECORDING) {
+            s_need_commit = false;
+            while (preN) {
+                drainPrebufToWs(16);
+            }
+            tryPttCommit();
+        } else if (!capturing) {
             if (convState == ST_RECORDING && !pttHeld && sessionReady) {
                 tryPttCommit();
-            }
-            if (convState != ST_RECORDING || !pttHeld) {
-                readMicChunk16(mic16, &chunkPeak, false);
             }
         }
 
@@ -920,6 +939,26 @@ bool bender_ai_tts_playing() {
     return t != 0 && (millis() - t) < 80u;
 }
 
+void bender_ai_ptt_arm() {
+    if (convState == ST_WAIT_RESP || waitingACK || responsePending || convState == ST_RECORDING) {
+        return;
+    }
+    s_need_mic_clear = false;
+    s_ptt_armed = true;
+    resetRecStats();
+}
+
+void bender_ai_ptt_cancel() {
+    if (convState == ST_RECORDING || pttHeld) {
+        return;
+    }
+    if (s_ptt_armed) {
+        s_need_mic_clear = true;
+    }
+    s_ptt_armed = false;
+    resetRecStats();
+}
+
 void bender_ai_ptt_down() {
     if (convState == ST_WAIT_RESP || waitingACK || responsePending) {
         ALOGLN(F("[PTT] wait answer"));
@@ -946,13 +985,15 @@ void bender_ai_ptt_down() {
     respPlaybackPending = false;
     pcm_analyzer_reset();
     pttStartCapture();
+    s_ptt_armed = false;
 }
 
 void bender_ai_ptt_up() {
     pttHeld = false;
+    s_ptt_armed = false;
     if (convState == ST_RECORDING) {
         ALOGLN(F("[PTT] release"));
-        tryPttCommit();
+        s_need_commit = true;
     }
 }
 
