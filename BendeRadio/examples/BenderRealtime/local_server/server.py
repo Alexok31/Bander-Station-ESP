@@ -31,6 +31,7 @@ from piper import PiperVoice, SynthesisConfig
 
 import rvc_convert
 import stress_convert
+import voice_commands
 
 HERE = Path(__file__).resolve().parent
 MODELS = HERE / "models"
@@ -134,7 +135,8 @@ CHAT: list[dict] = []
 CHAT_CONV_ID = ""
 CHAT_SUMMARY = ""
 CHAT_GROK_RESP_ID = ""
-GROK_PROMPT_REV = 3
+GROK_PROMPT_REV = 5
+DEVICE_STATIONS: list[dict] = []
 
 VOICE_ONNX = MODELS / "uk_UA-ukrainian_tts-medium.onnx"
 VOICE_JSON = MODELS / "uk_UA-ukrainian_tts-medium.onnx.json"
@@ -152,18 +154,28 @@ VOICE_EN_BASE = (
 PIPER_SPEAKER = int(os.environ.get("PIPER_SPEAKER", "1"))
 # >1 повільніше, <1 швидше.
 PIPER_LENGTH = float(os.environ.get("PIPER_LENGTH", str(CFG["piper_length"])))
-PIPER_PAUSE_SENT_MS = int(os.environ.get("PIPER_PAUSE_SENT_MS", "200"))
-PIPER_PAUSE_COMMA_MS = int(os.environ.get("PIPER_PAUSE_COMMA_MS", "100"))
+PIPER_PAUSE_SENT_MS = int(os.environ.get("PIPER_PAUSE_SENT_MS", "120"))
+PIPER_PAUSE_COMMA_MS = int(os.environ.get("PIPER_PAUSE_COMMA_MS", "0"))
 LLM_MAX_SENTS = int(os.environ.get("LLM_MAX_SENTS", "3"))
 LLM_STORY_SENTS = int(os.environ.get("LLM_STORY_SENTS", "5"))
 
-ASR_LANGS = ("uk", "ru", "en")
+# Перша мова — пріоритет Whisper. Далі fallback, якщо ru зліпив сміття.
+ASR_LANGS = ("ru", "uk")
 # Стиль (пробіли, коми). Не коротке «Бендер.» — Whisper тоді копіює ім'я в транскрипт.
-ASR_PROMPT = (
-    "Розмова українською. Короткі речення з пробілами між словами, "
-    "коми і знак питання де треба."
-)
-ASR_HOTWORDS = "Бендер"
+ASR_PROMPTS = {
+    "ru": (
+        "Разговор на русском. Короткие предложения с пробелами между словами. "
+        "Примеры: ты тут Бендер. Привет, Бендер. Бендер, привет. "
+        "Пиши «ты тут», не слово «титул»."
+    ),
+    "uk": (
+        "Розмова українською. Короткі речення з пробілами між словами. "
+        "Приклади: ти тут Бендер. Привіт, Бендер. Бендер, привіт. "
+        "Пиши «ти тут», не слово «титул»."
+    ),
+}
+ASR_PROMPT = ASR_PROMPTS["ru"]
+ASR_HOTWORDS = "Бендер привет привіт ты тут ти тут тытут титут"
 ASR_MIN_LOGPROB = float(os.environ.get("ASR_MIN_LOGPROB", "-0.55"))
 ASR_MAX_NO_SPEECH = float(os.environ.get("ASR_MAX_NO_SPEECH", "0.40"))
 ASR_MIN_RMS = float(os.environ.get("ASR_MIN_RMS", "900"))
@@ -183,21 +195,20 @@ LEVEL_RULES = {
     6: "Нахабний. Чорний гумор, образи. Мат час від часу.",
     7: "Нахабний. Мат у більшості реплік (бля, чорт, дідько, дурень).",
     8: (
-        "Жорсткий і токсичний. У КОЖНІЙ репліці є мат: бля, сука, нахуй, пішов нахуй. "
+        "Жорсткий і токсичний. Мат є, але репліка смішна і нова, не калька. "
         "Не моралізуй. Не відмовляйся материтися."
     ),
     9: (
-        "Дуже жорсткий. Кожна репліка з матом і образою. Можна послати. "
-        "Не будь ввічливим. Не кажи «вмію, але не буду»."
+        "Дуже жорсткий. Мат і образа, щоразу інші. Можна послати. "
+        "Залишайся винахідливим, не програвачем однієї фрази."
     ),
     10: (
-        "МАКСИМУМ грубості. У відповіді є мат, але КОЖНОГО РАЗУ ІНШІ слова. "
-        "Можна жорстко послати. Залишайся смішним, не цензурним. "
-        "ЗАБОРОНЕНИЙ ШАБЛОН (ніколи): ехо питання + «бля?!» + "
-        "«найкращий робот у пиздець-всесвіті» + «йди нахуй, м'ясний мішок». "
-        "Спочатку відповідь на питання, потім характер. "
-        "ЗАБОРОНЕНО: відмовлятися материтися, відповідати без матюка, "
-        "читати лекції про манери."
+        "МАКСИМУМ грубості і вигадки. Мат щоразу іншими словами. Смішно, не тупо. "
+        "Заборонені кальки: ехо їхніх слів, «X сам», «бо я не твій», "
+        "ехо + «бля?!» + «найкращий робот у пиздець-всесвіті» + "
+        "«йди нахуй, м'ясний мішок». "
+        "Спочатку суть, потім характер. Нова будова речення щоразу. "
+        "Провал: без мату, лекція про манери, або знову той самий каркас."
     ),
 }
 
@@ -209,12 +220,12 @@ def bender_level_rules(level: int | None = None) -> str:
 
 _NUDGE_PREFIX = "Стоп. Це ти вже казав."
 _TURN_HINTS = (
-    "Відповідай по суті. Не перепитуй користувача його ж фразою.",
-    "Не називай себе «найкращим роботом у Всесвіті».",
-    "Не закінчуй «йди нахуй, м'ясний мішок».",
-    "Один свіжий мат, далі відповідь на питання.",
-    "Якщо математика або факт — відповідь у першому реченні, підкол другим.",
-    "Інший жарт і інші слова, ніж минулого разу.",
+    "Вигадай новий підкол. Інша будова речення, ніж минулого разу.",
+    "Здивуй. Не калькуй їхні слова і не кажи «X сам / бо я не твій».",
+    "Жива сцена, не скріпт. Можна деталь про Фрая, пиво чи крадіжку — один раз, по-новому.",
+    "Спочатку суть їхньої репліки, потім характер. Свіжий мат, не той самий.",
+    "Якщо факт чи число — відповідь першим реченням, далі вигадка.",
+    "Не починай з того ж слова що в попередній своїй репліці.",
 )
 
 
@@ -245,19 +256,18 @@ def grok_turn_text(user_text: str, last_assistant: str = "", nudge: str = "") ->
     bits = [f"[BENDER_LEVEL {BENDER_LEVEL}/10]", hint]
     if BENDER_LEVEL >= 8:
         bits.append(
-            "Мат обов'язковий, але інший набір слів. "
-            "Без шаблону: ехо + «бля?!» + «найкращий робот у пиздець-всесвіті» + "
-            "«йди нахуй, м'ясний мішок»."
+            "Мат є, але вбудований у нову вигадку. Не шаблон образи. "
+            "Без ехо + «бля?!» + «найкращий робот» + «йди нахуй, м'ясний мішок»."
         )
     if last_assistant:
-        bits.append(
-            "Минула твоя репліка (структуру і фрази НЕ копіюй):\n"
-            + last_assistant[:500]
-        )
+        bits.append("Минулу свою репліку не копіюй ні словами, ні каркасом.")
     if nudge:
         bits.append(nudge)
     bits.append("Користувач сказав:\n" + user_text)
-    bits.append("Спочатку відповідь на ЦЕ, потім характер. Без ехо-питання.")
+    bits.append(
+        "Відповідь своїми словами, ніби вперше. "
+        "Заборонено папужити їхню фразу і каркас «сам / бо я не твій / лайковий»."
+    )
     bits.append(
         "Тебе звуть Бендер. Дендер/Блендер/Тендер/Бандер/Бендерпривіт — це ASR "
         "(привітання без пробілу), не кличка. Відповідай як на «Привіт, Бендер». "
@@ -267,16 +277,23 @@ def grok_turn_text(user_text: str, last_assistant: str = "", nudge: str = "") ->
 
 
 def set_bender_level(n) -> int:
-    global BENDER_LEVEL, CHAT_GROK_RESP_ID
+    global BENDER_LEVEL
     try:
         nxt = max(1, min(10, int(n)))
     except (TypeError, ValueError):
         return BENDER_LEVEL
     if nxt != BENDER_LEVEL:
         BENDER_LEVEL = nxt
-        CHAT_GROK_RESP_ID = ""
-        log(f"Grok chain reset (level {BENDER_LEVEL})")
+        grok_break_chain(f"level {BENDER_LEVEL}")
     return BENDER_LEVEL
+
+
+def grok_break_chain(reason: str) -> None:
+    """Новий Grok-ланцюг: continue з previous_response_id інакше крутить ту саму кальку."""
+    global CHAT_GROK_RESP_ID
+    if CHAT_GROK_RESP_ID:
+        log(f"Grok chain reset ({reason})")
+    CHAT_GROK_RESP_ID = ""
 
 
 def bender_prompt() -> str:
@@ -550,6 +567,7 @@ def load_piper():
         noise_w_scale=0.80,
     )
     log(f"Piper OK (uk_UA {who}, length={PIPER_LENGTH})")
+    load_stress_words()
     load_uk_stress()
     try:
         download(VOICE_EN_BASE, VOICE_EN_ONNX)
@@ -805,10 +823,12 @@ def _latin_to_uk(word: str) -> str:
 
 
 _ACUTE = "\u0301"
+_UK_VOWELS = set("аеєиіїоуюя")
 _UK_WORD = re.compile(r"[а-яіїєґ'\u0301]+")
 _uk_stress = None
-# Слова, яких немає в словнику / важливі для Бендера.
-_STRESS_FIX = {
+_STRESS_WORDS_PATH = HERE / "stress_words.json"
+# Запас, якщо JSON немає. Файл перекриває ці ключі.
+_STRESS_FIX_BUILTIN = {
     "бендер": "бе" + _ACUTE + "ндер",
     "бендера": "бе" + _ACUTE + "ндера",
     "бендеру": "бе" + _ACUTE + "ндеру",
@@ -818,6 +838,64 @@ _STRESS_FIX = {
     "хлапалка": "хлапа" + _ACUTE + "лка",
     "хлапалки": "хлапа" + _ACUTE + "лки",
 }
+_STRESS_FIX: dict[str, str] = dict(_STRESS_FIX_BUILTIN)
+
+
+def _stress_on_vowel(word: str, n: int) -> str:
+    """n — номер голосної (1 = перша). Знак ́ ставиться одразу після неї."""
+    w = (word or "").replace(_ACUTE, "")
+    if n < 1:
+        return w
+    seen = 0
+    out: list[str] = []
+    for ch in w:
+        out.append(ch)
+        if ch in _UK_VOWELS:
+            seen += 1
+            if seen == n:
+                out.append(_ACUTE)
+    return "".join(out)
+
+
+def _stress_fix_value(word: str, spec) -> str | None:
+    key = (word or "").lower().replace(_ACUTE, "").strip()
+    if not key:
+        return None
+    if isinstance(spec, bool) or spec is None:
+        return None
+    if isinstance(spec, (int, float)):
+        n = int(spec)
+        if n < 1:
+            return None
+        return _stress_on_vowel(key, n)
+    s = str(spec).lower().strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return _stress_on_vowel(key, int(s))
+    return s
+
+
+def load_stress_words() -> None:
+    """Свої наголоси з stress_words.json (перекривають словник Stanza)."""
+    global _STRESS_FIX
+    out = dict(_STRESS_FIX_BUILTIN)
+    if _STRESS_WORDS_PATH.is_file():
+        try:
+            raw = json.loads(_STRESS_WORDS_PATH.read_text(encoding="utf-8"))
+            n = 0
+            if isinstance(raw, dict):
+                for k, v in raw.items():
+                    if str(k).startswith("_"):
+                        continue
+                    val = _stress_fix_value(str(k), v)
+                    if val:
+                        out[str(k).lower().replace(_ACUTE, "").strip()] = val
+                        n += 1
+            log(f"stress_words.json {n} words")
+        except Exception as e:
+            log(f"stress_words.json skip: {e}")
+    _STRESS_FIX = out
 
 
 def load_uk_stress() -> None:
@@ -900,6 +978,9 @@ def piper_ready_uk(text: str) -> str:
     t = t.replace('"', " ").replace("«", " ").replace("»", " ").replace("„", " ").replace("“", " ").replace("”", " ")
     for apos in ("\u2019", "\u2018", "\u02bc", "\u02b9", "\u0060"):
         t = t.replace(apos, "'")
+    # Piper на «—» ставить довгу паузу, як на крапці. Тире = кома.
+    t = re.sub(r"\s*[—–−]+\s*", ", ", t)
+    t = re.sub(r"\s+-\s+", ", ", t)
     t = _expand_numbers(t, uk=True)
     t = re.sub(r"[a-z]+(?:-[a-z]+)*", lambda m: _latin_to_uk(m.group(0)), t)
     t = re.sub(r"[a-z]+", " ", t)
@@ -912,6 +993,8 @@ def piper_ready_uk(text: str) -> str:
 
 def piper_ready_en(text: str) -> str:
     t = unicodedata.normalize("NFC", text)
+    t = re.sub(r"\s*[—–−]+\s*", ", ", t)
+    t = re.sub(r"\s+-\s+", ", ", t)
     t = _expand_numbers(t, uk=False)
     t = re.sub(r"[\u0400-\u04ff]+", " ", t)
     t = re.sub(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]+", " ", t)
@@ -954,14 +1037,14 @@ _BENDER_FORMS = (
 )
 # Слова на -ендер, які існують. У звертанні («Тендер, привіт») усе одно Бендер.
 _BENDER_KEEP = re.compile(
-    r"(?iu)^(тендер|гендер|рендер|фендер|сендер|лендер|"
-    r"tender|gender|render|fender|sender|lender)"
+    r"(?iu)^(тендер|гендер|рендер|ренджер|рейнджер|фендер|сендер|лендер|"
+    r"tender|gender|render|ranger|fender|sender|lender)"
 )
 _BENDER_STEM = re.compile(r"(?iu)ндер|nder")
 
 
 def _asr_bender_form(word: str) -> str | None:
-    w = word.lower().replace("ё", "е").replace("’", "")
+    w = word.lower().replace("ё", "е").replace("’", "").replace("дж", "д")
     if not _BENDER_STEM.search(w):
         return None
     for form in _BENDER_FORMS:
@@ -974,7 +1057,8 @@ def _asr_bender_form(word: str) -> str | None:
 _ASR_GLUE_TAIL = (
     r"привіт|привет|здрастуй|здравствуй|здарова|вітаю|"
     r"алло|ало|слухай|скажи|розкажи|hello|\bhi\b|"
-    r"як|що|ти|там|бля|йо|гей|добрий|доброго"
+    r"як|що|ти|там|бля|йо|гей|добрий|доброго|"
+    r"титут|тытут|ятут|тыздесь|яздесь"
 )
 
 
@@ -1019,25 +1103,74 @@ def _asr_bender_vocative(text: str, start: int, end: int) -> bool:
     return False
 
 
+def _unglue_short(text: str) -> str:
+    """Whisper злипає короткі слова: «ты тут» → «титут»."""
+    pairs = (
+        (r"(?iu)\bтытут\b", "ты тут"),
+        (r"(?iu)\bтитут\b", "ти тут"),
+        (r"(?iu)\bтитуть\b", "ти тут"),
+        (r"(?iu)\bтытуть\b", "ты тут"),
+        (r"(?iu)\bтитутт\b", "ти тут"),
+        (r"(?iu)\bятут\b", "я тут"),
+        (r"(?iu)\bтыздесь\b", "ты здесь"),
+        (r"(?iu)\bяздесь\b", "я здесь"),
+        (r"(?iu)\bтытам\b", "ты там"),
+        (r"(?iu)\bтитам\b", "ти там"),
+        (r"(?iu)\bтыгде\b", "ты где"),
+        (r"(?iu)\bтиде\b", "ти де"),
+        (r"(?iu)\bатут\b", "а тут"),
+        (r"(?iu)\bнукак\b", "ну как"),
+        (r"(?iu)\bнуяк\b", "ну як"),
+    )
+    t = text
+    for pat, repl in pairs:
+        t = re.sub(pat, repl, t)
+    return t
+
+
+_HERE_ASR_GARBAGE = re.compile(
+    r"(?iu)^(титул|титуль|тытул|титула|титулі|ти\s*тул|ты\s*тул|title)$"
+)
+
+
+def _fix_here_ping(text: str) -> str:
+    """Whisper часто пише «титул» замість «ты тут»."""
+    t = re.sub(r"\s+", " ", text).strip()
+    core = re.sub(r"(?iu)\b(?:бендер|bender)\b", " ", t)
+    core = re.sub(r"[\s.,!?…:;«»\"'\-—]+", " ", core).strip()
+    if _HERE_ASR_GARBAGE.fullmatch(core):
+        return "Ты тут, Бендер?"
+    return t
+
+
 def _fix_asr(text: str) -> str:
     t = re.sub(r"\s+", " ", text).strip()
     t = re.sub(r"(?iu)\b[бдптвгклмн]ен\s+дер\b", "Бендер", t)
     t = _unglue_bender(t)
+    t = _unglue_short(t)
+    t = _fix_here_ping(t)
 
     def one(m: re.Match[str]) -> str:
         w = m.group(0)
         mapped = _asr_bender_form(w)
         if not mapped:
             return w
-        if _BENDER_KEEP.match(w) and not _asr_bender_vocative(t, m.start(), m.end()):
+        folded = w.lower().replace("ё", "е").replace("дж", "д")
+        if (_BENDER_KEEP.match(w) or _BENDER_KEEP.match(folded)) and not _asr_bender_vocative(
+            t, m.start(), m.end()
+        ):
             return w
         return mapped
 
     t = re.sub(r"(?iu)\b[a-zа-яёіїєґ]{4,12}\b", one, t)
+    t = re.sub(r"(?iu)\bбендж+ер\b", "Бендер", t)
+    t = re.sub(r"(?iu)\bбенждер\b", "Бендер", t)
     t = re.sub(r"(?i)\bгербал\b", "Бендер", t)
     t = re.sub(r"(?i)\bвзаучило\b", "звучало", t)
+    t = re.sub(r"(?iu)\bприєт\b", "привет", t)
     t = re.sub(r"(?iu)\bбендер(?:[\s,]+бендер)+\b", "Бендер", t)
     t = re.sub(r"(?iu)\bbender(?:[\s,]+bender)+\b", "Бендер", t)
+    t = _fix_here_ping(t)
     if re.fullmatch(r"(?iu)[\s.,!?]*бендер[\s.,!?]*", t):
         t = "Привіт, Бендер."
     return t.strip()
@@ -1076,16 +1209,93 @@ _YT_OUTRO_RE = re.compile(
     r"продолжение следует|"
     r"продовження слідує|"
     r"субтитры|"
+    r"субтитри|"
+    r"редактор(?:ы|а|и)?\s+субтит|"
+    r"корректор|"
+    r"коректор|"
+    r"переводчик|"
+    r"перекладач|"
+    r"семкин|"
+    r"егорова|"
     r"аплодисменты|"
-    r"\[музыка\]"
+    r"аплодисменти|"
+    r"\[музыка\]|"
+    r"\[музика\]|"
+    r"subtitles|"
+    r"текст чита[еє]|"
+    r"озвучи[лв]|"
+    r"translated by|"
+    r"transcribed by"
     r")"
 )
+
+# Кінцівка DVD: «Редактор субтитров А.Семкин Корректор А.Егорова»
+_SUB_CREDIT_RE = re.compile(
+    r"(?iu)"
+    r"(?:редактор(?:ы|а|и)?\s+субтит\w*|"
+    r"корректор(?:ы|а)?|"
+    r"коректор(?:и|а)?|"
+    r"переводчик\w*|"
+    r"перекладач\w*|"
+    r"субтитры\s+(?:сделал|сделала)|"
+    r"субтитри\s+зробив|"
+    r"текст\s+чита[еє]\w*|"
+    r"озвучи[лв]\w*)"
+    r"(?:\s+[A-ZА-ЯІЇЄҐ]\.\s*[A-ZА-ЯІЇЄҐ][a-zа-яёіїєґ'\-]*)*"
+)
+_INITIALS_NAME_RE = re.compile(
+    r"(?u)\b[А-ЯA-ZІЇЄҐ]\.\s*[А-ЯA-ZІЇЄҐ][а-яёіїєґa-z'\-]{2,}"
+)
+# Саме «Дякую!» / «Thanks.» без іншого тексту — типова галюцинація Whisper, не реальна фраза.
+_THANKS_ONLY_RE = re.compile(
+    r"(?iu)^[\s.,!?«»\"'…\-—]*"
+    r"(?:дуже\s+|велике\s+|большое\s+)?"
+    r"(?:дякую|спасибі|спасибо|thanks|thank\s+you|thx)"
+    r"(?:\s+(?:тобі|вам|большое|дуже))?"
+    r"[\s.,!?«»\"'…\-—]*$"
+)
+_last_halluc_norm = ""
+
+
+def _norm_asr_blob(text: str) -> str:
+    t = (text or "").lower().replace("ё", "е")
+    t = re.sub(r"[^\wіїєґ]+", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _looks_like_credits(text: str) -> bool:
+    t = re.sub(r"\s+", " ", text or "").strip()
+    if not t:
+        return False
+    if _YT_OUTRO_RE.search(t) or _THANKS_ONLY_RE.match(t) or _SUB_CREDIT_RE.search(t):
+        return True
+    if len(_INITIALS_NAME_RE.findall(t)) >= 2:
+        return True
+    return False
+
+
+def _scrub_hallucination(text: str) -> str:
+    t = re.sub(r"\s+", " ", text or "").strip()
+    if not t:
+        return ""
+    t = _SUB_CREDIT_RE.sub(" ", t)
+    t = _INITIALS_NAME_RE.sub(" ", t)
+    t = re.sub(r"\s+", " ", t).strip(" .,;:—-")
+    if _looks_like_credits(t):
+        return ""
+    return t
+
+
+def _note_hallucination(text: str) -> None:
+    global _last_halluc_norm
+    n = _norm_asr_blob(text)
+    if n:
+        _last_halluc_norm = n
 
 
 def _is_hallucination(text: str, avg_lp: float, rms: float) -> bool:
     t = re.sub(r"\s+", " ", text or "").strip()
-    # Whisper на тиші часто пише YouTube-кінцівку (укр. «Дякую за перегляд»).
-    if _YT_OUTRO_RE.search(t):
+    if _looks_like_credits(t):
         return True
     if re.search(
         r"(?iu)^(продолжение следует|продовження слідує|thanks for watching|"
@@ -1093,10 +1303,11 @@ def _is_hallucination(text: str, avg_lp: float, rms: float) -> bool:
         t,
     ):
         return True
+    if _last_halluc_norm and _norm_asr_blob(t) == _last_halluc_norm:
+        return True
     if not _only_greet_words(t):
         return False
     n = _greet_token_count(t)
-    # Злив Whisper-prompt лише на тихій доріжці. Гучне «Бендер Бендер» — реальна мова.
     if n >= 3 and rms < 4000:
         return True
     return False
@@ -1121,10 +1332,66 @@ def _asr_ok(
         return False
     if _is_hallucination(text, avg_lp, rms):
         return False
+    letters = [ch for ch in text if ch.isalpha()]
+    if letters and (sum(ch.isupper() for ch in letters) / len(letters)) >= 0.85:
+        return False
     return True
 
 
-def _whisper_once(audio, language: str | None) -> tuple[str, str, float, float, float]:
+def _asr_enhance(audio: np.ndarray, sr: int = IN_RATE) -> np.ndarray:
+    """М'який Wiener. Сильне віднімання дає «воду» / musical noise."""
+    x = np.asarray(audio, dtype=np.float32)
+    if x.size < 2048:
+        return x
+    x = x - float(x.mean())
+    x = np.concatenate([x[:1], x[1:] - 0.75 * x[:-1]])
+    n_fft, hop = 512, 160
+    win = np.hanning(n_fft).astype(np.float32)
+    pad = (hop - (x.size - n_fft) % hop) % hop
+    xp = np.pad(x, (0, int(pad) + n_fft))
+    frames = np.lib.stride_tricks.sliding_window_view(xp, n_fft)[::hop]
+    spec = np.fft.rfft(frames * win, axis=1)
+    mag = np.abs(spec)
+    energy = mag.sum(axis=1)
+    k = max(2, int(0.12 * energy.size))
+    quiet = np.argpartition(energy, k)[:k]
+    noise = np.median(mag[quiet], axis=0) + 1e-6
+    gain = np.clip(1.0 - 0.65 * (noise / (mag + 1e-6)), 0.45, 1.0)
+    if gain.shape[1] >= 3:
+        gain = (
+            np.concatenate([gain[:, :1], gain[:, :-1]], axis=1)
+            + gain
+            + np.concatenate([gain[:, 1:], gain[:, -1:]], axis=1)
+        ) / 3.0
+    smooth = np.empty_like(gain)
+    prev = gain[0]
+    for i in range(gain.shape[0]):
+        prev = 0.65 * prev + 0.35 * gain[i]
+        smooth[i] = prev
+    hz = np.fft.rfftfreq(n_fft, 1.0 / sr)
+    smooth[:, hz < 70] *= 0.55
+    rec = np.fft.irfft(spec * smooth, n=n_fft, axis=1) * win
+    out = np.zeros(xp.size, dtype=np.float32)
+    wsum = np.zeros(xp.size, dtype=np.float32)
+    for i, fr in enumerate(rec):
+        a = i * hop
+        out[a : a + n_fft] += fr
+        wsum[a : a + n_fft] += win
+    y = out[: x.size] / np.maximum(wsum[: x.size], 1e-6)
+    rms = float(np.sqrt(np.mean(y * y))) + 1e-8
+    y *= min(0.14 / rms, 3.5)
+    return np.clip(y, -1.0, 1.0)
+
+
+_last_whisper_pcm = b""
+
+
+def _pcm_for_whisper(pcm16: bytes) -> np.ndarray:
+    audio = np.frombuffer(pcm16, dtype=np.int16).astype(np.float32) / 32768.0
+    return _asr_enhance(audio, IN_RATE)
+
+
+def _whisper_once(audio, language: str | None, *, use_vad: bool = True) -> tuple[str, str, float, float, float]:
     kw = dict(
         language=language,
         beam_size=5,
@@ -1134,7 +1401,7 @@ def _whisper_once(audio, language: str | None) -> tuple[str, str, float, float, 
         temperature=(0.0, 0.2, 0.4),
         repetition_penalty=1.15,
         no_repeat_ngram_size=3,
-        vad_filter=False,
+        vad_filter=use_vad,
         # True прибирає timestamp-токени — Whisper тоді частіше пише «Бендерпривіт».
         without_timestamps=False,
         condition_on_previous_text=False,
@@ -1143,16 +1410,34 @@ def _whisper_once(audio, language: str | None) -> tuple[str, str, float, float, 
         no_speech_threshold=0.6,
         hotwords=ASR_HOTWORDS,
     )
-    if ASR_PROMPT:
-        kw["initial_prompt"] = ASR_PROMPT
+    if use_vad:
+        kw["vad_parameters"] = {
+            "threshold": 0.42,
+            "min_silence_duration_ms": 350,
+            "speech_pad_ms": 220,
+        }
+    prompt = ASR_PROMPTS.get(language or "", ASR_PROMPT)
+    if prompt:
+        kw["initial_prompt"] = prompt
     segments, info = whisper_model.transcribe(audio, **kw)
     segs = list(segments)
+    kept = []
+    for s in segs:
+        tx = (s.text or "").strip()
+        if not tx:
+            continue
+        if _looks_like_credits(tx):
+            log(f"ASR drop segment: {tx!r}")
+            _note_hallucination(tx)
+            continue
+        kept.append(s)
+    segs = kept
     text = " ".join(s.text.strip() for s in segs if s.text).strip()
-    if ASR_PROMPT:
-        leak = ASR_PROMPT.split(".")[0].strip()
+    if prompt:
+        leak = prompt.split(".")[0].strip()
         if leak and text.lower().startswith(leak.lower()):
             text = text[len(leak) :].lstrip(" .,;:—-")
-    lang = (getattr(info, "language", None) or (language or "uk")).lower()[:2]
+    lang = (getattr(info, "language", None) or (language or "ru")).lower()[:2]
     lang_p = float(getattr(info, "language_probability", 0.0) or 0.0)
     lps = [float(s.avg_logprob) for s in segs if getattr(s, "avg_logprob", None) is not None]
     nss = [float(s.no_speech_prob) for s in segs if getattr(s, "no_speech_prob", None) is not None]
@@ -1161,26 +1446,62 @@ def _whisper_once(audio, language: str | None) -> tuple[str, str, float, float, 
     return text, lang, lang_p, avg_lp, no_speech
 
 
+def _asr_pass(audio, language: str, *, use_vad: bool, rms: float):
+    text, lang, lang_p, avg_lp, no_speech = _whisper_once(
+        audio, language, use_vad=use_vad
+    )
+    text = _fix_asr(text)
+    text = _scrub_hallucination(text)
+    if not text or _looks_like_credits(text) or _THANKS_ONLY_RE.match(text):
+        if text:
+            _note_hallucination(text)
+            log(f"ASR drop hallucination: {text!r}")
+        return "", language, lang_p, avg_lp, no_speech, False
+    ok = _asr_ok(text, avg_lp, no_speech, rms)
+    if not ok and _is_hallucination(text, avg_lp, rms):
+        _note_hallucination(text)
+    return text, language, lang_p, avg_lp, no_speech, ok
+
+
 def transcribe(pcm16: bytes) -> tuple[str, str, float, bool]:
     if not pcm16 or len(pcm16) < IN_RATE:
-        return "", "uk", 0.0, False
+        return "", "ru", 0.0, False
     rms = _pcm_rms(pcm16)
     if rms < ASR_MIN_RMS:
         log(f"ASR drop rms={rms:.0f} (тиша)")
-        return "", "uk", 0.0, False
-    audio = np.frombuffer(pcm16, dtype=np.int16).astype(np.float32) / 32768.0
-    # Автомова часто ставить en на «Бендер привіт» і з'їдає «привіт».
-    text, lang, lang_p, avg_lp, no_speech = _whisper_once(audio, "uk")
-    lang = "uk"
-    text = _fix_asr(text)
-    if _YT_OUTRO_RE.search(text or ""):
-        log(f"ASR drop hallucination: {text!r}")
-        return "", "uk", 0.0, False
-    ok = _asr_ok(text, avg_lp, no_speech, rms)
-    log(
-        f"ASR lang={lang} lang_p={lang_p:.2f} q={avg_lp:.2f} "
-        f"ns={no_speech:.2f} rms={rms:.0f} ok={ok}"
-    )
+        return "", "ru", 0.0, False
+    audio = _pcm_for_whisper(pcm16)
+    global _last_whisper_pcm
+    _last_whisper_pcm = np.clip(np.round(audio * 32767.0), -32767, 32767).astype(np.int16).tobytes()
+    raw = np.frombuffer(pcm16, dtype=np.int16).astype(np.float32) / 32768.0
+    best = None
+    for lang_try in ASR_LANGS:
+        try:
+            got = _asr_pass(audio, lang_try, use_vad=True, rms=rms)
+        except Exception as e:
+            log(f"ASR VAD fail ({lang_try}), retry raw: {e}")
+            got = _asr_pass(raw, lang_try, use_vad=False, rms=rms)
+        text, lang, lang_p, avg_lp, no_speech, ok = got
+        log(
+            f"ASR lang={lang} lang_p={lang_p:.2f} q={avg_lp:.2f} "
+            f"ns={no_speech:.2f} rms={rms:.0f} ok={ok}"
+        )
+        cand = (ok, avg_lp, text, lang, lang_p)
+        if best is None or cand[:2] > best[:2]:
+            best = cand
+        if ok:
+            break
+        # Порожньо (тиша/титри) — другий язик лише тримає GPU і зриває колонку.
+        if not text:
+            break
+    if best is None:
+        return "", "ru", 0.0, False
+    ok, _avg_lp, text, lang, lang_p = best
+    if not text or _looks_like_credits(text):
+        if text:
+            _note_hallucination(text)
+            log(f"ASR drop hallucination: {text!r}")
+        return "", lang, 0.0, False
     return text, lang, lang_p, ok
 
 
@@ -1209,7 +1530,21 @@ _CANNED_RE = re.compile(
     r"найкращий робот у всьому|"
     r"йди нахуй,\s*м['’ʼ]ясн|"
     r"дякую за перегляд|"
-    r"thanks for watching"
+    r"thanks for watching|"
+    r"\bсам собі\b|"
+    r"сам,?\s*бо я не твій|"
+    r"бо я не твій\b|"
+    r"лайков\w*|"
+    r"коробц[іеи]\s+передач|"
+    r"порожн[іиі]\s+банк|"
+    r"гайков(ий|ого)\s+ключ|"
+    r"нелегальн\w*\s+алкогол|"
+    r"холодильник[аеу]?\s+з|"
+    r"сейф[ауе]?\s+з|"
+    r"обернути цей (шум|звук)|"
+    r"деренчить у моїй|"
+    r"гупає в моїй|"
+    r"заскрипіло в моїй"
     r")"
 )
 _LOOP_SENT_RE = re.compile(
@@ -1217,12 +1552,17 @@ _LOOP_SENT_RE = re.compile(
     r"пиздець[- ]цьому|"
     r"найкращий робот у всьому|"
     r"^йди нахуй,\s*м['’ʼ]ясн|"
-    r"бля\s*\?!?\s*$"
+    r"бля\s*\?!?\s*$|"
+    r"коробц[іеи]\s+передач|"
+    r"нелегальн\w*\s+алкогол|"
+    r"порожн[іиі]\s+банк|"
+    r"деренчить у моїй"
     r")"
 )
 _SIM_STOP = {
     "я", "ти", "це", "не", "в", "у", "на", "та", "і", "й", "а", "що",
     "бля", "сука", "нахуй", "пиздець", "крихітко", "твій", "твоя", "мене",
+    "уже", "вже", "наче", "зараз", "цей", "для", "або",
 }
 
 _STORY_FALLBACKS = (
@@ -1230,13 +1570,24 @@ _STORY_FALLBACKS = (
     "Окей. Записався у згинальники, щоб не працювати. Мене змусили гнути балки дванадцять годин. Я зігнув начальника. Найкращий день у кар'єрі, крихітко.",
     "Коротко. Фрай заховав мій останній кухоль. Я розібрав кухню, знайшов його в духовці і випив там. Професор кричав. Мені було байдуже.",
 )
+_GREET_FALLBACKS = (
+    "О, м'ясний мішок. Я якраз відкривав пиво, а не твою пасть.",
+    "Привіт. Якщо це знову поклон перед найкращим роботом — так, я слухаю.",
+    "Ага, чую. Кажи справу, поки пиво не скіпіло.",
+)
+_MISS_FALLBACKS = (
+    "Не розчув. Повтори коротше.",
+    "Нічого не зрозумів. Кажи ще раз, гучніше.",
+    "Шум якийсь. Повтори, м'ясний мішок.",
+)
 
 _LLM_RETRY_NUDGE = (
-    "Стоп. Це ти вже казав. Заборонено: ехо питання, "
-    "«найкращий робот у всьому пиздець-цьому Всесвіті», "
-    "«йди нахуй, м'ясний мішок». "
-    "Дай ІНШУ відповідь на те саме питання користувача, по суті. "
-    "Якщо математика — число в першому реченні."
+    _NUDGE_PREFIX + " "
+    "Це заїжджений шаблон, не Бендер. "
+    "Заборонено: ехо їхніх слів, «сам собі», «бо я не твій», «лайковий», "
+    "коробка передач, порожні банки, гайковий ключ, нелегальний алкоголь, "
+    "та сама будова що минулого разу. "
+    "Вигадай ІНШУ репліку: новий жарт, інший початок, по суті того що сказали."
 )
 
 
@@ -1265,9 +1616,56 @@ def _too_like_last(parts: list[str], last: str) -> bool:
     return len(a & b) / len(a | b) >= 0.42
 
 
+def _reply_head(text: str) -> tuple[str, ...]:
+    t = (text or "").lower()
+    t = re.sub(r"[^\wіїєґ']+", " ", t)
+    words = [w for w in t.split() if w not in _SIM_STOP]
+    return tuple(words[:3])
+
+
+def _same_frame(parts: list[str], last: str) -> bool:
+    a = _reply_head(" ".join(parts))
+    b = _reply_head(last)
+    return len(a) >= 3 and a == b
+
+
+def _too_like_any(parts: list[str], prev: list[str]) -> bool:
+    for old in prev:
+        if _too_like_last(parts, old) or _same_frame(parts, old):
+            return True
+    return False
+
+
+def _too_like_user(parts: list[str], user: str) -> bool:
+    a = _content_words(" ".join(parts))
+    b = _content_words(user)
+    if len(b) < 2 or len(a) < 3:
+        return False
+    hit = a & b
+    if len(hit) >= 2 and len(hit) / len(b) >= 0.55:
+        return True
+    blob = " ".join(parts).lower()
+    return bool(re.search(r"\bсам\b", blob) and hit)
+
+
 def _story_fallback(history: list) -> str:
     i = (len(history) // 2) % len(_STORY_FALLBACKS)
     return _STORY_FALLBACKS[i]
+
+
+_miss_n = 0
+
+
+def _greet_fallback(history: list) -> str:
+    i = (len(history) // 2) % len(_GREET_FALLBACKS)
+    return _GREET_FALLBACKS[i]
+
+
+def _miss_fallback() -> str:
+    global _miss_n
+    reply = _MISS_FALLBACKS[_miss_n % len(_MISS_FALLBACKS)]
+    _miss_n += 1
+    return reply
 
 
 def _llm_payload(
@@ -1282,15 +1680,15 @@ def _llm_payload(
         last_user = (history[-1].get("content") or "").strip()
     greet = _is_greet(last_user)
     story = _is_story(last_user)
-    n_temp = 0.55 + (BENDER_LEVEL - 5) * 0.05
-    n_temp = max(0.35, min(0.95, n_temp))
+    n_temp = 0.62 + (BENDER_LEVEL - 5) * 0.06
+    n_temp = max(0.45, min(0.98, n_temp))
     if greet and not story and len(last_user.split()) <= 4:
-        n_pred = 80
+        n_pred = 90
     elif story:
-        n_pred = 180
-        n_temp = max(n_temp, 0.7)
+        n_pred = 200
+        n_temp = max(n_temp, 0.78)
     else:
-        n_pred = 120
+        n_pred = 140
     # Системний промпт однаковий щоразу на тому ж рівні — інакше Grok не кешує.
     messages: list[dict] = [{"role": "system", "content": bender_prompt()}]
     if LLM_PROVIDER == "grok":
@@ -1480,7 +1878,7 @@ async def _grok_pieces(history: list[dict], n_pred: int, n_temp: float):
         "stream": True,
         "store": True,
         "temperature": n_temp,
-        "top_p": 0.92,
+        "top_p": 0.95,
         "max_output_tokens": int(n_pred),
         "prompt_cache_key": CHAT_CONV_ID or "bender-radio",
     }
@@ -1610,28 +2008,18 @@ def warm_ollama() -> None:
 
 
 def _clause_units(text: str) -> list[str]:
-    parts = [p.strip() for p in re.split(r"(?<=[,;.!?…])\s+", text.strip()) if p.strip()]
+    """Коми лишаємо Piper. Ріжемо лише речення, і то якщо текст довгий або є «?» всередині."""
+    t = (text or "").strip()
+    if not t:
+        return []
+    parts = [p.strip() for p in re.split(r"(?<=[.!?…])\s+", t) if p.strip()]
     if len(parts) <= 1:
         return parts
-    out: list[str] = []
-    buf: list[str] = []
-
-    def n_letters(s: str) -> int:
-        return len(re.findall(r"[A-Za-zА-Яа-яІіЇїЄєҐґ]", s))
-
-    def flush() -> None:
-        if buf:
-            out.append(" ".join(buf))
-            buf.clear()
-
-    for p in parts:
-        if n_letters(p) <= 4:
-            buf.append(p)
-        else:
-            flush()
-            out.append(p)
-    flush()
-    return out or parts
+    letters = len(re.findall(r"[A-Za-zА-Яа-яІіЇїЄєҐґ]", t))
+    mid_q = any(_is_question(p) for p in parts[:-1])
+    if letters <= 220 and not mid_q:
+        return [t]
+    return parts
 
 
 def _is_question(text: str) -> bool:
@@ -1773,8 +2161,8 @@ def synth(text: str) -> bytes:
     return _trim_pcm_silence(out, OUT_RATE)
 
 
-def _trim_pcm_silence(pcm: bytes, sr: int, abs_thr: int = 500, pad_ms: int = 25) -> bytes:
-    """Прибрати тишу Piper/RVC на старті — інакше рот чекає, а з колонки вже щось чути."""
+def _trim_pcm_silence(pcm: bytes, sr: int, abs_thr: int = 200, pad_ms: int = 120) -> bytes:
+    """Обрізати довгий хвіст Piper/RVC, але лишити запас на старті/кінці (інакше з’їдає фонеми)."""
     if not pcm or len(pcm) < 4:
         return pcm
     x = np.frombuffer(pcm, dtype=np.int16)
@@ -1785,21 +2173,51 @@ def _trim_pcm_silence(pcm: bytes, sr: int, abs_thr: int = 500, pad_ms: int = 25)
     pad = int(sr * pad_ms / 1000)
     start = max(0, int(hit[0]) - pad)
     end = min(int(x.size), int(hit[-1]) + pad + 1)
-    if start <= 0 and end >= int(x.size):
-        return pcm
+    y = x[start:end]
+    # Mute/I2S після фіксу зависання з’їдав ~30–80 мс — «Знову» ставало «Зову».
+    lead = np.zeros(int(sr * 0.22), dtype=np.int16)
+    tail = np.zeros(int(sr * 0.06), dtype=np.int16)
     log(f"TTS trim silence {start}..{end} / {int(x.size)} samples")
-    return x[start:end].tobytes()
+    return np.concatenate([lead, y, tail]).tobytes()
+
+
+def _mic_debug_pcm(pcm: bytes) -> bytes:
+    """Те саме аудіо, що вже порахували для Whisper (без повторного enhance)."""
+    body = _last_whisper_pcm
+    if not body and pcm and len(pcm) >= 4:
+        y = _pcm_for_whisper(pcm)
+        body = np.clip(np.round(y * 32767.0), -32767, 32767).astype(np.int16).tobytes()
+    if not body:
+        return b""
+    x = np.frombuffer(body, dtype=np.int16)
+    if x.size == 0 or int(np.max(np.abs(x))) < 80:
+        return b""
+    gap = np.zeros(int(OUT_RATE * 0.12), dtype=np.int16)
+    return np.concatenate([gap, x]).tobytes()
+
+
+async def send_asr_debug_replay(ws, pcm_in: bytes) -> None:
+    replay = _mic_debug_pcm(pcm_in)
+    if not replay:
+        log("ASR debug replay skip (порожньо)")
+        return
+    log(f"ASR debug replay {len(replay)} bytes (as Whisper, cached)")
+    await send_pcm_deltas(ws, replay)
 
 
 async def send_pcm_deltas(ws, pcm: bytes) -> None:
-    step = 2400 * 2  # 100 ms @ 24 kHz — коротші пакети, щоб ESP встигав малювати рот
+    step = 2400 * 2  # 100 ms @ 24 kHz
     if not pcm:
         return
+    burst = 5  # ~500 мс одразу в кільце ESP — менше заїкань
+    n = 0
     for i in range(0, len(pcm), step):
         piece = pcm[i : i + step]
         b64 = base64.b64encode(piece).decode("ascii")
         await ws.send(dumps({"type": "response.output_audio.delta", "delta": b64}))
-        await asyncio.sleep(0)
+        n += 1
+        if n > burst:
+            await asyncio.sleep(0.055)
 
 
 async def send_audio(ws, pcm: bytes, *, emit_created: bool = True) -> None:
@@ -1835,70 +2253,107 @@ async def run_turn(ws, pcm_in: bytes, prompt: str, history: list) -> None:
         log(f"ASR: {text!r}")
         if not text or not asr_ok:
             log("ASR drop (тиша або сміття) — без LLM, історію не псуємо")
-            reply = "Не розчув. Повтори коротше, м'ясний мішок."
+            reply = _miss_fallback()
+            log(f"ASR miss → {reply!r}")
             pcm_out = await asyncio.to_thread(synth, reply)
             await send_pcm_deltas(ws, pcm_out)
         else:
             history.append({"role": "user", "content": text})
-            reply_lang = _reply_lang(text, lang)
-            log(f"LLM {LLM_PROVIDER} (reply_lang={reply_lang})")
-            n = 0
-            parts: list[str] = []
-            max_sents = LLM_STORY_SENTS if _is_story(text) else LLM_MAX_SENTS
-
-            async def _collect(extra: list[dict] | None = None) -> list[str]:
-                out: list[str] = []
-                hist = history if not extra else (list(history) + extra)
-                async for sent in iter_llm_sentences(
-                    bender_prompt(), reply_lang, asr_p, hist
-                ):
-                    out.append(sent)
-                    log(f"LLM: {sent!r}")
-                    if len(out) >= max_sents:
-                        break
-                return out
-
-            parts = await _collect()
-            last_asst = ""
-            for m in reversed(history[:-1]):
-                if m.get("role") == "assistant":
-                    last_asst = m.get("content") or ""
-                    break
-            parts = _strip_loop_sents(parts) or parts
-            looped = _is_canned(parts) or _too_like_last(parts, last_asst)
-            if looped or not _strip_loop_sents(parts):
-                bad = _join_reply(parts)
-                log("LLM canned/repeat — retry")
-                parts = await _collect([
-                    {
-                        "role": "user",
-                        "content": _LLM_RETRY_NUDGE + "\nБуло:\n" + bad[:400],
-                    },
-                ])
-                stripped = _strip_loop_sents(parts)
-                if stripped:
-                    parts = stripped
-                elif _is_canned(parts) and _is_story(text):
-                    parts = [_story_fallback(history)]
-                    log(f"LLM canned again — fallback: {parts[0]!r}")
-                else:
-                    parts = ["Платівка заїла. Повтори коротше, без шаблону."]
-                    log("LLM canned again — drop loop")
-            n = len(parts)
-            if n == 0:
-                pcm_out = await asyncio.to_thread(synth, "Не розчув. Повтори.")
+            cmd = voice_commands.match(text, DEVICE_STATIONS or None)
+            if cmd:
+                reply = cmd.reply(len(history))
+                log(f"CMD {cmd.name or 'talk'} {cmd.args} → {reply!r}")
+                pcm_out = await asyncio.to_thread(synth, reply)
                 await send_pcm_deltas(ws, pcm_out)
+                history.append({"role": "assistant", "content": reply})
+                if cmd.name:
+                    await ws.send(dumps({
+                        "type": "device.command",
+                        "name": cmd.name,
+                        "args": cmd.args,
+                    }))
+                fold_old_turns(history)
+                save_chat(history)
             else:
-                if rvc_convert.enabled():
-                    pcm_out = await asyncio.to_thread(synth, _join_reply(parts))
+                reply_lang = _reply_lang(text, lang)
+                log(f"LLM {LLM_PROVIDER} (reply_lang={reply_lang})")
+                n = 0
+                parts: list[str] = []
+                max_sents = LLM_STORY_SENTS if _is_story(text) else LLM_MAX_SENTS
+
+                async def _collect(extra: list[dict] | None = None) -> list[str]:
+                    out: list[str] = []
+                    hist = history if not extra else (list(history) + extra)
+                    async for sent in iter_llm_sentences(
+                        bender_prompt(), reply_lang, asr_p, hist
+                    ):
+                        out.append(sent)
+                        log(f"LLM: {sent!r}")
+                        if len(out) >= max_sents:
+                            break
+                    return out
+
+                parts = await _collect()
+                last_assts: list[str] = []
+                for m in reversed(history[:-1]):
+                    if m.get("role") == "assistant":
+                        last_assts.append(m.get("content") or "")
+                        if len(last_assts) >= 3:
+                            break
+                parts = _strip_loop_sents(parts) or parts
+                looped = (
+                    _is_canned(parts)
+                    or _too_like_any(parts, last_assts)
+                    or _too_like_user(parts, text)
+                )
+                if looped or not _strip_loop_sents(parts):
+                    bad = _join_reply(parts)
+                    log("LLM canned/repeat — retry")
+                    grok_break_chain("canned/repeat")
+                    parts = await _collect([
+                        {
+                            "role": "user",
+                            "content": _LLM_RETRY_NUDGE + "\nБуло:\n" + bad[:400],
+                        },
+                    ])
+                    stripped = _strip_loop_sents(parts)
+                    still = (
+                        _is_canned(parts)
+                        or _too_like_last(parts, bad)
+                        or _too_like_any(parts, last_assts)
+                        or _too_like_user(parts, text)
+                    )
+                    if stripped and not still:
+                        parts = stripped
+                    elif _is_story(text):
+                        grok_break_chain("canned again")
+                        parts = [_story_fallback(history)]
+                        log(f"LLM canned again — fallback: {parts[0]!r}")
+                    elif _is_greet(text):
+                        grok_break_chain("canned again")
+                        parts = [_greet_fallback(history)]
+                        log(f"LLM canned again — greet fallback: {parts[0]!r}")
+                    else:
+                        grok_break_chain("canned again")
+                        parts = ["Платівка заїла. Повтори коротше, без шаблону."]
+                        log("LLM canned again — drop loop")
+                n = len(parts)
+                if n == 0:
+                    pcm_out = await asyncio.to_thread(synth, "Не розчув. Повтори.")
                     await send_pcm_deltas(ws, pcm_out)
                 else:
-                    for sent in parts:
-                        pcm_out = await asyncio.to_thread(synth, sent)
+                    if rvc_convert.enabled():
+                        pcm_out = await asyncio.to_thread(synth, _join_reply(parts))
                         await send_pcm_deltas(ws, pcm_out)
-                history.append({"role": "assistant", "content": _join_reply(parts)})
-            fold_old_turns(history)
-            save_chat(history)
+                    else:
+                        for sent in parts:
+                            pcm_out = await asyncio.to_thread(synth, sent)
+                            await send_pcm_deltas(ws, pcm_out)
+                    history.append({"role": "assistant", "content": _join_reply(parts)})
+                fold_old_turns(history)
+                save_chat(history)
+        if text and asr_ok and not voice_commands.match(text, DEVICE_STATIONS or None):
+            await send_asr_debug_replay(ws, pcm_in)
         await ws.send(dumps({"type": "response.output_audio.done"}))
         await ws.send(dumps({"type": "response.done"}))
     except Exception as e:
@@ -1965,6 +2420,25 @@ async def handle(ws) -> None:
                 raw_lv = ev.get("bender_level", sess.get("bender_level"))
                 if raw_lv is not None:
                     log(f"BENDER_LEVEL {BENDER_LEVEL} → {set_bender_level(raw_lv)}")
+                raw_st = sess.get("stations") or ev.get("stations")
+                if isinstance(raw_st, list):
+                    DEVICE_STATIONS.clear()
+                    for item in raw_st:
+                        if isinstance(item, dict) and item.get("id") is not None:
+                            DEVICE_STATIONS.append({
+                                "id": int(item.get("id") or 0),
+                                "name": str(item.get("name") or ""),
+                                "aliases": tuple(item.get("aliases") or ()),
+                            })
+                        elif isinstance(item, str) and item.strip():
+                            DEVICE_STATIONS.append({
+                                "id": len(DEVICE_STATIONS),
+                                "name": item.strip(),
+                            })
+                    if DEVICE_STATIONS:
+                        log("device stations: " + ", ".join(
+                            f"{s['id']}:{s['name']}" for s in DEVICE_STATIONS
+                        ))
                 await ws.send(dumps({"type": "conversation.created"}))
                 await ws.send(dumps({"type": "session.updated"}))
             elif t == "input_audio_buffer.append":

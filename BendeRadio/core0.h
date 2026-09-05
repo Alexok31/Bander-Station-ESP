@@ -40,6 +40,13 @@ void matrix_get_brightness_trim(int8_t* outTrim, uint8_t count);
 void matrix_set_brightness_trim(const int8_t* trim, uint8_t count, bool persist);
 uint8_t matrix_get_base_brightness();
 
+uint8_t radio_station_count();
+const char* radio_station_name(uint8_t idx);
+// Голосова команда з ПК: лише radioState (I2S ще може бути в Бендера).
+void radio_voice_set_state(bool on, int station /* -1 = не міняти */);
+// Після віддачі I2S радіо: BT play/pause, морда, гучність.
+void radio_voice_after_speaker();
+
 // Источник звука: "wifi" (интернет-радио / PCM5100) или "bt" (BK8000L через CD4052). NVS "bende"/"aud".
 extern char g_audio_source[8];
 // enum + CD4052: AudioMux.h

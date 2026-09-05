@@ -94,20 +94,23 @@ constexpr uint32_t RATE = 24000;
 constexpr size_t CHUNK = 240;
 constexpr size_t CHUNK_BYTES = CHUNK * 2;
 constexpr size_t RING_BYTES = 512 * 1024;
-constexpr uint16_t PREBUF_N = 400;
+constexpr uint16_t PREBUF_N = 1700;
 constexpr uint16_t PRE_IDLE_N = 80;
 constexpr size_t PREBUF_BYTES = (size_t)PREBUF_N * CHUNK_BYTES;
 constexpr size_t PCM_DECODE_BYTES = 192 * 1024;
-constexpr uint8_t MIC_SHIFT = 15;
-constexpr int MIC_GAIN = 2;
+constexpr uint8_t MIC_SHIFT = RadioConfig::micPcmShiftRight;
+constexpr int MIC_GAIN = RadioConfig::micDigitalGain;
 constexpr int MIC_PEAK_MIN = 500;
 constexpr uint32_t PTT_MIN_MS = 200;
 constexpr uint32_t MAX_RECORD_MS = 15000;
 constexpr uint8_t MIC_EMA_ALPHA = 72;
+// 10 мс/чанк. Натискання — коротко (інакше з'їдає перші літери). Відпускання — довший хвіст.
+// Після idle-преролу: клац натискання (~80 мс). Хвіст — коротко, користувач чує старт.
+constexpr uint8_t PTT_DROP_HEAD = 8;
+constexpr uint8_t PTT_DROP_TAIL = 4;
 
 enum : uint8_t { ST_IDLE = 0, ST_RECORDING, ST_WAIT_RESP };
 
-static I2SClass i2sSpk;
 static I2SClass i2sMic;
 static websockets::WebsocketsClient wsClient;
 
@@ -140,15 +143,26 @@ static volatile bool serverCommitted = false;
 static volatile bool commitWhenReady = false;
 static uint16_t preHead = 0;
 static uint16_t preN = 0;
+static volatile uint16_t s_preN_at_arm = 0;
+static char s_voice_cmd[24] = {0};
+static volatile int s_voice_station = -1;
+static volatile bool s_voice_pending = false;
 static bool g_mic32bit = true;
 static int32_t micSmoothPk = 0;
 
 static volatile bool s_owns_spk = false;
-static bool s_spk_begun = false;
+static volatile bool s_taking = false;
 static bool s_spk_stereo = true;
+static uint16_t s_take_n = 0;
 static volatile bool s_resume_radio = false;
 static volatile bool s_giveback = false;
+static volatile bool s_need_speaker = false;
 static volatile bool s_started = false;
+static volatile uint8_t s_demo = 0;
+static uint8_t* s_demo_pcm = nullptr;
+static size_t s_demo_cap = 0;
+static volatile uint32_t s_progress_ms = 0;
+static volatile uint32_t s_last_pcm_ms = 0;
 
 static size_t rbFree() {
     return (tail - head - 1 + RING_BYTES) % RING_BYTES;
@@ -191,9 +205,10 @@ static void i2sWriteAll(const uint8_t* p, size_t n) {
     size_t off = 0;
     uint8_t spins = 0;
     while (off < n) {
-        size_t w = i2sSpk.write(p + off, n - off);
+        // Пишемо в канал Audio, без I2SClass begin/end — той після 3–4 фраз вбиває I2S0.
+        size_t w = audio.i2sWriteRaw(p + off, n - off, 80);
         if (!w) {
-            if (++spins > 50) {
+            if (++spins > 80) {
                 break;
             }
             delay(1);
@@ -222,6 +237,14 @@ static void i2sOutMono(const uint8_t* buf, size_t n) {
         st[2 * i + 1] = m[i];
     }
     i2sWriteAll(stereo, outn);
+}
+
+static void i2sWriteSilenceChunks(uint8_t n) {
+    static uint8_t stereo[CHUNK_BYTES * 2];
+    memset(stereo, 0, sizeof(stereo));
+    for (uint8_t i = 0; i < n; i++) {
+        i2sWriteAll(stereo, sizeof(stereo));
+    }
 }
 
 static void spkWrite(uint8_t* buf, size_t n, bool from_pcm) {
@@ -258,68 +281,127 @@ static bool takeSpeaker() {
     if (s_owns_spk) {
         return true;
     }
+    s_taking = true;
+    s_need_speaker = false;
+    delay(8);
     if (strcmp(g_audio_source, "wifi") == 0) {
         audio.setVolume(0);
         if (audio.isRunning()) {
             audio.stopSong();
         }
-        delay(50);
+        delay(20);
     }
     free_uart0_from_i2s_pins();
-    audio.releaseI2SChannel();
-    delay(20);
-    if (s_spk_begun) {
-        i2sSpk.end();
-        s_spk_begun = false;
-    }
-    if (!i2sSpk.setPort(I2S_NUM_0)) {
-        ALOGLN(F("[AI] I2S0 setPort fail"));
-        audio_hw_init(false);
+    if (!audio.i2sSetSampleRateHz(RATE)) {
+        ALOGLN(F("[AI] I2S0 rate 24k fail"));
+        s_taking = false;
         return false;
     }
-    i2sSpk.setPins(RadioConfig::i2sBclk, RadioConfig::i2sLrc, RadioConfig::i2sDout);
-    bool ok = i2sSpk.begin(I2S_MODE_STD, RATE, (i2s_data_bit_width_t)16, I2S_SLOT_MODE_STEREO,
-                           I2S_STD_SLOT_BOTH);
-    s_spk_stereo = ok;
-    if (!ok) {
-        ok = i2sSpk.begin(I2S_MODE_STD, RATE, (i2s_data_bit_width_t)16, I2S_SLOT_MODE_MONO,
-                          I2S_STD_SLOT_LEFT);
-        s_spk_stereo = false;
-    }
-    if (!ok) {
-        ALOGLN(F("[AI] I2S0 begin fail"));
-        audio_hw_init(false);
-        return false;
-    }
-    i2sSpk.setTimeout(1000);
-    s_owns_spk = true;
-    s_spk_begun = true;
+    s_spk_stereo = true;
     ampMuteHw(true);
-    ALOG("[AI] I2S0 PCM 24k %s\n", s_spk_stereo ? "stereo" : "mono");
+    s_owns_spk = true;
+    s_taking = false;
+    s_take_n++;
+    ALOG("[AI] I2S0 PCM 24k Audio n=%u heap=%u\n", (unsigned)s_take_n, (unsigned)ESP.getFreeHeap());
     return true;
 }
 
 static void releaseSpeakerFromLoop() {
-    if (!s_owns_spk) {
+    if (!s_owns_spk && !s_taking) {
         return;
     }
     ampMuteHw(true);
-    if (s_spk_begun) {
-        i2sSpk.end();
-        s_spk_begun = false;
-    }
+    i2sWriteSilenceChunks(12);
     s_owns_spk = false;
-    audio_hw_init(false);
+    s_taking = false;
+    s_need_speaker = false;
+    if (!audio.i2sSetSampleRateHz(44100)) {
+        ALOGLN(F("[AI] I2S0 rate 44k fail"));
+    }
     apply_output_volume();
-    if (s_resume_radio && radioState.state && strcmp(g_audio_source, "wifi") == 0) {
+    if (radioState.state && strcmp(g_audio_source, "wifi") == 0) {
         reconnect = station_url_for_current();
     }
     s_resume_radio = false;
-    ALOGLN(F("[AI] I2S0 back to radio"));
+    ALOG("[AI] I2S0 back to radio n=%u heap=%u\n", (unsigned)s_take_n, (unsigned)ESP.getFreeHeap());
 }
 
 static void requestGiveback() {
     s_giveback = true;
+}
+
+static void noteProgress() {
+    s_progress_ms = millis();
+}
+
+static uint32_t s_sock_wait_ms;
+
+static void forceRecover(const char* why) {
+    ALOG("[AI] recover %s heap=%u\n", why ? why : "?", (unsigned)ESP.getFreeHeap());
+    waitingACK = false;
+    responsePending = false;
+    sessionArmed = false;
+    respPlaybackPending = false;
+    convState = ST_IDLE;
+    stateSinceMs = 0;
+    s_sock_wait_ms = 0;
+    s_need_commit = false;
+    speaking = false;
+    s_tts_out_ms = 0;
+    s_last_pcm_ms = 0;
+    portENTER_CRITICAL(&mux);
+    head = tail = 0;
+    portEXIT_CRITICAL(&mux);
+    requestGiveback();
+}
+
+static void queueVoiceCmd(const char* name, int station) {
+    if (!name || !name[0]) {
+        return;
+    }
+    strncpy(s_voice_cmd, name, sizeof(s_voice_cmd) - 1);
+    s_voice_cmd[sizeof(s_voice_cmd) - 1] = 0;
+    s_voice_station = station;
+    s_voice_pending = true;
+    ALOG("[AI] cmd %s station=%d\n", s_voice_cmd, station);
+}
+
+static bool applyVoiceCmdState() {
+    if (!s_voice_pending) {
+        return false;
+    }
+    s_voice_pending = false;
+    const char* n = s_voice_cmd;
+    const int st = s_voice_station;
+    if (!strcmp(n, "radio.off")) {
+        radio_voice_set_state(false, -1);
+    } else if (!strcmp(n, "radio.on")) {
+        radio_voice_set_state(true, st);
+    } else if (!strcmp(n, "radio.station")) {
+        radio_voice_set_state(true, st);
+    } else if (!strcmp(n, "radio.next")) {
+        int i = (int)radioState.station + 1;
+        const int nst = (int)radio_station_count();
+        if (nst > 0 && i >= nst) {
+            i = 0;
+        }
+        radio_voice_set_state(true, i);
+    } else if (!strcmp(n, "radio.prev")) {
+        int i = (int)radioState.station - 1;
+        const int nst = (int)radio_station_count();
+        if (i < 0) {
+            i = nst > 0 ? nst - 1 : 0;
+        }
+        radio_voice_set_state(true, i);
+    } else {
+        ALOG("[AI] cmd unknown %s\n", n);
+        s_voice_cmd[0] = 0;
+        s_voice_station = -1;
+        return false;
+    }
+    s_voice_cmd[0] = 0;
+    s_voice_station = -1;
+    return true;
 }
 
 static void micResetSmooth() {
@@ -337,6 +419,7 @@ static void resetTxState() {
     respPlaybackPending = false;
     convState = ST_IDLE;
     stateSinceMs = 0;
+    s_sock_wait_ms = 0;
     recMs = 0;
     recPeak = 0;
     recClip = 0;
@@ -345,6 +428,7 @@ static void resetTxState() {
     commitWhenReady = false;
     preN = 0;
     preHead = 0;
+    s_preN_at_arm = 0;
     micResetSmooth();
 }
 
@@ -448,11 +532,17 @@ static void wsSend(const JsonDocument& j) {
     wsClient.send(s);
 }
 
-static void sendMicAppend(const uint8_t* pcm) {
-    static char b64[(((CHUNK_BYTES + 2) / 3) * 4) + 4];
+constexpr size_t APPEND_CHUNKS = 10;
+constexpr size_t APPEND_BYTES = APPEND_CHUNKS * CHUNK_BYTES;
+
+static void sendMicAppendBytes(const uint8_t* pcm, size_t nbytes) {
+    if (!pcm || !nbytes) {
+        return;
+    }
+    static char b64[(((APPEND_BYTES + 2) / 3) * 4) + 8];
     static char json[80 + sizeof(b64)];
     size_t out = 0;
-    if (mbedtls_base64_encode((unsigned char*)b64, sizeof(b64), &out, pcm, CHUNK_BYTES) != 0) {
+    if (mbedtls_base64_encode((unsigned char*)b64, sizeof(b64), &out, pcm, nbytes) != 0) {
         return;
     }
     b64[out] = 0;
@@ -488,13 +578,19 @@ static void drainPrebufToWs(uint8_t max_n) {
     if (!sessionReady || !prebuf || !preN) {
         return;
     }
+    static uint8_t pack[APPEND_BYTES];
     uint8_t n = 0;
     while (preN && n < max_n) {
-        const uint16_t idx = preHead % PREBUF_N;
-        sendMicAppend(prebuf + (size_t)idx * CHUNK_BYTES);
-        preHead = (preHead + 1) % PREBUF_N;
-        preN--;
-        n++;
+        uint8_t got = 0;
+        while (preN && got < APPEND_CHUNKS && n < max_n) {
+            const uint16_t idx = preHead % PREBUF_N;
+            memcpy(pack + (size_t)got * CHUNK_BYTES, prebuf + (size_t)idx * CHUNK_BYTES, CHUNK_BYTES);
+            preHead = (preHead + 1) % PREBUF_N;
+            preN--;
+            got++;
+            n++;
+        }
+        sendMicAppendBytes(pack, (size_t)got * CHUNK_BYTES);
     }
 }
 
@@ -516,6 +612,9 @@ static void tryPttCommit() {
     }
     if (!sessionReady) {
         commitWhenReady = true;
+        if (!s_sock_wait_ms) {
+            s_sock_wait_ms = millis();
+        }
         ALOGLN(F("[PTT] wait session"));
         return;
     }
@@ -524,6 +623,7 @@ static void tryPttCommit() {
     sessionArmed = false;
     pttHeld = false;
     stateSinceMs = millis();
+    noteProgress();
     if (serverCommitted && ok) {
         JsonDocument r;
         r["type"] = "response.create";
@@ -548,10 +648,11 @@ static void onSessionReadyConv() {
     if (convState != ST_RECORDING && !s_ptt_armed) {
         return;
     }
-    while (preN) {
-        drainPrebufToWs(16);
-    }
     if (!pttHeld || commitWhenReady) {
+        while (preN) {
+            drainPrebufToWs(40);
+            wsClient.poll();
+        }
         tryPttCommit();
     }
 }
@@ -568,12 +669,16 @@ static void pushPcmBytes(const uint8_t* pcm, size_t n) {
     if (!pcm || !n || !ring) {
         return;
     }
+    if (!s_owns_spk) {
+        s_need_speaker = true;
+    }
     static bool s_logged = false;
     if (!s_logged) {
         s_logged = true;
         ALOG("[AI] pcm in %u\n", (unsigned)n);
     }
     size_t idx = 0;
+    uint8_t waits = 0;
     while (idx < n) {
         portENTER_CRITICAL(&mux);
         size_t freeb = rbFree();
@@ -587,10 +692,16 @@ static void pushPcmBytes(const uint8_t* pcm, size_t n) {
         }
         portEXIT_CRITICAL(&mux);
         if (idx < n) {
+            if (++waits > 40) {
+                ALOGLN(F("[AI] ring full — drop pcm"));
+                break;
+            }
             vTaskDelay(1);
         }
     }
     speaking = true;
+    s_last_pcm_ms = millis();
+    noteProgress();
 }
 
 static void pushPcmB64(const char* b64, size_t b64len) {
@@ -632,9 +743,6 @@ static void onMessage(websockets::WebsocketsMessage m) {
     if (!payload) {
         return;
     }
-    if (convState == ST_WAIT_RESP) {
-        stateSinceMs = millis();
-    }
     if (strstr(payload, "input_audio_transcription")) {
         return;
     }
@@ -674,6 +782,13 @@ static void onMessage(websockets::WebsocketsMessage m) {
         JsonObject outFmt = audioo["output"]["format"].to<JsonObject>();
         outFmt["type"] = "audio/pcm";
         outFmt["rate"] = 24000;
+        JsonArray stArr = s["stations"].to<JsonArray>();
+        const uint8_t nst = radio_station_count();
+        for (uint8_t i = 0; i < nst; i++) {
+            JsonObject o = stArr.add<JsonObject>();
+            o["id"] = i;
+            o["name"] = radio_station_name(i);
+        }
         wsSend(u);
         ALOGLN(F("[WSS] session.update"));
     } else if (!strcmp(t, "session.updated") || !strcmp(t, "conversation.created")) {
@@ -684,6 +799,7 @@ static void onMessage(websockets::WebsocketsMessage m) {
         }
     } else if (!strcmp(t, "input_audio_buffer.committed")) {
         serverCommitted = true;
+        noteProgress();
         if (convState != ST_RECORDING) {
             waitingACK = false;
             JsonDocument r;
@@ -691,22 +807,32 @@ static void onMessage(websockets::WebsocketsMessage m) {
             wsSend(r);
         }
     } else if (!strcmp(t, "response.created")) {
-        speaking = true;
+        // Не тримати I2S тишею на весь STT/LLM — інакше радіо «мертве» до відповіді.
+        noteProgress();
         if (convState == ST_WAIT_RESP) {
             stateSinceMs = millis();
         }
     } else if (!strcmp(t, "response.output_audio.done") || !strcmp(t, "response.audio.done")) {
         speaking = false;
+        noteProgress();
     } else if (!strcmp(t, "response.done")) {
         speaking = false;
         waitingACK = false;
         responsePending = false;
         respPlaybackPending = true;
         convState = ST_IDLE;
+        noteProgress();
         ALOGLN(F("[PTT] response.done"));
+    } else if (!strcmp(t, "pong")) {
+        // keepalive під час STT/LLM — не подовжує wait-timeout
     } else if (!strcmp(t, "error")) {
         const char* msg = j["error"]["message"] | "";
         ALOG("[WSS] error: %s\n", msg);
+        forceRecover("ws error");
+    } else if (!strcmp(t, "device.command")) {
+        const char* name = j["name"] | "";
+        const int st = j["args"]["station"] | -1;
+        queueVoiceCmd(name, st);
     }
 }
 
@@ -717,14 +843,8 @@ static void onEvent(websockets::WebsocketsEvent e, String) {
     } else if (e == websockets::WebsocketsEvent::ConnectionClosed) {
         wsReady = false;
         sessionReady = false;
-        waitingACK = false;
-        responsePending = false;
-        speaking = false;
-        if (convState == ST_WAIT_RESP || convState == ST_RECORDING) {
-            convState = ST_IDLE;
-        }
         ALOGLN(F("[WSS] closed"));
-        requestGiveback();
+        forceRecover("ws closed");
     } else if (e == websockets::WebsocketsEvent::GotPing) {
         wsClient.pong();
     }
@@ -734,24 +854,37 @@ static void speakerTask(void*) {
     static uint8_t buf[CHUNK_BYTES];
     bool primed = false;
     uint32_t quietSince = 0;
+    uint8_t starve = 0;
     for (;;) {
-        if (!s_owns_spk) {
+        if (!s_owns_spk || s_taking) {
             primed = false;
             quietSince = 0;
             s_tts_out_ms = 0;
             vTaskDelay(10 / portTICK_PERIOD_MS);
             continue;
         }
+        if (s_demo == 1 || s_demo == 2 || convState == ST_RECORDING || pttHeld) {
+            // Як у mic demo: під час запису не писати в I2S і тримати mute.
+            // Інакше тиша/unmute дає тріск у колонку і він лізе в мікрофон.
+            primed = false;
+            quietSince = 0;
+            ampMuteHw(true);
+            vTaskDelay(5 / portTICK_PERIOD_MS);
+            continue;
+        }
         size_t avail = rbUsed();
         if (!primed) {
             const bool gotWholeReply = respPlaybackPending && avail >= CHUNK_BYTES;
-            if (avail < CHUNK_BYTES && !gotWholeReply) {
+            const size_t minStart = CHUNK_BYTES * 16;
+            if (avail < minStart && !gotWholeReply) {
+                ampMuteHw(true);
                 vTaskDelay(1);
                 continue;
             }
+            ampMuteHw(false);
+            i2sWriteSilenceChunks(16);
             primed = true;
             quietSince = 0;
-            ampMuteHw(false);
         }
         if (avail < CHUNK_BYTES) {
             if (avail >= 4) {
@@ -769,16 +902,28 @@ static void speakerTask(void*) {
                 continue;
             }
             if (speaking) {
-                spkWriteSilence();
-                continue;
+                if (s_last_pcm_ms && (millis() - s_last_pcm_ms > 800)) {
+                    speaking = false;
+                    starve = 0;
+                } else if (++starve < 10) {
+                    vTaskDelay(2 / portTICK_PERIOD_MS);
+                    continue;
+                } else {
+                    starve = 0;
+                    spkWriteSilence();
+                    continue;
+                }
             }
             if (!quietSince) {
                 quietSince = millis();
-            } else if (millis() - quietSince > 400) {
+            } else if (millis() - quietSince > 350) {
                 ampMuteHw(true);
                 quietSince = 0;
                 primed = false;
-                if (respPlaybackPending || convState == ST_IDLE) {
+                const bool still_wait = (convState == ST_WAIT_RESP) || responsePending || waitingACK;
+                const bool pcm_fresh = s_last_pcm_ms && (millis() - s_last_pcm_ms < 700);
+                if (!still_wait && !pcm_fresh &&
+                    (respPlaybackPending || convState == ST_IDLE)) {
                     respPlaybackPending = false;
                     requestGiveback();
                 }
@@ -787,6 +932,7 @@ static void speakerTask(void*) {
             continue;
         }
         quietSince = 0;
+        starve = 0;
         portENTER_CRITICAL(&mux);
         size_t first = minOf((size_t)CHUNK_BYTES, RING_BYTES - tail);
         memcpy(buf, ring + tail, first);
@@ -796,6 +942,7 @@ static void speakerTask(void*) {
         tail = (tail + CHUNK_BYTES) % RING_BYTES;
         portEXIT_CRITICAL(&mux);
         spkWrite(buf, CHUNK_BYTES, true);
+        vTaskDelay(0);
     }
 }
 
@@ -804,6 +951,45 @@ static void wsTask(void*) {
     uint32_t lastPing = millis();
     uint32_t backoff = 0;
     for (;;) {
+        if (s_demo == 1 && s_demo_pcm && s_demo_cap >= CHUNK_BYTES) {
+            ampMuteHw(true);
+            micDump();
+            size_t filled = 0;
+            int32_t pk = 0;
+            uint64_t acc = 0;
+            uint32_t ns = 0;
+            const uint32_t t0 = millis();
+            s_demo = 2;
+            ALOGLN(F("[MIC] demo REC 3s — говори"));
+            while (filled + CHUNK_BYTES <= s_demo_cap) {
+                int32_t chunkPk = 0;
+                if (!readMicChunk16(mic16, &chunkPk, false)) {
+                    vTaskDelay(1);
+                    continue;
+                }
+                memcpy(s_demo_pcm + filled, mic16, CHUNK_BYTES);
+                filled += CHUNK_BYTES;
+                if (chunkPk > pk) {
+                    pk = chunkPk;
+                }
+                const int16_t* s = (const int16_t*)mic16;
+                for (size_t i = 0; i < CHUNK; i++) {
+                    int32_t a = s[i] < 0 ? -s[i] : s[i];
+                    acc += (uint32_t)a;
+                    ns++;
+                }
+            }
+            const uint32_t rms = ns ? (uint32_t)(acc / ns) : 0;
+            ALOG("[MIC] demo peak=%d rms=%u ms=%u\n", (int)pk, (unsigned)rms, (unsigned)(millis() - t0));
+            pushPcmBytes(s_demo_pcm, filled);
+            speaking = false;
+            s_demo = 3;
+            ALOGLN(F("[MIC] demo PLAY"));
+        }
+        if (s_demo) {
+            vTaskDelay(5 / portTICK_PERIOD_MS);
+            continue;
+        }
         if (!wsReady) {
             if (!wantOnline) {
                 backoff = 0;
@@ -813,25 +999,35 @@ static void wsTask(void*) {
             if (backoff) {
                 vTaskDelay(backoff / portTICK_PERIOD_MS);
             }
-            ALOGLN(F("[WSS] connecting…"));
+            ALOG("[WSS] connecting… heap=%u\n", (unsigned)ESP.getFreeHeap());
             sessionReady = false;
+            wsClient.close();
             if (!wsClient.connect(wsUrl())) {
-                ALOG("[WSS] connect fail %s\n", wsUrl().c_str());
+                wsClient.close();
+                ALOG("[WSS] connect fail %s heap=%u\n", wsUrl().c_str(),
+                     (unsigned)ESP.getFreeHeap());
                 backoff = minOfU32(backoff ? backoff * 2 : 500u, 8000u);
+                if (!pttHeld && (s_owns_spk || convState != ST_IDLE || s_taking)) {
+                    forceRecover("connect fail");
+                }
             } else {
                 backoff = 0;
             }
             continue;
         }
         backoff = 0;
-        wsClient.poll();
-        if (millis() - lastPing > 30000) {
-            wsClient.ping();
-            lastPing = millis();
+        const bool capturing = s_ptt_armed || (convState == ST_RECORDING && pttHeld);
+        if (!capturing) {
+            wsClient.poll();
+            if (millis() - lastPing > 30000) {
+                wsClient.ping();
+                lastPing = millis();
+            }
+        } else if (recMs && (recMs % 200u) == 0) {
+            wsClient.poll();
         }
 
         int32_t chunkPeak = 0;
-        const bool capturing = s_ptt_armed || (convState == ST_RECORDING && pttHeld);
         if (s_need_mic_clear) {
             s_need_mic_clear = false;
             if (sessionReady) {
@@ -840,41 +1036,59 @@ static void wsTask(void*) {
                 wsSend(cl);
             }
         }
-        if (readMicChunk16(mic16, &chunkPeak, capturing)) {
-            prePush(mic16);
-            if (capturing) {
+        const bool freeze_rec = (convState == ST_RECORDING) && s_need_commit;
+        const bool keep_rec = capturing && !freeze_rec;
+        if (readMicChunk16(mic16, &chunkPeak, keep_rec)) {
+            if (keep_rec) {
+                prePush(mic16);
                 recMs += 10;
                 if (recMs >= MAX_RECORD_MS) {
                     ALOGLN(F("[PTT] max rec"));
                     s_need_commit = true;
                 }
-            } else {
+            } else if (!freeze_rec) {
+                prePush(mic16);
                 preTrimIdle();
             }
         }
-        if (capturing && sessionReady) {
-            drainPrebufToWs(8);
-        }
         if (s_need_commit && convState == ST_RECORDING) {
             s_need_commit = false;
+            // Idle до натискання (~0.8 с) + клац кнопки. Різати лише 30 мс з голови
+            // не чіпало клац — він сидів після преролу, replay починався з нього.
+            uint16_t drop_head = (uint16_t)s_preN_at_arm + (uint16_t)PTT_DROP_HEAD;
+            s_preN_at_arm = 0;
+            if (preN > 40) {
+                while (drop_head && preN > 28) {
+                    preHead = (preHead + 1) % PREBUF_N;
+                    preN--;
+                    drop_head--;
+                }
+                uint8_t drop_tail = PTT_DROP_TAIL;
+                while (drop_tail && preN > 24) {
+                    preN--;
+                    drop_tail--;
+                }
+            }
+            const uint32_t queued_ms = (uint32_t)preN * 10u;
+            const uint32_t t0 = millis();
             while (preN) {
-                drainPrebufToWs(16);
+                drainPrebufToWs(40);
+                wsClient.poll();
             }
+            ALOG("[PTT] flush %u ms audio in %u ms\n", (unsigned)queued_ms, (unsigned)(millis() - t0));
             tryPttCommit();
-        } else if (!capturing) {
-            if (convState == ST_RECORDING && !pttHeld && sessionReady) {
-                tryPttCommit();
-            }
         }
 
-        const uint32_t waitLim = providerIsLocal() ? 90000u : 20000u;
-        if (convState == ST_WAIT_RESP && stateSinceMs && (millis() - stateSinceMs > waitLim)) {
+        const uint32_t waitLim = providerIsLocal() ? 45000u : 20000u;
+        if (convState == ST_WAIT_RESP && s_progress_ms && (millis() - s_progress_ms > waitLim)) {
             ALOGLN(F("[PTT] timeout"));
-            waitingACK = false;
-            responsePending = false;
-            convState = ST_IDLE;
-            stateSinceMs = 0;
+            forceRecover("wait timeout");
             requestHangup();
+        }
+        if (s_sock_wait_ms && !sessionReady && !pttHeld &&
+            (uint32_t)(millis() - s_sock_wait_ms) > 5000u) {
+            ALOGLN(F("[PTT] no socket — radio back"));
+            forceRecover("no socket");
         }
 
         if (respPlaybackPending && rbUsed() == 0 && !speaking) {
@@ -888,7 +1102,9 @@ static void wsTask(void*) {
         if (hangupPending && wantOnline && !busy && !pttHeld) {
             doHangup();
         }
-        vTaskDelay(1);
+        if (!capturing) {
+            vTaskDelay(1);
+        }
     }
 }
 
@@ -916,7 +1132,7 @@ static bool initMic() {
 }
 
 bool bender_ai_busy() {
-    return s_owns_spk || convState != ST_IDLE || speaking || waitingACK || responsePending ||
+    return s_demo || s_owns_spk || convState != ST_IDLE || speaking || waitingACK || responsePending ||
            (respPlaybackPending && rbUsed() > 0) || pttHeld;
 }
 
@@ -925,7 +1141,7 @@ bool bender_ai_recording() {
 }
 
 bool bender_ai_owns_speaker() {
-    return s_owns_spk;
+    return s_owns_spk || s_taking;
 }
 
 bool bender_ai_tts_playing() {
@@ -940,11 +1156,12 @@ bool bender_ai_tts_playing() {
 }
 
 void bender_ai_ptt_arm() {
-    if (convState == ST_WAIT_RESP || waitingACK || responsePending || convState == ST_RECORDING) {
+    if (s_demo || convState == ST_WAIT_RESP || waitingACK || responsePending || convState == ST_RECORDING) {
         return;
     }
     s_need_mic_clear = false;
     s_ptt_armed = true;
+    s_preN_at_arm = preN;
     resetRecStats();
 }
 
@@ -959,10 +1176,44 @@ void bender_ai_ptt_cancel() {
     resetRecStats();
 }
 
+void bender_ai_mic_demo() {
+    if (s_demo || !s_demo_pcm || convState != ST_IDLE || pttHeld || s_ptt_armed || waitingACK ||
+        responsePending || speaking) {
+        ALOGLN(F("[MIC] demo busy"));
+        return;
+    }
+    s_resume_radio = radioState.state && strcmp(g_audio_source, "wifi") == 0;
+    if (!takeSpeaker()) {
+        ALOGLN(F("[MIC] demo no speaker"));
+        return;
+    }
+    s_demo = 1;
+    ALOGLN(F("[MIC] demo start"));
+}
+
+void bender_ai_yield_radio() {
+    if (s_owns_spk || s_taking || convState != ST_IDLE) {
+        forceRecover("radio play");
+    }
+}
+
 void bender_ai_ptt_down() {
-    if (convState == ST_WAIT_RESP || waitingACK || responsePending) {
+    if (s_demo) {
         ALOGLN(F("[PTT] wait answer"));
         return;
+    }
+    if (!wsReady) {
+        ALOGLN(F("[PTT] no socket — radio stays"));
+        return;
+    }
+    const bool waiting = (convState == ST_WAIT_RESP || waitingACK || responsePending);
+    if (waiting) {
+        const bool recent_pcm = s_last_pcm_ms && (millis() - s_last_pcm_ms < 2500);
+        if (recent_pcm) {
+            ALOGLN(F("[PTT] wait answer"));
+            return;
+        }
+        forceRecover("ptt barge");
     }
     s_resume_radio = radioState.state && strcmp(g_audio_source, "wifi") == 0;
     if (!takeSpeaker()) {
@@ -998,10 +1249,23 @@ void bender_ai_ptt_up() {
 }
 
 void bender_ai_tick() {
+    if (s_need_speaker && !s_owns_spk && !s_giveback) {
+        s_need_speaker = false;
+        if (!takeSpeaker()) {
+            ALOGLN(F("[AI] take speaker fail"));
+        }
+    }
+    const bool pcm_fresh = s_last_pcm_ms && (millis() - s_last_pcm_ms < 800);
     if (s_giveback && !pttHeld && convState != ST_RECORDING && convState != ST_WAIT_RESP &&
-        !speaking && rbUsed() == 0) {
+        !responsePending && !waitingACK && rbUsed() == 0 && !pcm_fresh) {
         s_giveback = false;
+        s_demo = 0;
+        speaking = false;
+        const bool had_cmd = applyVoiceCmdState();
         releaseSpeakerFromLoop();
+        if (had_cmd) {
+            radio_voice_after_speaker();
+        }
     }
 }
 
@@ -1012,9 +1276,15 @@ void bender_ai_begin() {
     ring = (uint8_t*)ps_malloc(RING_BYTES);
     pcmDecode = (uint8_t*)ps_malloc(PCM_DECODE_BYTES);
     prebuf = (uint8_t*)ps_malloc(PREBUF_BYTES);
+    s_demo_cap = (size_t)RATE * 2u * (size_t)RadioConfig::micDemoMs / 1000u;
+    s_demo_pcm = (uint8_t*)ps_malloc(s_demo_cap);
     if (!ring || !pcmDecode || !prebuf) {
         ALOGLN(F("[AI] PSRAM alloc fail"));
         return;
+    }
+    if (!s_demo_pcm) {
+        ALOGLN(F("[MIC] demo buf fail"));
+        s_demo_cap = 0;
     }
     if (!initMic()) {
         return;
@@ -1028,8 +1298,9 @@ void bender_ai_begin() {
     }
     wsClient.onEvent(onEvent);
     wsClient.onMessage(onMessage);
-    xTaskCreatePinnedToCore(speakerTask, "ai_spk", 4096, nullptr, 5, nullptr, 1);
-    xTaskCreatePinnedToCore(wsTask, "ai_ws", 16384, nullptr, 3, nullptr, 1);
+    // WS вище за колонку: інакше I2S-write голодує poll() → сервер бачить client disconnected.
+    xTaskCreatePinnedToCore(speakerTask, "ai_spk", 4096, nullptr, 2, nullptr, 1);
+    xTaskCreatePinnedToCore(wsTask, "ai_ws", 16384, nullptr, 5, nullptr, 1);
     s_started = true;
-    ALOGLN(F("[AI] PTT hold=talk  7 clicks=sleep  8=restart"));
+    ALOGLN(F("[AI] PTT hold=talk  2 clicks=mic demo  7=sleep  8=restart"));
 }

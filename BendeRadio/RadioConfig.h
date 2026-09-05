@@ -87,14 +87,16 @@ class RadioConfig {
     static constexpr uint8_t encS1 = 4;
     static constexpr uint8_t encS2 = 5;
     static constexpr uint8_t encBtn = 6;
-    // 5 кліків — % АКБ; 6 — Pong; 7 — deep sleep; 8 — restart.
+    // 2 кліки — демо мікрофона (3 с запис → відтворення). 5 — % АКБ; 6 — Pong; 7 — сон; 8 — restart.
     // Утримання без кліків/повороту (~0.5 с) підтверджує PTT (не клік). Мікрофон пише з моменту натискання.
     static constexpr uint16_t encoderPttHoldMs = 520;
+    static constexpr uint16_t micDemoMs = 3000;
     static constexpr uint8_t encoderSleepClicks = 7;
     static constexpr uint8_t encoderRestartClicks = 8;
     // Без музики і без розмови з Бендером — очі/рот у спокійний режим (не deep sleep).
     static constexpr uint32_t benderFaceCalmAfterMs = 5ul * 60ul * 1000ul;
     // Далі бездіяльність (немає музики, PTT, енкодера, WebUI) — deep sleep, будить кнопка.
+    // На зарядці автосон не вмикається (7 кліків — так).
     static constexpr uint32_t benderIdleDeepSleepMs = 30ul * 60ul * 1000ul;
     // Застарілі пороги hold-sleep/reset (сон і restart тепер кліками).
     static constexpr uint16_t encoderSleepHoldMs = 5000;
@@ -124,6 +126,10 @@ class RadioConfig {
     // Ниже порога без зарядки: глубокий сон (только если batteryMonitorEnable и chargingDetectEnable).
     static constexpr bool batteryShutdownEnable = true;
     static constexpr uint8_t batteryShutdownBelowPercent = 5;
+    // 2S: нижче ~3.1 В/банку — сон. 4.8 В пакета = вже глибокий розряд, так не повинно доходити.
+    static constexpr uint16_t batteryShutdownBelowMv = 6200;
+    // Нижче цього зарядка НЕ рятує: робочий ЗП тримав би банку вище.
+    static constexpr uint16_t batteryCriticalMv = 5600;
     // Подряд столько замеров (с интервалом выше) должны быть < порога — защита от шума АЦП.
     static constexpr uint8_t batteryShutdownConsecutiveSamples = 2;
     // Ниже этого % (без активной зарядки) — грустные глаза по битмапу (левый/правый — отдельные массивы в core0).
@@ -144,7 +150,9 @@ class RadioConfig {
     static constexpr bool chargingDetectEnable = true;
     static constexpr uint8_t chargingDetectPin = 12;
     static constexpr bool chargingDetectUseAdc = true;
-    static constexpr uint16_t chargingDetectMinMv = 1000;  // >1.0 V = идёт зарядка
+    // LED IP2326 ШІМ: треба кілька імпульсів, не один випадковий пік (інакше хибна зарядка
+    // блокує захист і пакет сідає до 4.8 В).
+    static constexpr uint16_t chargingDetectMinMv = 600;
     static constexpr bool chargingDetectActiveHigh = true;   // только для digital-режима
     static constexpr uint32_t chargingDebugSerialMs = 15000;
     // Крок анімації заливки батареї (мс на кадр; кадр = лічильник для battery_matrix_rows_charging).
@@ -160,8 +168,10 @@ class RadioConfig {
     static constexpr uint8_t micWsPin = 10;
     static constexpr uint8_t micDinPin = 8;
     static constexpr uint32_t micSampleRate = 16000;
-    // INMP441 в 32-bit I2S-слоте: 14 — баланс громкости; 8 клиппит (peak=32768), 16 часто тихо.
+    // INMP441 у 32-bit слоті: менше shift / більше gain — голосніше. 14 і ×4 — ще чутливіше за 14×3.
+    // Демо (2 кліки): peak близько 20000–28000 норма; 32767 — кліп, зменши gain або підніми shift.
     static constexpr uint8_t micPcmShiftRight = 14;
+    static constexpr int micDigitalGain = 4;
 
     // SoftAP: см. encoderSoftApToggleHoldMs + жест 4×клик+удерж. в режиме Wi‑Fi.
     // Станція / гучність на роті — фіксований період matrix_tmr (не довше за batteryPercentShowDurationMs після батареї).

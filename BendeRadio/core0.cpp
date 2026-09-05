@@ -69,8 +69,53 @@ static const char* station_url_by_index(int idx) {
     return stations[0];
 }
 
+static void station_clamp_index();
+
 const char* station_url_for_current() {
     return station_url_by_index(radioState.station);
+}
+
+uint8_t radio_station_count() {
+    return station_total_count();
+}
+
+const char* radio_station_name(uint8_t idx) {
+    static const char* kBuiltInNames[] = {
+        "Majestic Jukebox",
+        "Radio1 Rock",
+    };
+    static char custom_label[40];
+    const uint8_t n_built = (uint8_t)(sizeof(kBuiltInNames) / sizeof(kBuiltInNames[0]));
+    if (idx < n_built && idx < kStationBuiltInCount) {
+        return kBuiltInNames[idx];
+    }
+    snprintf(custom_label, sizeof(custom_label), "станція %u", (unsigned)idx);
+    return custom_label;
+}
+
+void radio_voice_set_state(bool on, int station) {
+    if (station >= 0) {
+        radioState.station = (int8_t)station;
+        station_clamp_index();
+    }
+    radioState.state = on;
+    Serial.printf("[Radio] voice %s station %d\n", on ? "ON" : "OFF", (int)radioState.station);
+}
+
+void radio_voice_after_speaker() {
+    if (strcmp(g_audio_source, "bt") == 0) {
+        if (radioState.state) {
+            bt_audio_avrcp_play();
+        } else {
+            bt_audio_avrcp_pause();
+        }
+    } else if (!radioState.state) {
+        audio.setVolume(0);
+        audio.stopSong();
+    }
+    apply_output_volume();
+    syncWifiWithAudioSilence();
+    change_state();
 }
 
 static void station_clamp_index() {
@@ -1237,13 +1282,14 @@ static void low_battery_enter_deep_sleep_forever() {
     mtrx.setBright(br_off);
     mtrx.clear();
     matrix_flush();
-    (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT0);
     (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT1);
     (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
     (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TOUCHPAD);
 #if defined(ESP_SLEEP_WAKEUP_ULP)
     (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ULP);
 #endif
+    // Кнопка будить: інакше при хибному «не заряджається» колонка цеглина до зняття живлення.
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)RadioConfig::encBtn, 0);
     esp_deep_sleep_start();
     delay(1000);
 }
@@ -1252,12 +1298,26 @@ static void battery_shutdown_guard_on_sample() {
     if (!battery_low_power_sleep_active() || !battery_gauge_ready()) {
         return;
     }
-    if (battery_is_charging()) {
+    const uint16_t mv = battery_millivolts();
+    const uint8_t pct = battery_percent();
+    const bool chg = battery_is_charging();
+    // Якщо пакет уже < ~2.8 В/банку — це не робоча зарядка, сон обов'язковий.
+    if (mv > 0 && mv < RadioConfig::batteryCriticalMv) {
+        Serial.printf("[Batt] CRITICAL %umV — sleep (chg=%d ignored)\n", (unsigned)mv, (int)chg);
+        low_battery_enter_deep_sleep_forever();
+        return;
+    }
+    const bool charger_holds = chg && mv >= RadioConfig::batteryCriticalMv;
+    if (charger_holds) {
         s_batt_shutdown_consecutive = 0;
         return;
     }
-    if (battery_percent() < RadioConfig::batteryShutdownBelowPercent) {
+    const bool low = (pct < RadioConfig::batteryShutdownBelowPercent) ||
+                     (mv > 0 && mv < RadioConfig::batteryShutdownBelowMv);
+    if (low) {
         if (++s_batt_shutdown_consecutive >= RadioConfig::batteryShutdownConsecutiveSamples) {
+            Serial.printf("[Batt] LOW SLEEP pct=%u mv=%u chg=%d\n", (unsigned)pct, (unsigned)mv,
+                          (int)chg);
             low_battery_enter_deep_sleep_forever();
         }
         return;
@@ -1701,6 +1761,9 @@ void core0(void* p) {
                     switch (eb.getClicks()) {
                         case 1:
                             radioState.state = !radioState.state;
+                            if (radioState.state) {
+                                bender_ai_yield_radio();
+                            }
                             if (!radioState.state) {
                                 if (strcmp(g_audio_source, "bt") == 0) {
                                     bt_audio_avrcp_pause();
@@ -1721,6 +1784,7 @@ void core0(void* p) {
                             change_state();
                             break;
                         case 2:
+                            bender_ai_mic_demo();
                             break;
                         case 3:
                             radioState.trsh = (uint16_t)constrain((int)g_pcm_level_adc * 2 / 3, 4, 3800);
@@ -1886,9 +1950,10 @@ void core0(void* p) {
 
         {
             const bool ap_up = (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA);
+            const bool charging = RadioConfig::chargingDetectEnable && battery_is_charging();
             const bool stay_awake =
                 radioState.state || bender_ai_busy() || pong_active() || s_mode_pick_active ||
-                wifiConnecting || show_wake_after_sleep_anim || ap_up ||
+                wifiConnecting || show_wake_after_sleep_anim || ap_up || charging ||
                 (strcmp(g_audio_source, "bt") == 0 && bt_audio_needs_pairing_ui());
             if (stay_awake) {
                 s_wifi_last_activity_ms = millis();

@@ -197,7 +197,9 @@ void loop() {
 
     webUiLoop();
     bender_ai_tick();
-    if (bender_ai_busy()) {
+    // Не блокувати радіо, поки Bender лише чекає WS/LLM. I2S0 зайнятий лише коли
+    // owns_speaker — інакше стрім ніколи не reconnect після фрази.
+    if (bender_ai_owns_speaker()) {
         WiFi.setSleep(false);
         esp_wifi_set_ps(WIFI_PS_NONE);
         wifi_touch_activity();

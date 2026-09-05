@@ -72,17 +72,27 @@ static bool charging_pin_majority_high() {
         return false;
     }
     uint32_t acc = 0;
-    constexpr uint8_t kSamples = 8;
+    uint16_t peak = 0;
+    uint8_t hits = 0;
+    constexpr uint8_t kSamples = 16;
     for (uint8_t i = 0; i < kSamples; i++) {
+        uint16_t mv = 0;
         if (RadioConfig::chargingDetectUseAdc) {
-            acc += charging_pin_millivolts();
+            mv = charging_pin_millivolts();
         } else if (digitalRead(RadioConfig::chargingDetectPin) == HIGH) {
-            acc += 3300u;
+            mv = 3300u;
         }
-        delayMicroseconds(120);
+        acc += mv;
+        if (mv > peak) {
+            peak = mv;
+        }
+        if (mv >= RadioConfig::chargingDetectMinMv) {
+            hits++;
+        }
+        delayMicroseconds(200);
     }
     if (RadioConfig::chargingDetectUseAdc) {
-        return (acc / kSamples) >= RadioConfig::chargingDetectMinMv;
+        return hits >= 3u && peak >= RadioConfig::chargingDetectMinMv;
     }
     const bool majority = acc >= (3300u * 5u);
     return RadioConfig::chargingDetectActiveHigh ? majority : !majority;
