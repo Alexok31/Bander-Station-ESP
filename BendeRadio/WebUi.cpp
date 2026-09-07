@@ -7,6 +7,7 @@
 
 #include "NvsConfig.h"
 #include "RadioConfig.h"
+#include "BenderAi.h"
 #include "core0.h"
 
 static WebServer server(80);

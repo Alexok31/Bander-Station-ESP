@@ -14,12 +14,14 @@
 
 #include "battery.h"
 #include "battery_matrix.h"
+#include "AirPlay.h"
 #include "AudioMux.h"
 #include "BtAudio.h"
 #include "NvsConfig.h"
 #include "pong.h"
 #include "tmr.h"
 #include "BenderAi.h"
+#include "secrets.h"
 
 static inline uint8_t mouth_gfx_on(bool invert) {
     return invert ? GFX_CLEAR : GFX_FILL;
@@ -31,7 +33,7 @@ static inline uint8_t mouth_gfx_off(bool invert) {
 static uint32_t s_face_last_live_ms = 0;
 
 static bool matrix_face_awake() {
-    if (radioState.state || bender_ai_busy()) {
+    if (radioState.state || bender_ai_busy() || airplay_playing()) {
         s_face_last_live_ms = millis();
         return true;
     }
@@ -198,7 +200,7 @@ static int matrix_base_max() {
 }
 
 void upd_bright() {
-    if (!radioState.state && !bender_ai_busy()) {
+    if (!radioState.state && !bender_ai_busy() && !airplay_playing()) {
         matrix_apply_brightness((int)RadioConfig::matrixBrightnessIdleBase);
         return;
     }
@@ -282,6 +284,20 @@ static void draw_mode_pick_mouth() {
 static void pong_sync_matrix_brightness() {
     upd_bright();
 }
+static volatile bool s_ui_vol_req = false;
+static volatile uint8_t s_ui_vol_val = 0;
+
+void matrix_show_volume(int8_t vol) {
+    if (vol < 0) {
+        vol = 0;
+    }
+    if (vol > 99) {
+        vol = 99;
+    }
+    s_ui_vol_val = (uint8_t)vol;
+    s_ui_vol_req = true;
+}
+
 void print_val(char c, uint8_t v) {
     if (!matrix_display_ready()) {
         return;
@@ -1158,7 +1174,7 @@ void wifi_ap_toggle_from_core0() {
         }
         wifiConnecting = false;
         if (WiFi.status() == WL_CONNECTED) {
-            reconnect = station_url_by_index(radioState.station);
+            reconnect = station_url_for_current();
         }
         wifi_touch_activity();
         syncWifiWithAudioSilence();
@@ -1183,7 +1199,7 @@ void wifi_ap_toggle_from_core0() {
 }
 
 void apply_output_volume() {
-    if (bender_ai_owns_speaker()) {
+    if (bender_ai_owns_speaker() || airplay_owns_speaker()) {
         return;
     }
     int8_t vol = radioState.vol;
@@ -1235,7 +1251,7 @@ void amp_force_mute() {
 void audio_hw_init(bool log_serial) {
     static bool s_bufsize_done = false;
     if (!s_bufsize_done) {
-        audio.setBufsize(RadioConfig::radioBuffer, -1);
+        audio.setBufsize(RadioConfig::radioBuffer, RadioConfig::radioBufferPsram);
         s_bufsize_done = true;
     }
     amp_force_mute();
@@ -1326,6 +1342,7 @@ static void battery_shutdown_guard_on_sample() {
 }
 
 static void radio_enter_deep_sleep() {
+    airplay_interrupt();
     memory.update();
     if (radioState.state) {
         if (strcmp(g_audio_source, "bt") == 0) {
@@ -1481,6 +1498,12 @@ void core0(void* p) {
             battery_shutdown_guard_on_sample();
         }
         matrix_tmr.tick();
+        if (s_ui_vol_req) {
+            s_ui_vol_req = false;
+            s_batt_matrix_overlay = false;
+            print_val('v', s_ui_vol_val);
+            matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
+        }
         if (s_batt_matrix_overlay && !matrix_tmr.state()) {
             s_batt_matrix_overlay = false;
             s_batt_overlay_prev_chg = false;
@@ -1535,7 +1558,7 @@ void core0(void* p) {
         }
 
         const bool eb_tick = eb.tick();
-        if (radioState.state || bender_ai_busy()) {
+        if (radioState.state || bender_ai_busy() || airplay_playing()) {
             s_wifi_last_activity_ms = millis();
         } else if (eb_tick && (eb.press() || eb.release() || eb.turn())) {
             s_wifi_last_activity_ms = millis();
@@ -1715,7 +1738,8 @@ void core0(void* p) {
                 matrix_flush();
             } else if ((viz_tmr || (bender_ai_tts_playing() && tts_mouth_tmr)) && !matrix_tmr.state() &&
                        radioState.mode <= 5 && matrix_face_awake()) {
-                const bool talk = bender_ai_tts_playing() || (radioState.state && !bender_ai_busy());
+                const bool talk = bender_ai_tts_playing() || airplay_playing() ||
+                                  (radioState.state && !bender_ai_busy());
                 const uint8_t anim_mode = mouth_anim_mode();
                 const bool mouth_invert = (anim_mode == 1 || anim_mode == 4);
                 mtrx.rect(0, 0, RadioConfig::analyzWidth - 1, 7, mouth_gfx_off(mouth_invert));
@@ -1773,7 +1797,7 @@ void core0(void* p) {
                                 }
                             } else {
                                 if (strcmp(g_audio_source, "wifi") == 0) {
-                                    reconnect = station_url_by_index(radioState.station);
+                                    reconnect = station_url_for_current();
                                 }
                                 if (strcmp(g_audio_source, "bt") == 0) {
                                     bt_audio_avrcp_play();
@@ -1835,6 +1859,16 @@ void core0(void* p) {
                         // 0 — один клик + поворот; 1 — двойной; 2 — тройной (яркость); 3 — четверной (Wi‑Fi / Bluetooth).
                         switch (eb.getClicks()) {
                             case 0:
+                                if (airplay_owns_speaker()) {
+                                    radioState.vol += eb.dir();
+                                    radioState.vol = constrain(radioState.vol, 0, RadioConfig::ampVolumeUiMax);
+                                    airplay_encoder_vol_changed();
+                                    Serial.printf("[Vol] %d\n", (int)radioState.vol);
+                                    print_val('v', radioState.vol);
+                                    s_batt_matrix_overlay = false;
+                                    matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
+                                    break;
+                                }
                                 if (strcmp(g_audio_source, "bt") == 0) {
                                     if (eb.dir() > 0) {
                                         bt_audio_avrcp_next();
@@ -1895,11 +1929,14 @@ void core0(void* p) {
                                 break;
                         }
                     } else {
-                        if ((radioState.state || bender_ai_owns_speaker()) &&
+                        if ((radioState.state || bender_ai_owns_speaker() || airplay_owns_speaker()) &&
                             RadioConfig::encoderControlsVolume) {
                             angry_tmr.start();
                             radioState.vol += eb.dir();
                             radioState.vol = constrain(radioState.vol, 0, RadioConfig::ampVolumeUiMax);
+                            if (airplay_owns_speaker()) {
+                                airplay_encoder_vol_changed();
+                            }
                             apply_output_volume();
                             syncWifiWithAudioSilence();
                             Serial.printf("[Vol] %d\n", (int)radioState.vol);
@@ -1952,9 +1989,9 @@ void core0(void* p) {
             const bool ap_up = (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA);
             const bool charging = RadioConfig::chargingDetectEnable && battery_is_charging();
             const bool stay_awake =
-                radioState.state || bender_ai_busy() || pong_active() || s_mode_pick_active ||
-                wifiConnecting || show_wake_after_sleep_anim || ap_up || charging ||
-                (strcmp(g_audio_source, "bt") == 0 && bt_audio_needs_pairing_ui());
+                radioState.state || bender_ai_busy() || airplay_playing() || pong_active() ||
+                s_mode_pick_active || wifiConnecting || show_wake_after_sleep_anim || ap_up ||
+                charging || (strcmp(g_audio_source, "bt") == 0 && bt_audio_needs_pairing_ui());
             if (stay_awake) {
                 s_wifi_last_activity_ms = millis();
             } else if (RadioConfig::benderIdleDeepSleepMs > 0 &&

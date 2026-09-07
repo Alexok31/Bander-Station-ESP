@@ -158,6 +158,7 @@ def match(text: str, stations: list[dict] | None = None) -> VoiceCommand | None:
     t = _norm(text)
     if len(t) < 6:
         return None
+
     st = find_station(t, stations)
     listed = _list_stations(stations)
     st_name = str((st or {}).get("name") or "цю станцію")

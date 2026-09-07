@@ -2261,16 +2261,18 @@ async def run_turn(ws, pcm_in: bytes, prompt: str, history: list) -> None:
             history.append({"role": "user", "content": text})
             cmd = voice_commands.match(text, DEVICE_STATIONS or None)
             if cmd:
+                play_args = dict(cmd.args or {})
                 reply = cmd.reply(len(history))
-                log(f"CMD {cmd.name or 'talk'} {cmd.args} → {reply!r}")
+                send_name = cmd.name
+                log(f"CMD {send_name or 'talk'} {play_args} → {reply!r}")
                 pcm_out = await asyncio.to_thread(synth, reply)
                 await send_pcm_deltas(ws, pcm_out)
                 history.append({"role": "assistant", "content": reply})
-                if cmd.name:
+                if send_name:
                     await ws.send(dumps({
                         "type": "device.command",
-                        "name": cmd.name,
-                        "args": cmd.args,
+                        "name": send_name,
+                        "args": play_args,
                     }))
                 fold_old_turns(history)
                 save_chat(history)

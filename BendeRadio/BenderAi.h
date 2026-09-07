@@ -7,6 +7,9 @@
 
 void bender_ai_begin();
 void bender_ai_tick();
+void bender_ai_wake();
+void bender_ai_sleep();
+bool bender_ai_awake();
 
 bool bender_ai_busy();
 bool bender_ai_recording();

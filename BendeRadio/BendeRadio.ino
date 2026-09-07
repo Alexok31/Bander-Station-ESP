@@ -12,6 +12,7 @@
 #include "WebUi.h"
 #include "core0.h"
 #include "BenderAi.h"
+#include "AirPlay.h"
 
 TaskHandle_t Task0;
 
@@ -177,7 +178,9 @@ void setup() {
 
     webUiBegin();
     bender_ai_begin();
+    airplay_begin();
     Serial.println(F("Bender AI: hold=talk; 7 clicks=sleep; 8=restart; idle 5 min=calm, 30 min=sleep"));
+    Serial.println(F("AirPlay: iPhone Control Center → Bender"));
 
     if (!(esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 && RadioConfig::wakeAfterSleepAnimMs > 0)) {
         change_state();
@@ -195,11 +198,20 @@ void loop() {
         return;
     }
 
-    webUiLoop();
+    if (!airplay_owns_speaker()) {
+        webUiLoop();
+    } else {
+        static uint32_t s_web_ms = 0;
+        if ((uint32_t)(millis() - s_web_ms) >= 80u) {
+            s_web_ms = millis();
+            webUiLoop();
+        }
+    }
     bender_ai_tick();
+    airplay_tick();
     // Не блокувати радіо, поки Bender лише чекає WS/LLM. I2S0 зайнятий лише коли
     // owns_speaker — інакше стрім ніколи не reconnect після фрази.
-    if (bender_ai_owns_speaker()) {
+    if (bender_ai_owns_speaker() || airplay_owns_speaker()) {
         WiFi.setSleep(false);
         esp_wifi_set_ps(WIFI_PS_NONE);
         wifi_touch_activity();

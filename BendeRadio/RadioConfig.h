@@ -49,6 +49,11 @@ class RadioConfig {
     static constexpr uint16_t btModulePowerOnDelayMs = 150;
     static constexpr bool btModuleAtPowerDownOnWifi = false;
     static constexpr const char* btSinkName = "Bender Station";
+
+    // AirPlay 1 (RAOP): iPhone бачить колонку, поки є Wi‑Fi. RECORD забирає I2S.
+    static constexpr bool airplayEnable = true;
+    static constexpr const char* airplayName = "Bender";
+    static constexpr uint16_t airplayRtspPort = 5000;
     static constexpr uint32_t btReconnectFirstDelayMs = 1200;
     static constexpr uint32_t btReconnectRetryMs = 2500;
     static constexpr uint8_t btReconnectBurstCount = 16;
@@ -178,7 +183,9 @@ class RadioConfig {
     static constexpr uint16_t matrixOverlayDigitsMs = 1000;
 
     static constexpr int analyzWidth = 3 * 8;
-    static constexpr int radioBuffer = 1600 * 28;  // underrun → «захлеб» / скачет громкость
+    static constexpr int radioBuffer = 1600 * 28;  // RAM fallback
+    // HTTPS-станції (Majestic) важчі за HTTP 128k — тримаємо запас у PSRAM.
+    static constexpr int radioBufferPsram = 320000;
 
     // Режим 0: синусоида «струна» + FM и шум — хаотичнее, чем одна гладкая sin.
     static constexpr float analyzSinePeriodsAcross = 1.5f;

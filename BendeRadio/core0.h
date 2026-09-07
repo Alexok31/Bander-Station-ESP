@@ -27,6 +27,7 @@ void change_state();
 // I2S/буфер — как можно раньше в setup(), до connecttohost (конструктор Audio уже поднял I2S).
 void audio_hw_init(bool log_serial = false);
 void apply_output_volume();
+void matrix_show_volume(int8_t vol);
 void amp_force_mute();
 // ESP32-S3: UART0 по умолчанию на 43/44, у нас BCLK=44 — без этого при USB динамик молчит.
 void free_uart0_from_i2s_pins();

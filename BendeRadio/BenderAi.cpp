@@ -9,6 +9,7 @@
 #include <esp_wifi.h>
 #include <mbedtls/base64.h>
 
+#include "AirPlay.h"
 #include "RadioConfig.h"
 #include "core0.h"
 #include "pcm_analyzer.h"
@@ -123,6 +124,9 @@ static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool wsReady = false;
 static volatile bool sessionReady = false;
 static volatile bool wantOnline = false;
+static volatile bool s_ai_awake = false;
+static uint32_t s_ai_last_live_ms = 0;
+static bool s_mic_on = false;
 static volatile bool hangupPending = false;
 static volatile bool sessionArmed = false;
 static volatile bool pttHeld = false;
@@ -443,7 +447,7 @@ static void requestHangup() {
 
 static void doHangup() {
     hangupPending = false;
-    wantOnline = providerIsLocal();
+    wantOnline = false;
     sessionReady = false;
     wsReady = false;
     resetTxState();
@@ -860,7 +864,7 @@ static void speakerTask(void*) {
             primed = false;
             quietSince = 0;
             s_tts_out_ms = 0;
-            vTaskDelay(10 / portTICK_PERIOD_MS);
+            vTaskDelay(s_ai_awake ? 10 : 80);
             continue;
         }
         if (s_demo == 1 || s_demo == 2 || convState == ST_RECORDING || pttHeld) {
@@ -990,10 +994,15 @@ static void wsTask(void*) {
             vTaskDelay(5 / portTICK_PERIOD_MS);
             continue;
         }
+        if (!s_ai_awake && !s_demo && !wantOnline) {
+            backoff = 0;
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            continue;
+        }
         if (!wsReady) {
             if (!wantOnline) {
                 backoff = 0;
-                vTaskDelay(50 / portTICK_PERIOD_MS);
+                vTaskDelay(100 / portTICK_PERIOD_MS);
                 continue;
             }
             if (backoff) {
@@ -1038,17 +1047,19 @@ static void wsTask(void*) {
         }
         const bool freeze_rec = (convState == ST_RECORDING) && s_need_commit;
         const bool keep_rec = capturing && !freeze_rec;
-        if (readMicChunk16(mic16, &chunkPeak, keep_rec)) {
-            if (keep_rec) {
-                prePush(mic16);
-                recMs += 10;
-                if (recMs >= MAX_RECORD_MS) {
-                    ALOGLN(F("[PTT] max rec"));
-                    s_need_commit = true;
+        if (capturing || s_ptt_armed) {
+            if (readMicChunk16(mic16, &chunkPeak, keep_rec)) {
+                if (keep_rec) {
+                    prePush(mic16);
+                    recMs += 10;
+                    if (recMs >= MAX_RECORD_MS) {
+                        ALOGLN(F("[PTT] max rec"));
+                        s_need_commit = true;
+                    }
+                } else if (!freeze_rec) {
+                    prePush(mic16);
+                    preTrimIdle();
                 }
-            } else if (!freeze_rec) {
-                prePush(mic16);
-                preTrimIdle();
             }
         }
         if (s_need_commit && convState == ST_RECORDING) {
@@ -1108,12 +1119,28 @@ static void wsTask(void*) {
     }
 }
 
-static bool initMic() {
-    if (!i2sMic.setPort(I2S_NUM_1)) {
-        ALOGLN(F("[AI] mic setPort fail"));
-        return false;
+static void micSleep() {
+    if (!s_mic_on) {
+        return;
     }
-    i2sMic.setPins(RadioConfig::micBclkPin, RadioConfig::micWsPin, -1, RadioConfig::micDinPin);
+    i2sMic.end();
+    s_mic_on = false;
+    ALOGLN(F("[AI] mic sleep"));
+}
+
+static bool initMic() {
+    if (s_mic_on) {
+        return true;
+    }
+    static bool s_mic_port = false;
+    if (!s_mic_port) {
+        if (!i2sMic.setPort(I2S_NUM_1)) {
+            ALOGLN(F("[AI] mic setPort fail"));
+            return false;
+        }
+        i2sMic.setPins(RadioConfig::micBclkPin, RadioConfig::micWsPin, -1, RadioConfig::micDinPin);
+        s_mic_port = true;
+    }
     if (i2sMic.begin(I2S_MODE_STD, RATE, (i2s_data_bit_width_t)32, I2S_SLOT_MODE_MONO,
                      I2S_STD_SLOT_LEFT)) {
         g_mic32bit = true;
@@ -1128,6 +1155,7 @@ static bool initMic() {
     }
     delay(50);
     micDump();
+    s_mic_on = true;
     return true;
 }
 
@@ -1155,10 +1183,42 @@ bool bender_ai_tts_playing() {
     return t != 0 && (millis() - t) < 80u;
 }
 
+void bender_ai_wake() {
+    s_ai_awake = true;
+    wantOnline = true;
+    s_ai_last_live_ms = millis();
+    (void)initMic();
+}
+
+void bender_ai_sleep() {
+    if (pttHeld || s_demo || convState == ST_RECORDING || convState == ST_WAIT_RESP || speaking ||
+        waitingACK || responsePending) {
+        return;
+    }
+    s_ai_awake = false;
+    wantOnline = false;
+    hangupPending = false;
+    sessionReady = false;
+    if (wsReady) {
+        wsClient.close();
+    }
+    wsReady = false;
+    micSleep();
+    ALOGLN(F("[AI] sleep"));
+}
+
+bool bender_ai_awake() {
+    return s_ai_awake;
+}
+
 void bender_ai_ptt_arm() {
     if (s_demo || convState == ST_WAIT_RESP || waitingACK || responsePending || convState == ST_RECORDING) {
         return;
     }
+    if (airplay_owns_speaker()) {
+        airplay_interrupt();
+    }
+    bender_ai_wake();
     s_need_mic_clear = false;
     s_ptt_armed = true;
     s_preN_at_arm = preN;
@@ -1183,6 +1243,7 @@ void bender_ai_mic_demo() {
         return;
     }
     s_resume_radio = radioState.state && strcmp(g_audio_source, "wifi") == 0;
+    bender_ai_wake();
     if (!takeSpeaker()) {
         ALOGLN(F("[MIC] demo no speaker"));
         return;
@@ -1203,8 +1264,14 @@ void bender_ai_ptt_down() {
         return;
     }
     if (!wsReady) {
-        ALOGLN(F("[PTT] no socket — radio stays"));
-        return;
+        const uint32_t t0 = millis();
+        while (!wsReady && (uint32_t)(millis() - t0) < 1200u) {
+            delay(10);
+        }
+        if (!wsReady) {
+            ALOGLN(F("[PTT] no socket — radio stays"));
+            return;
+        }
     }
     const bool waiting = (convState == ST_WAIT_RESP || waitingACK || responsePending);
     if (waiting) {
@@ -1267,6 +1334,12 @@ void bender_ai_tick() {
             radio_voice_after_speaker();
         }
     }
+    if (s_ai_awake && !bender_ai_busy() && !s_ptt_armed &&
+        (uint32_t)(millis() - s_ai_last_live_ms) > 8000u) {
+        bender_ai_sleep();
+    } else if (bender_ai_busy() || s_ptt_armed) {
+        s_ai_last_live_ms = millis();
+    }
 }
 
 void bender_ai_begin() {
@@ -1286,12 +1359,8 @@ void bender_ai_begin() {
         ALOGLN(F("[MIC] demo buf fail"));
         s_demo_cap = 0;
     }
-    if (!initMic()) {
-        return;
-    }
     if (providerIsLocal()) {
-        wantOnline = true;
-        ALOG("[WSS] local %s\n", wsUrl().c_str());
+        ALOG("[WSS] local %s (sleep until PTT)\n", wsUrl().c_str());
     } else {
         wsClient.setInsecure();
         wsClient.addHeader("Authorization", String("Bearer ") + apiKey());
