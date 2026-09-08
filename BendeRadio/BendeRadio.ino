@@ -229,6 +229,7 @@ void setup() {
     airplay_set_accept(play_mode_is_airplay());
     Serial.println(F("Bender AI: hold=talk; 7 clicks=sleep; 8=restart; idle 5 min=calm, 30 min=sleep"));
     Serial.println(F("Mode: 4 clicks = FM / AIR"));
+    Serial.println(F("FM: 2 clicks=next station, 3=prev"));
     Serial.println(F("AirPlay: 1 click=pause, 2=next, 3=prev"));
 
     if (!(esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 && RadioConfig::wakeAfterSleepAnimMs > 0)) {

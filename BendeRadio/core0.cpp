@@ -129,6 +129,21 @@ static void station_clamp_index() {
     radioState.station = constrain(radioState.station, 0, total - 1);
 }
 
+static void radio_step_station(int dir) {
+    const int n = (int)station_total_count();
+    if (n <= 0) {
+        radioState.station = 0;
+        return;
+    }
+    int i = (int)radioState.station + dir;
+    if (i < 0) {
+        i = n - 1;
+    } else if (i >= n) {
+        i = 0;
+    }
+    radioState.station = (int8_t)i;
+}
+
 // data
 MAX7219<5, 1, RadioConfig::mtrxCs, RadioConfig::mtrxDat, RadioConfig::mtrxClk> mtrx;
 Data radioState;
@@ -1845,8 +1860,31 @@ void core0(void* p) {
                             syncWifiWithAudioSilence();
                             change_state();
                             break;
+                        case 2:
+                            if (strcmp(g_audio_source, "wifi") == 0) {
+                                radio_step_station(+1);
+                                print_val('s', radioState.station);
+                                Serial.printf("[Radio] next station %d/%u %s\n",
+                                              (int)radioState.station, (unsigned)station_total_count(),
+                                              station_url_by_index(radioState.station));
+                                s_batt_matrix_overlay = false;
+                                matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
+                                reconnect = station_url_for_current();
+                            }
+                            break;
                         case 3:
-                            radioState.trsh = (uint16_t)constrain((int)g_pcm_level_adc * 2 / 3, 4, 3800);
+                            if (strcmp(g_audio_source, "wifi") == 0) {
+                                radio_step_station(-1);
+                                print_val('s', radioState.station);
+                                Serial.printf("[Radio] prev station %d/%u %s\n",
+                                              (int)radioState.station, (unsigned)station_total_count(),
+                                              station_url_by_index(radioState.station));
+                                s_batt_matrix_overlay = false;
+                                matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
+                                reconnect = station_url_for_current();
+                            } else {
+                                radioState.trsh = (uint16_t)constrain((int)g_pcm_level_adc * 2 / 3, 4, 3800);
+                            }
                             break;
                         case 4:
                             if (RadioConfig::airplayEnable) {
@@ -1900,35 +1938,26 @@ void core0(void* p) {
                         // 0 — один клик + поворот; 1 — двойной; 2 — тройной (яркость); 3 — четверной (Wi‑Fi / Bluetooth).
                         switch (eb.getClicks()) {
                             case 0:
-                                if (airplay_owns_speaker() || play_mode_is_airplay()) {
-                                    radioState.vol += eb.dir();
-                                    radioState.vol = constrain(radioState.vol, 0, RadioConfig::ampVolumeUiMax);
-                                    if (airplay_owns_speaker()) {
-                                        airplay_encoder_vol_changed();
-                                    }
-                                    Serial.printf("[Vol] %d\n", (int)radioState.vol);
-                                    print_val('v', radioState.vol);
-                                    s_batt_matrix_overlay = false;
-                                    matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
-                                    break;
-                                }
                                 if (strcmp(g_audio_source, "bt") == 0) {
                                     if (eb.dir() > 0) {
                                         bt_audio_avrcp_next();
                                     } else if (eb.dir() < 0) {
                                         bt_audio_avrcp_previous();
                                     }
-                                } else {
-                                    radioState.station += eb.dir();
-                                    station_clamp_index();
-                                    print_val('s', radioState.station);
-                                    Serial.printf("[Radio] pick station %d/%u %s\n", (int)radioState.station,
-                                                  (unsigned)station_total_count(),
-                                                  station_url_by_index(radioState.station));
-                                    s_batt_matrix_overlay = false;
-                                    matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
-                                    station_changed = 1;
+                                    break;
                                 }
+                                radioState.vol += eb.dir();
+                                radioState.vol = constrain(radioState.vol, 0, RadioConfig::ampVolumeUiMax);
+                                if (airplay_owns_speaker()) {
+                                    airplay_encoder_vol_changed();
+                                } else {
+                                    apply_output_volume();
+                                    syncWifiWithAudioSilence();
+                                }
+                                Serial.printf("[Vol] %d\n", (int)radioState.vol);
+                                print_val('v', radioState.vol);
+                                s_batt_matrix_overlay = false;
+                                matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
                                 break;
                             case 1: {
                                 const int8_t d = eb.dir();
