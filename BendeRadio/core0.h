@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include <Audio.h>
+#include <cstring>
 
 #include "RadioConfig.h"
 #include "pcm_analyzer.h"
@@ -50,7 +51,13 @@ void radio_voice_after_speaker();
 
 // Источник звука: "wifi" (интернет-радио / PCM5100) или "bt" (BK8000L через CD4052). NVS "bende"/"aud".
 extern char g_audio_source[8];
+extern char g_play_mode[8];
+inline bool play_mode_is_airplay() {
+    return strcmp(g_play_mode, "ap") == 0;
+}
 // enum + CD4052: AudioMux.h
 // true только после esp_restart() из commitSourceModeSwitch — короткие задержки вместо холодного старта.
 extern bool g_warm_boot_after_mode_switch;
 void commitSourceModeSwitch(const char* new_mode);
+void commitPlayModeSwitch(const char* mode);
+void matrix_show_play_mode();

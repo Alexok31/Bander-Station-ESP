@@ -15,6 +15,7 @@
 #include "BenderAi.h"
 #include "RadioConfig.h"
 #include "core0.h"
+#include "pcm_analyzer.h"
 
 AirPlaySess g_ap;
 WiFiServer g_ap_rtsp(RadioConfig::airplayRtspPort);
@@ -29,6 +30,8 @@ static TaskHandle_t s_rtp_task = nullptr;
 static TaskHandle_t s_play_task = nullptr;
 static TaskHandle_t s_rtsp_task = nullptr;
 static bool s_begun = false;
+static bool s_mdns_host = false;
+static bool s_ap_accept = false;
 
 // 352 семпли ALAC ≈ 8 мс. Велике кільце — iPhone у lock реже Wi‑Fi пачками.
 static constexpr int kApFrameSamp = 352;
@@ -62,7 +65,6 @@ static uint32_t ring_count() {
 static void ring_reset() {
     s_ring_w = 0;
     s_ring_r = 0;
-    s_play_armed = false;
     s_pq_w = 0;
     s_pq_r = 0;
 }
@@ -168,6 +170,9 @@ bool airplay_take_speaker() {
     if (g_ap_owns) {
         return true;
     }
+    if (!airplay_accepts()) {
+        return false;
+    }
     if (bender_ai_owns_speaker()) {
         return false;
     }
@@ -195,16 +200,34 @@ void airplay_release_speaker() {
     airplay_hw_mute(true);
     g_ap_owns = false;
     apply_output_volume();
-    if (radioState.state && strcmp(g_audio_source, "wifi") == 0) {
+    if (radioState.state && strcmp(g_audio_source, "wifi") == 0 && !play_mode_is_airplay()) {
         reconnect = station_url_for_current();
     }
     Serial.println(F("[AirPlay] I2S0 back to radio"));
+}
+
+static void i2s_feed(const uint8_t* p, size_t left) {
+    size_t off = 0;
+    uint8_t spins = 0;
+    while (off < left) {
+        const size_t w = audio.i2sWriteRaw(p + off, left - off, 40);
+        if (!w) {
+            if (++spins > 20) {
+                break;
+            }
+            vTaskDelay(1);
+            continue;
+        }
+        spins = 0;
+        off += w;
+    }
 }
 
 void airplay_write_pcm(int16_t* stereo, int frames) {
     if (!stereo || frames <= 0 || !g_ap_owns) {
         return;
     }
+    pcm_analyzer_on_airplay_pcm16(stereo, (uint16_t)frames);
     float g = g_ap.vol_gain;
     if (g < 0) {
         g = 0;
@@ -225,26 +248,14 @@ void airplay_write_pcm(int16_t* stereo, int frames) {
             stereo[i] = (int16_t)x;
         }
     }
-    const uint8_t* p = reinterpret_cast<const uint8_t*>(stereo);
-    size_t left = (size_t)n * 2;
-    size_t off = 0;
-    uint8_t spins = 0;
-    while (off < left) {
-        const size_t w = audio.i2sWriteRaw(p + off, left - off, 40);
-        if (!w) {
-            if (++spins > 20) {
-                break;
-            }
-            vTaskDelay(1);
-            continue;
-        }
-        spins = 0;
-        off += w;
-    }
+    i2s_feed(reinterpret_cast<const uint8_t*>(stereo), (size_t)n * 2);
 }
 
 void airplay_rtp_flush() {
     ring_reset();
+    pcm_analyzer_reset();
+    airplay_meta_on_flush();
+    g_ap.playing = false;
 }
 
 void airplay_session_clear() {
@@ -255,6 +266,8 @@ void airplay_session_clear() {
     g_ap.enc_touched = false;
     g_ap.phone_vol_seen = false;
     ring_reset();
+    pcm_analyzer_reset();
+    airplay_meta_clear();
     if (g_ap.alac) {
         alac_free(g_ap.alac);
         g_ap.alac = nullptr;
@@ -320,6 +333,7 @@ static void play_rtp_audio(uint8_t* pkt, int n, uint8_t* dec, int16_t* pcm) {
     if (outn >= 4) {
         g_ap.last_rtp_ms = millis();
         g_ap.playing = true;
+        airplay_meta_on_play();
         ring_push(pcm, outn / 4);
     }
 }
@@ -332,28 +346,27 @@ static void play_task(void*) {
         return;
     }
     while (true) {
-        if (!g_ap.session || !g_ap_owns) {
+        if (!g_ap_owns) {
             s_play_armed = false;
             vTaskDelay(50);
             continue;
         }
-        if (!s_play_armed) {
+        if (g_ap.session && !s_play_armed) {
             if (ring_count() < (uint32_t)kApPrebuf) {
-                vTaskDelay(1);
+                memset(pcm, 0, (size_t)kApFrameBytes);
+                i2s_feed(reinterpret_cast<const uint8_t*>(pcm), (size_t)kApFrameBytes);
                 continue;
             }
             airplay_hw_mute(false);
             s_play_armed = true;
         }
-        if (ring_pop(pcm)) {
+        if (g_ap.session && ring_pop(pcm)) {
             airplay_write_pcm(pcm, kApFrameSamp);
-            if (ring_count() < (uint32_t)(kApPrebuf / 2)) {
-                vTaskDelay(1);
-            }
             continue;
         }
         ++s_under_n;
-        vTaskDelay(1);
+        memset(pcm, 0, (size_t)kApFrameBytes);
+        i2s_feed(reinterpret_cast<const uint8_t*>(pcm), (size_t)kApFrameBytes);
     }
 }
 
@@ -449,6 +462,7 @@ void airplay_rtp_start() {
         Serial.printf("[AirPlay] UDP q %u pkts\n", (unsigned)kPktQ);
     }
     ring_reset();
+    s_play_armed = false;
     audio_pcb_open();
     g_ap_ctrl.begin(g_ap.ctrl_port);
     g_ap_time.begin(g_ap.time_port);
@@ -461,20 +475,25 @@ void airplay_rtp_start() {
 }
 
 void airplay_rtp_stop() {
+    s_play_armed = false;
     ring_reset();
+    pcm_analyzer_reset();
     audio_pcb_close();
     g_ap_ctrl.stop();
     g_ap_time.stop();
 }
 
 static bool advertise() {
-    if (g_ap.advertised || WiFi.status() != WL_CONNECTED) {
+    if (g_ap.advertised || !s_ap_accept || WiFi.status() != WL_CONNECTED) {
         return g_ap.advertised;
     }
     WiFi.macAddress(g_ap_mac);
-    if (!MDNS.begin(RadioConfig::airplayName)) {
-        Serial.println(F("[AirPlay] MDNS.begin fail"));
-        return false;
+    if (!s_mdns_host) {
+        if (!MDNS.begin(RadioConfig::airplayName)) {
+            Serial.println(F("[AirPlay] MDNS.begin fail"));
+            return false;
+        }
+        s_mdns_host = true;
     }
     char inst[48];
     snprintf(inst, sizeof(inst), "%02X%02X%02X%02X%02X%02X@%s", g_ap_mac[0], g_ap_mac[1],
@@ -491,7 +510,7 @@ static bool advertise() {
         {"pw", "false"},
         {"vn", "3"},
         {"tp", "UDP"},
-        {"md", "0"},
+        {"md", "0,1,2"},
         {"vs", "105.1"},
         {"am", "AirPort4,107"},
         {"ek", "1"},
@@ -507,6 +526,15 @@ static bool advertise() {
     return true;
 }
 
+static void unadvertise() {
+    if (!g_ap.advertised) {
+        return;
+    }
+    mdns_service_remove("_raop", "_tcp");
+    g_ap.advertised = false;
+    Serial.println(F("[AirPlay] mDNS off"));
+}
+
 static void mdns_refresh() {
     esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (netif) {
@@ -518,7 +546,7 @@ static void rtsp_task(void*) {
     uint32_t last_mdns = 0;
     while (true) {
         if (g_ap.ready) {
-            if (!g_ap.advertised) {
+            if (s_ap_accept && !g_ap.advertised) {
                 advertise();
             }
             airplay_rtsp_poll();
@@ -527,6 +555,7 @@ static void rtsp_task(void*) {
                 last_mdns = millis();
                 mdns_refresh();
                 mdns_service_txt_item_set("_raop", "_tcp", "vs", "105.1");
+                mdns_service_txt_item_set("_raop", "_tcp", "md", "0,1,2");
             }
         }
         vTaskDelay(g_ap.session ? 3 : 40);
@@ -559,6 +588,18 @@ void airplay_interrupt() {
     airplay_release_speaker();
 }
 
+bool airplay_accepts() {
+    return s_ap_accept && RadioConfig::airplayEnable;
+}
+
+void airplay_set_accept(bool on) {
+    s_ap_accept = on && RadioConfig::airplayEnable;
+    if (!s_ap_accept) {
+        airplay_interrupt();
+        unadvertise();
+    }
+}
+
 bool airplay_owns_speaker() {
     return g_ap_owns;
 }
@@ -567,17 +608,65 @@ bool airplay_playing() {
     return g_ap.playing && g_ap_owns;
 }
 
+static int airplay_vmax() {
+    return RadioConfig::ampVolumeUiMax > 0 ? RadioConfig::ampVolumeUiMax : 21;
+}
+
+int airplay_db_to_ui(float db) {
+    const int vmax = airplay_vmax();
+    if (db <= -144.0f) {
+        return 0;
+    }
+    if (db >= 0.0f) {
+        return vmax;
+    }
+    const float t = (db + 30.0f) / 30.0f;
+    int v = (int)(t * (float)vmax + 0.5f);
+    if (v < 0) {
+        v = 0;
+    }
+    if (v > vmax) {
+        v = vmax;
+    }
+    return v;
+}
+
+float airplay_ui_to_db(int vol) {
+    const int vmax = airplay_vmax();
+    if (vol <= 0) {
+        return -144.0f;
+    }
+    if (vol >= vmax) {
+        return 0.0f;
+    }
+    return -30.0f + 30.0f * ((float)vol / (float)vmax);
+}
+
+float airplay_db_to_gain(float db) {
+    if (db <= -144.0f) {
+        return 0.0f;
+    }
+    float g = powf(10.0f, db / 20.0f);
+    if (g < 0.02f) {
+        g = 0.02f;
+    }
+    if (g > 1.0f) {
+        g = 1.0f;
+    }
+    return g;
+}
+
 void airplay_encoder_vol_changed() {
     g_ap.enc_touched = true;
-    const int vmax = RadioConfig::ampVolumeUiMax > 0 ? RadioConfig::ampVolumeUiMax : 21;
     int vol = radioState.vol;
+    const int vmax = airplay_vmax();
     if (vol < 0) {
         vol = 0;
     }
     if (vol > vmax) {
         vol = vmax;
     }
-    g_ap.vol_gain = vol <= 0 ? 0.0f : (float)vol / (float)vmax;
-    const float db = g_ap.vol_gain <= 0.0001f ? -144.0f : 20.0f * log10f(g_ap.vol_gain);
+    const float db = airplay_ui_to_db(vol);
+    g_ap.vol_gain = airplay_db_to_gain(db);
     airplay_dacp_request(db);
 }

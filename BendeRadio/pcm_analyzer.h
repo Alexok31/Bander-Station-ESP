@@ -21,3 +21,6 @@ void pcm_analyzer_on_bt_pcm_bytes(const uint8_t* pcm_bytes, uint32_t len_bytes);
 
 // Моно s16 PCM відповіді Бендера (рот/EQ без стріму радіо).
 void pcm_analyzer_on_bender_pcm16(const int16_t* samples, uint16_t n_samples);
+
+// Стерео s16 кадри AirPlay (рот/EQ, радіо може бути вимкнене).
+void pcm_analyzer_on_airplay_pcm16(const int16_t* stereo, uint16_t n_frames);

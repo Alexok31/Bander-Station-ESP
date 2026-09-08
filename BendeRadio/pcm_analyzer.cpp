@@ -316,3 +316,10 @@ void pcm_analyzer_on_bender_pcm16(const int16_t* samples, uint16_t n_samples) {
     }
     pcm_analyzer_feed_impl(samples, n_samples, 1, 1, 100u, RadioConfig::pcmBenderSilenceAbs, true);
 }
+
+void pcm_analyzer_on_airplay_pcm16(const int16_t* stereo, uint16_t n_frames) {
+    if (!stereo || n_frames == 0) {
+        return;
+    }
+    pcm_analyzer_feed_impl(stereo, n_frames, 2, 1, 100u, RadioConfig::pcmSilenceAbs);
+}

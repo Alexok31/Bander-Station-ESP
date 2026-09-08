@@ -1215,9 +1215,7 @@ void bender_ai_ptt_arm() {
     if (s_demo || convState == ST_WAIT_RESP || waitingACK || responsePending || convState == ST_RECORDING) {
         return;
     }
-    if (airplay_owns_speaker()) {
-        airplay_interrupt();
-    }
+    // Не рвати AirPlay на press: 1/2/3 кліки — пауза/трек, PTT підтверджується hold.
     bender_ai_wake();
     s_need_mic_clear = false;
     s_ptt_armed = true;
@@ -1234,22 +1232,6 @@ void bender_ai_ptt_cancel() {
     }
     s_ptt_armed = false;
     resetRecStats();
-}
-
-void bender_ai_mic_demo() {
-    if (s_demo || !s_demo_pcm || convState != ST_IDLE || pttHeld || s_ptt_armed || waitingACK ||
-        responsePending || speaking) {
-        ALOGLN(F("[MIC] demo busy"));
-        return;
-    }
-    s_resume_radio = radioState.state && strcmp(g_audio_source, "wifi") == 0;
-    bender_ai_wake();
-    if (!takeSpeaker()) {
-        ALOGLN(F("[MIC] demo no speaker"));
-        return;
-    }
-    s_demo = 1;
-    ALOGLN(F("[MIC] demo start"));
 }
 
 void bender_ai_yield_radio() {
@@ -1283,6 +1265,9 @@ void bender_ai_ptt_down() {
         forceRecover("ptt barge");
     }
     s_resume_radio = radioState.state && strcmp(g_audio_source, "wifi") == 0;
+    if (airplay_owns_speaker()) {
+        airplay_interrupt();
+    }
     if (!takeSpeaker()) {
         ALOGLN(F("[PTT] no speaker — TTS mute"));
     }
@@ -1371,5 +1356,5 @@ void bender_ai_begin() {
     xTaskCreatePinnedToCore(speakerTask, "ai_spk", 4096, nullptr, 2, nullptr, 1);
     xTaskCreatePinnedToCore(wsTask, "ai_ws", 16384, nullptr, 5, nullptr, 1);
     s_started = true;
-    ALOGLN(F("[AI] PTT hold=talk  2 clicks=mic demo  7=sleep  8=restart"));
+    ALOGLN(F("[AI] PTT hold=talk  7=sleep  8=restart"));
 }

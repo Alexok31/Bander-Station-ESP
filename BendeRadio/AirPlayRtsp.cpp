@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <esp_netif.h>
 #include <mdns.h>
@@ -28,6 +29,409 @@ static volatile float s_dacp_db = 0;
 static uint32_t s_dacp_quiet_ms = 0;
 static uint32_t s_enc_guard_ms = 0;
 static float s_enc_db = 0;
+static char s_dacp_cmd[40] = "";
+static volatile bool s_dacp_cmd_pend = false;
+
+static char s_title[64] = "";
+static char s_artist[48] = "";
+static volatile uint32_t s_meta_serial = 1;
+static volatile uint32_t s_dur_ms = 0;
+static volatile uint32_t s_anchor_pos_ms = 0;
+static volatile uint32_t s_anchor_wall_ms = 0;
+static volatile bool s_clock_run = false;
+static uint32_t s_rtp_start = 0;
+static uint32_t s_rtp_end = 0;
+static bool s_rtp_span = false;
+static bool s_have_npt = false;
+static uint32_t s_npt_ms = 0;
+static bool s_have_ts = false;
+static uint32_t s_last_ts = 0;
+static uint32_t s_walk_cant = 0;
+static bool s_walk_got_cant = false;
+static uint8_t s_walk_caps = 0;
+static bool s_walk_got_caps = false;
+static volatile bool s_dacp_time_pend = false;
+static uint32_t s_dacp_time_ms = 0;
+static volatile bool s_seek_hold = false;
+
+static uint32_t be32u(const uint8_t* p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static uint32_t be_u32(const uint8_t* p, size_t n) {
+    if (!p || n == 0) {
+        return 0;
+    }
+    if (n > 8) {
+        n = 8;
+    }
+    uint64_t v = 0;
+    for (size_t i = 0; i < n; i++) {
+        v = (v << 8) | p[i];
+    }
+    if (v > 0xFFFFFFFFull) {
+        v = 0xFFFFFFFFull;
+    }
+    return (uint32_t)v;
+}
+
+static void copy_txt(char* dst, size_t dstn, const uint8_t* s, size_t n) {
+    size_t j = 0;
+    for (size_t i = 0; i < n && j + 1 < dstn; i++) {
+        const uint8_t c = s[i];
+        if (c < 32) {
+            if ((c == '\t' || c == '\n' || c == '\r') && j && dst[j - 1] != ' ') {
+                dst[j++] = ' ';
+            }
+            continue;
+        }
+        dst[j++] = (char)c;
+    }
+    while (j && dst[j - 1] == ' ') {
+        --j;
+    }
+    dst[j] = 0;
+}
+
+static bool tag_eq(const uint8_t* p, const char* t) {
+    return p[0] == (uint8_t)t[0] && p[1] == (uint8_t)t[1] && p[2] == (uint8_t)t[2] &&
+           p[3] == (uint8_t)t[3];
+}
+
+static void snap_pos_ms(uint32_t pos, uint32_t dur);
+
+static void apply_walk_times() {
+    if (s_walk_got_cant && s_dur_ms > 1u) {
+        uint32_t pos = 0;
+        if (s_walk_cant < s_dur_ms) {
+            pos = s_dur_ms - s_walk_cant;
+        }
+        snap_pos_ms(pos, s_dur_ms);
+        s_seek_hold = false;
+        if (s_walk_got_caps && (s_walk_caps == 3u || s_walk_caps == 2u)) {
+            s_clock_run = false;
+        } else {
+            s_clock_run = true;
+        }
+    }
+}
+
+static void dmap_walk_reset_times() {
+    s_walk_cant = 0;
+    s_walk_got_cant = false;
+    s_walk_caps = 0;
+    s_walk_got_caps = false;
+}
+
+static bool fourcc_ok(const uint8_t* p) {
+    for (int i = 0; i < 4; i++) {
+        const char c = (char)p[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void dmap_walk(const uint8_t* p, size_t n, int depth) {
+    if (!p || depth > 8) {
+        return;
+    }
+    size_t i = 0;
+    while (i + 8 <= n) {
+        const uint8_t* tag = p + i;
+        const uint32_t len = be32u(p + i + 4);
+        i += 8;
+        if (len > n - i) {
+            break;
+        }
+        const uint8_t* d = p + i;
+        if (tag_eq(tag, "minm")) {
+            copy_txt(s_title, sizeof(s_title), d, len);
+        } else if (tag_eq(tag, "asar")) {
+            copy_txt(s_artist, sizeof(s_artist), d, len);
+        } else if (tag_eq(tag, "cann")) {
+            copy_txt(s_title, sizeof(s_title), d, len);
+        } else if (tag_eq(tag, "cana")) {
+            copy_txt(s_artist, sizeof(s_artist), d, len);
+        } else if (tag_eq(tag, "astm") && len > 0) {
+            const uint32_t ms = be_u32(d, len);
+            if (ms > 1u) {
+                s_dur_ms = ms;
+            }
+        } else if (tag_eq(tag, "cast") && len > 0) {
+            const uint32_t ms = be_u32(d, len);
+            if (ms > 1u) {
+                s_dur_ms = ms;
+            }
+        } else if (tag_eq(tag, "cant") && len > 0) {
+            s_walk_cant = be_u32(d, len);
+            s_walk_got_cant = true;
+        } else if (tag_eq(tag, "caps") && len > 0) {
+            s_walk_caps = (uint8_t)be_u32(d, len);
+            s_walk_got_caps = true;
+        } else if (len >= 8 && fourcc_ok(d)) {
+            dmap_walk(d, len, depth + 1);
+        }
+        i += len;
+    }
+}
+
+static uint32_t rtp_to_ms(uint32_t samples) {
+    uint32_t sr = (uint32_t)g_ap.fmtp[11];
+    if (sr < 8000u) {
+        sr = 44100u;
+    }
+    return (uint32_t)((uint64_t)samples * 1000ull / (uint64_t)sr);
+}
+
+static uint32_t ms_to_rtp(uint32_t ms) {
+    uint32_t sr = (uint32_t)g_ap.fmtp[11];
+    if (sr < 8000u) {
+        sr = 44100u;
+    }
+    return (uint32_t)((uint64_t)ms * (uint64_t)sr / 1000ull);
+}
+
+static void snap_pos_ms(uint32_t pos, uint32_t dur) {
+    if (dur > 1u && pos >= dur) {
+        pos = dur - 1u;
+    }
+    if (dur > 1u) {
+        s_dur_ms = dur;
+    }
+    s_anchor_pos_ms = pos;
+    s_anchor_wall_ms = millis();
+}
+
+static void ensure_span_from_ts(uint32_t ts) {
+    if (s_rtp_span) {
+        return;
+    }
+    const uint32_t pos_samp = s_have_npt ? ms_to_rtp(s_npt_ms) : 0u;
+    s_rtp_start = ts - pos_samp;
+    s_have_ts = true;
+    s_last_ts = ts;
+    if (s_dur_ms > 1u) {
+        s_rtp_end = s_rtp_start + ms_to_rtp(s_dur_ms);
+        s_rtp_span = true;
+    }
+}
+
+static void snap_from_rtp(uint32_t rtp) {
+    ensure_span_from_ts(rtp);
+    const uint32_t dur =
+        s_rtp_span ? rtp_to_ms(s_rtp_end - s_rtp_start) : (s_dur_ms > 1u ? s_dur_ms : 0u);
+    const uint32_t pos = rtp_to_ms(rtp - s_rtp_start);
+    snap_pos_ms(pos, dur);
+}
+
+static void apply_progress_rtp(uint32_t start, uint32_t curr, uint32_t end) {
+    s_rtp_start = start;
+    s_rtp_end = end;
+    s_rtp_span = true;
+    s_have_ts = true;
+    s_last_ts = curr;
+    snap_from_rtp(curr);
+    Serial.printf("[AirPlay] progress %u/%u ms\n", (unsigned)s_anchor_pos_ms, (unsigned)s_dur_ms);
+}
+
+static void handle_progress_body(const char* body) {
+    const char* p = strcasestr(body ? body : "", "progress:");
+    if (!p) {
+        p = strstr(body ? body : "", "progress");
+        if (p) {
+            p = strchr(p, ':');
+        }
+    }
+    if (!p) {
+        p = body;
+    }
+    if (*p == ':') {
+        ++p;
+    } else if (strncasecmp(p, "progress", 8) == 0) {
+        p += 8;
+        if (*p == ':') {
+            ++p;
+        }
+    }
+    while (*p == ' ' || *p == '\t') {
+        ++p;
+    }
+    unsigned long start = 0, curr = 0, end = 0;
+    if (sscanf(p, "%lu/%lu/%lu", &start, &curr, &end) != 3) {
+        return;
+    }
+    apply_progress_rtp((uint32_t)start, (uint32_t)curr, (uint32_t)end);
+}
+
+void airplay_meta_clear() {
+    s_title[0] = 0;
+    s_artist[0] = 0;
+    s_dur_ms = 0;
+    s_anchor_pos_ms = 0;
+    s_anchor_wall_ms = millis();
+    s_clock_run = false;
+    s_rtp_start = 0;
+    s_rtp_end = 0;
+    s_rtp_span = false;
+    s_have_npt = false;
+    s_npt_ms = 0;
+    s_have_ts = false;
+    s_last_ts = 0;
+    s_meta_serial++;
+}
+
+void airplay_meta_on_flush() {
+    if (s_clock_run) {
+        const uint32_t dur = s_dur_ms;
+        uint64_t pos = (uint64_t)s_anchor_pos_ms + (uint64_t)(millis() - s_anchor_wall_ms);
+        if (dur > 1u && pos >= dur) {
+            pos = dur - 1u;
+        }
+        s_anchor_pos_ms = (uint32_t)pos;
+        s_anchor_wall_ms = millis();
+    }
+    s_clock_run = false;
+    s_seek_hold = true;
+    s_dacp_time_pend = true;
+}
+
+void airplay_meta_on_play() {
+    if (s_seek_hold) {
+        return;
+    }
+    if (!s_clock_run) {
+        s_anchor_wall_ms = millis();
+    }
+    s_clock_run = true;
+}
+
+void airplay_meta_seek_rtp(uint32_t rtptime) {
+    snap_from_rtp(rtptime);
+    s_clock_run = false;
+}
+
+void airplay_meta_on_rtp(uint32_t) {
+    // RTP clock is not track position (seek does not jump timestamps).
+}
+
+void airplay_meta_set_npt_ms(uint32_t npt_ms) {
+    s_npt_ms = npt_ms;
+    s_have_npt = true;
+    snap_pos_ms(npt_ms, s_dur_ms);
+}
+
+uint32_t airplay_track_duration_ms() {
+    return s_dur_ms;
+}
+
+uint32_t airplay_track_position_ms() {
+    const uint32_t dur = s_dur_ms;
+    if (dur <= 1u) {
+        return 0;
+    }
+    uint64_t pos = s_anchor_pos_ms;
+    if (s_clock_run) {
+        pos += (uint64_t)(millis() - s_anchor_wall_ms);
+    }
+    if (pos >= dur) {
+        return dur - 1u;
+    }
+    return (uint32_t)pos;
+}
+
+uint32_t airplay_track_meta_serial() {
+    return s_meta_serial;
+}
+
+static void utf8_to_matrix(const char* in, char* out, size_t outn) {
+    if (!out || outn == 0) {
+        return;
+    }
+    out[0] = 0;
+    if (!in) {
+        return;
+    }
+    size_t j = 0;
+    auto put = [&](const char* s) {
+        while (*s && j + 1 < outn) {
+            out[j++] = *s++;
+        }
+    };
+    for (size_t i = 0; in[i] && j + 1 < outn;) {
+        const uint8_t c = (uint8_t)in[i];
+        if (c < 0x80) {
+            out[j++] = (char)c;
+            i++;
+            continue;
+        }
+        if ((c & 0xE0) == 0xC0 && in[i + 1]) {
+            const uint16_t u = (uint16_t)(((c & 0x1F) << 6) | ((uint8_t)in[i + 1] & 0x3F));
+            i += 2;
+            switch (u) {
+                case 0x401:
+                case 0x451:
+                    put("E");
+                    break;
+                case 0x404:
+                case 0x454:
+                    put("Ye");
+                    break;
+                case 0x406:
+                case 0x456:
+                    put("I");
+                    break;
+                case 0x407:
+                case 0x457:
+                    put("Yi");
+                    break;
+                case 0x490:
+                case 0x491:
+                    put("G");
+                    break;
+                default: {
+                    uint16_t base = u;
+                    if (base >= 0x430 && base <= 0x44F) {
+                        base = (uint16_t)(base - 0x20);
+                    }
+                    static const char* const ru[] = {"A",  "B", "V", "G", "D", "E", "Zh", "Z",
+                                                     "I",  "Y", "K", "L", "M", "N", "O",  "P",
+                                                     "R",  "S", "T", "U", "F", "H", "Ts", "Ch",
+                                                     "Sh", "Sch", "", "Y", "", "E", "Yu", "Ya"};
+                    if (base >= 0x410 && base <= 0x42F) {
+                        put(ru[base - 0x410]);
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+        i++;
+    }
+    out[j] = 0;
+}
+
+const char* airplay_track_scroll_cstr() {
+    if (!s_title[0] && !s_artist[0]) {
+        return "AIR";
+    }
+    static char raw[sizeof(s_title) + sizeof(s_artist) + 8];
+    static char line[96];
+    if (!s_artist[0]) {
+        strncpy(raw, s_title, sizeof(raw) - 1);
+    } else if (!s_title[0]) {
+        strncpy(raw, s_artist, sizeof(raw) - 1);
+    } else {
+        snprintf(raw, sizeof(raw), "%s  |  %s", s_title, s_artist);
+    }
+    raw[sizeof(raw) - 1] = 0;
+    utf8_to_matrix(raw, line, sizeof(line));
+    if (!line[0]) {
+        return raw;
+    }
+    return line;
+}
 
 void airplay_rtsp_hangup() {
     for (int i = 0; i < kRtspClients; i++) {
@@ -44,6 +448,8 @@ void airplay_rtsp_hangup() {
     s_active_remote[0] = 0;
     s_dacp_port = 0;
     s_dacp_pending = false;
+    s_dacp_cmd_pend = false;
+    s_dacp_time_pend = false;
     s_enc_guard_ms = 0;
 }
 
@@ -131,10 +537,16 @@ static bool sdp_copy(const char* body, const char* key, char* out, size_t outn) 
     return i > 0;
 }
 
-static void reply(int cseq, const char* extra, const char* body = "") {
+static void reply(int cseq, const char* extra, const char* body = "", int code = 200) {
     WiFiClient& c = s_cli[s_rep];
     if (!c) {
         return;
+    }
+    const char* reason = "OK";
+    if (code == 453) {
+        reason = "Not Enough Bandwidth";
+    } else if (code != 200) {
+        reason = "Forbidden";
     }
     char apple[400] = "";
     const char* ch = hdr_find(s_acc[s_rep], "Apple-Challenge");
@@ -154,7 +566,7 @@ static void reply(int cseq, const char* extra, const char* body = "") {
         snprintf(sess, sizeof(sess), "Session: %s;timeout=7200\r\n", s_sess_id);
     }
     c.printf(
-        "RTSP/1.0 200 OK\r\n"
+        "RTSP/1.0 %d %s\r\n"
         "Server: AirTunes/105.1\r\n"
         "CSeq: %d\r\n"
         "%s"
@@ -163,7 +575,7 @@ static void reply(int cseq, const char* extra, const char* body = "") {
         "Content-Length: %d\r\n"
         "\r\n"
         "%s",
-        cseq, apple, sess, extra ? extra : "", blen, body ? body : "");
+        code, reason, cseq, apple, sess, extra ? extra : "", blen, body ? body : "");
 }
 
 static void handle_announce(const char* body) {
@@ -229,6 +641,11 @@ static void handle_announce(const char* body) {
 }
 
 static void handle_setup(const char* req) {
+    if (!airplay_accepts()) {
+        reply(hdr_int(req, "CSeq"), "", "", 453);
+        Serial.println(F("[AirPlay] SETUP refused (radio mode)"));
+        return;
+    }
     char tr[192];
     hdr_copy_line(hdr_find(req, "Transport"), tr, sizeof(tr));
     int cport = 0, tport = 0;
@@ -243,7 +660,9 @@ static void handle_setup(const char* req) {
     (void)cport;
     (void)tport;
     if (!airplay_take_speaker()) {
+        reply(hdr_int(req, "CSeq"), "", "", 453);
         Serial.println(F("[AirPlay] SETUP: speaker busy"));
+        return;
     }
     airplay_rtp_start();
     g_ap.session = true;
@@ -313,7 +732,10 @@ static bool dacp_resolve() {
     return s_dacp_port != 0;
 }
 
-static void dacp_send_volume(float db) {
+static void dacp_send_cmd(const char* cmd) {
+    if (!cmd || !cmd[0]) {
+        return;
+    }
     if (!s_active_remote[0]) {
         Serial.println(F("[AirPlay] DACP: no Active-Remote"));
         return;
@@ -333,11 +755,11 @@ static void dacp_send_volume(float db) {
         s_dacp_port = 0;
         return;
     }
-    c.printf("GET /ctrl-int/1/setproperty?dmcp.device-volume=%.6f HTTP/1.1\r\n"
+    c.printf("GET /ctrl-int/1/%s HTTP/1.1\r\n"
              "Host: %s:%u\r\n"
              "Active-Remote: %s\r\n"
              "\r\n",
-             db, s_dacp_ip.toString().c_str(), (unsigned)s_dacp_port, s_active_remote);
+             cmd, s_dacp_ip.toString().c_str(), (unsigned)s_dacp_port, s_active_remote);
     const uint32_t t0 = millis();
     while (c.connected() && (uint32_t)(millis() - t0) < 200u) {
         if (c.available()) {
@@ -351,6 +773,111 @@ static void dacp_send_volume(float db) {
     c.stop();
 }
 
+static bool dacp_http_get(const char* path, uint8_t* out, size_t outmax, size_t* outn) {
+    if (outn) {
+        *outn = 0;
+    }
+    if (!path || !out || outmax < 16) {
+        return false;
+    }
+    if (!s_active_remote[0]) {
+        return false;
+    }
+    if (!dacp_resolve() && s_dacp_port == 0) {
+        s_dacp_port = 3689;
+    }
+    if (!s_dacp_ip) {
+        return false;
+    }
+    WiFiClient c;
+    c.setTimeout(180);
+    if (!c.connect(s_dacp_ip, s_dacp_port, 180)) {
+        s_dacp_port = 0;
+        return false;
+    }
+    c.printf("GET /ctrl-int/1/%s HTTP/1.1\r\n"
+             "Host: %s:%u\r\n"
+             "Active-Remote: %s\r\n"
+             "\r\n",
+             path, s_dacp_ip.toString().c_str(), (unsigned)s_dacp_port, s_active_remote);
+    uint8_t buf[1400];
+    size_t n = 0;
+    const uint32_t t0 = millis();
+    while ((uint32_t)(millis() - t0) < 250u && n + 1 < sizeof(buf)) {
+        while (c.available() && n + 1 < sizeof(buf)) {
+            buf[n++] = (uint8_t)c.read();
+        }
+        buf[n] = 0;
+        if (n >= 16) {
+            char* blank = strstr(reinterpret_cast<char*>(buf), "\r\n\r\n");
+            if (blank) {
+                const size_t header_n = (size_t)(blank + 4 - reinterpret_cast<char*>(buf));
+                int clen = 0;
+                const char* cl = strcasestr(reinterpret_cast<char*>(buf), "Content-Length:");
+                if (cl && cl < blank) {
+                    clen = atoi(cl + 15);
+                }
+                if (clen < 0) {
+                    clen = 0;
+                }
+                const size_t need = header_n + (size_t)clen;
+                if (clen == 0 && n > header_n) {
+                    break;
+                }
+                if (n >= need && need > header_n) {
+                    n = need;
+                    break;
+                }
+            }
+        }
+        delay(1);
+    }
+    c.stop();
+    char* blank = strstr(reinterpret_cast<char*>(buf), "\r\n\r\n");
+    if (!blank || n < 16) {
+        return false;
+    }
+    const size_t header_n = (size_t)(blank + 4 - reinterpret_cast<char*>(buf));
+    if (header_n >= n) {
+        return false;
+    }
+    const size_t body_n = n - header_n;
+    const size_t copy = body_n < outmax ? body_n : outmax;
+    memcpy(out, buf + header_n, copy);
+    if (outn) {
+        *outn = copy;
+    }
+    return copy > 8;
+}
+
+static void dacp_fetch_playing_time() {
+    uint8_t body[1024];
+    size_t n = 0;
+    if (!dacp_http_get("playstatusupdate?revision-number=1", body, sizeof(body), &n)) {
+        if (!dacp_http_get("getproperty?properties=dacp.playingtime", body, sizeof(body), &n)) {
+            static uint32_t s_fail_ms = 0;
+            if (!s_fail_ms || (uint32_t)(millis() - s_fail_ms) > 8000u) {
+                s_fail_ms = millis();
+                Serial.println(F("[AirPlay] DACP time fail"));
+            }
+            return;
+        }
+    }
+    const uint32_t old_pos = s_anchor_pos_ms;
+    dmap_walk_reset_times();
+    dmap_walk(body, n, 0);
+    apply_walk_times();
+    if (s_walk_got_cant && s_dur_ms > 1u && s_anchor_pos_ms != old_pos) {
+        Serial.printf("[AirPlay] dacp time %u/%u\n", (unsigned)s_anchor_pos_ms, (unsigned)s_dur_ms);
+    }
+}
+
+static void dacp_send_volume(float db) {
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "setproperty?dmcp.device-volume=%.6f", db);
+    dacp_send_cmd(cmd);
+}
+
 void airplay_dacp_request(float db) {
     s_dacp_db = db;
     s_enc_db = db;
@@ -359,15 +886,66 @@ void airplay_dacp_request(float db) {
     s_dacp_pending = true;
 }
 
+void airplay_dacp_command(const char* cmd) {
+    if (!cmd || !cmd[0]) {
+        return;
+    }
+    if (!s_active_remote[0]) {
+        Serial.println(F("[AirPlay] DACP: no Active-Remote"));
+        return;
+    }
+    strncpy(s_dacp_cmd, cmd, sizeof(s_dacp_cmd) - 1);
+    s_dacp_cmd[sizeof(s_dacp_cmd) - 1] = 0;
+    s_dacp_cmd_pend = true;
+    Serial.printf("[AirPlay] DACP %s\n", s_dacp_cmd);
+}
+
 void airplay_dacp_poll() {
-    if (!s_dacp_pending || !g_ap.session) {
+    if (!s_active_remote[0]) {
         return;
     }
-    if ((uint32_t)(millis() - s_dacp_quiet_ms) < 90u) {
+    if (s_dacp_pending) {
+        if ((uint32_t)(millis() - s_dacp_quiet_ms) < 90u) {
+            return;
+        }
+        s_dacp_pending = false;
+        dacp_send_volume(s_dacp_db);
         return;
     }
-    s_dacp_pending = false;
-    dacp_send_volume(s_dacp_db);
+    if (s_dacp_cmd_pend) {
+        s_dacp_cmd_pend = false;
+        dacp_send_cmd(s_dacp_cmd);
+        return;
+    }
+    const bool due = s_dacp_time_pend ||
+                     ((g_ap.session || g_ap_owns) && (uint32_t)(millis() - s_dacp_time_ms) >= 700u);
+    if (due) {
+        s_dacp_time_pend = false;
+        s_dacp_time_ms = millis();
+        dacp_fetch_playing_time();
+    }
+}
+
+static void handle_dmap(const uint8_t* body, size_t n) {
+    char old_t[sizeof(s_title)];
+    char old_a[sizeof(s_artist)];
+    const uint32_t old_dur = s_dur_ms;
+    strncpy(old_t, s_title, sizeof(old_t) - 1);
+    old_t[sizeof(old_t) - 1] = 0;
+    strncpy(old_a, s_artist, sizeof(old_a) - 1);
+    old_a[sizeof(old_a) - 1] = 0;
+    dmap_walk_reset_times();
+    dmap_walk(body, n, 0);
+    apply_walk_times();
+    if (strcmp(old_t, s_title) != 0 || strcmp(old_a, s_artist) != 0) {
+        s_meta_serial++;
+        Serial.printf("[AirPlay] track \"%s\" — %s\n", s_title[0] ? s_title : "-",
+                      s_artist[0] ? s_artist : "-");
+    }
+    if (s_dur_ms != old_dur && s_dur_ms > 1u) {
+        Serial.printf("[AirPlay] duration %u ms pos %u\n", (unsigned)s_dur_ms,
+                      (unsigned)s_anchor_pos_ms);
+    }
 }
 
 static void apply_volume_db(float db) {
@@ -389,16 +967,8 @@ static void apply_volume_db(float db) {
         return;
     }
     g_ap.phone_vol_seen = true;
-    float g = powf(10.0f, db / 20.0f);
-    if (g < 0.02f) {
-        g = 0.02f;
-    }
-    if (g > 1.0f) {
-        g = 1.0f;
-    }
-    g_ap.vol_gain = g;
-    const int vmax = RadioConfig::ampVolumeUiMax > 0 ? RadioConfig::ampVolumeUiMax : 21;
-    const int8_t nv = (int8_t)constrain((int)(g * (float)vmax + 0.5f), 0, vmax);
+    g_ap.vol_gain = airplay_db_to_gain(db);
+    const int8_t nv = (int8_t)airplay_db_to_ui(db);
     if (nv != radioState.vol) {
         radioState.vol = nv;
         matrix_show_volume(nv);
@@ -459,6 +1029,52 @@ static void handle_volume(const char* body, size_t body_n, const char* req) {
     apply_volume_db(db);
 }
 
+static void scan_progress_bytes(const char* body, size_t n) {
+    if (!body || n < 12) {
+        return;
+    }
+    for (size_t i = 0; i + 12 < n; i++) {
+        if (strncasecmp(body + i, "progress", 8) != 0) {
+            continue;
+        }
+        const char* p = body + i + 8;
+        const char* end = body + n;
+        if (p < end && *p == ':') {
+            ++p;
+        }
+        while (p < end && (*p == ' ' || *p == '\t' || *p == 0)) {
+            ++p;
+        }
+        char tmp[72];
+        size_t k = 0;
+        while (p < end && k + 1 < sizeof(tmp) && *p != '\r' && *p != '\n' && *p != 0) {
+            tmp[k++] = *p++;
+        }
+        tmp[k] = 0;
+        handle_progress_body(tmp[0] ? tmp : body + i);
+        return;
+    }
+}
+
+static void handle_set_parameter(const char* body, size_t body_n, const char* req) {
+    char ct[56] = "";
+    hdr_copy_line(hdr_find(req, "Content-Type"), ct, sizeof(ct));
+    if (strcasestr(ct, "image/")) {
+        return;
+    }
+    if (body && body_n && !s_body_truncated) {
+        scan_progress_bytes(body, body_n);
+        if (strcasestr(ct, "dmap") || strcasestr(ct, "daap")) {
+            handle_dmap(reinterpret_cast<const uint8_t*>(body), body_n);
+            return;
+        }
+        if (strcasestr(body, "volume:") ||
+            (body_n >= 8 && memcmp(body, "bplist00", 8) == 0)) {
+            handle_volume(body, body_n, req);
+        }
+    }
+}
+
 static void dispatch(char* req, size_t len) {
     char* blank = strstr(req, "\r\n\r\n");
     const char* body = blank ? blank + 4 : "";
@@ -483,25 +1099,40 @@ static void dispatch(char* req, size_t len) {
         g_ap.playing = true;
         g_ap.last_rtp_ms = millis();
         wifi_touch_activity();
+        {
+            const char* range = hdr_find(req, "Range");
+            const char* npt = range ? strcasestr(range, "npt=") : nullptr;
+            if (npt) {
+                const float sec = strtof(npt + 4, nullptr);
+                airplay_meta_set_npt_ms((uint32_t)(sec * 1000.f + 0.5f));
+            }
+            s_dacp_time_pend = true;
+        }
+        airplay_meta_on_play();
         reply(cseq, "Audio-Latency: 31680\r\n");
         Serial.println(F("[AirPlay] RECORD"));
     } else if (!strcmp(method, "FLUSH") || !strcmp(method, "PAUSE")) {
         airplay_rtp_flush();
         g_ap.last_rtp_ms = millis();
+        wifi_touch_activity();
         reply(cseq, "");
     } else if (!strcmp(method, "TEARDOWN")) {
         reply(cseq, "");
-        airplay_interrupt();
-        Serial.println(F("[AirPlay] TEARDOWN"));
+        // Не вішати RTSP і не віддавати I2S: iPhone часто шле TEARDOWN на паузі/скіпі,
+        // а наступний SETUP йде тим самим TCP. Інакше колонка «відвалюється».
+        g_ap.playing = false;
+        g_ap.session = false;
+        airplay_rtp_stop();
+        airplay_meta_on_flush();
+        Serial.println(F("[AirPlay] TEARDOWN (keep RTSP)"));
     } else if (!strcmp(method, "SET_PARAMETER")) {
         const char* blank = strstr(req, "\r\n\r\n");
         const size_t body_n = blank ? (len > (size_t)(blank + 4 - req) ? len - (size_t)(blank + 4 - req) : 0) : 0;
-        handle_volume(body, body_n, req);
+        handle_set_parameter(body, body_n, req);
         reply(cseq, "");
     } else if (!strcmp(method, "GET_PARAMETER")) {
         char vol[40];
-        snprintf(vol, sizeof(vol), "volume: %.6f\r\n",
-                 g_ap.vol_gain <= 0.0001f ? -144.0f : 20.0f * log10f(g_ap.vol_gain));
+        snprintf(vol, sizeof(vol), "volume: %.6f\r\n", airplay_ui_to_db((int)radioState.vol));
         reply(cseq, "Content-Type: text/parameters\r\n", vol);
     } else if (!strcmp(method, "POST")) {
         reply(cseq, "");

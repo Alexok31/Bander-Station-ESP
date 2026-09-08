@@ -17,6 +17,7 @@
 TaskHandle_t Task0;
 
 char g_audio_source[8] = "wifi";
+char g_play_mode[8] = "radio";
 bool g_warm_boot_after_mode_switch = false;
 
 void commitSourceModeSwitch(const char* new_mode) {
@@ -37,6 +38,43 @@ void commitSourceModeSwitch(const char* new_mode) {
     }
     delay(RadioConfig::modeSwitchRestartDelayMs);
     esp_restart();
+}
+
+void commitPlayModeSwitch(const char* mode) {
+    if (!mode) {
+        return;
+    }
+    if (strcmp(mode, "ap") == 0 && !RadioConfig::airplayEnable) {
+        return;
+    }
+    if (strcmp(mode, "radio") != 0 && strcmp(mode, "ap") != 0) {
+        return;
+    }
+    const bool same = strcmp(g_play_mode, mode) == 0;
+    strncpy(g_play_mode, mode, sizeof(g_play_mode) - 1);
+    g_play_mode[sizeof(g_play_mode) - 1] = '\0';
+    Preferences prefs;
+    prefs.begin("bende", false);
+    prefs.putString("play", g_play_mode);
+    prefs.end();
+    if (strcmp(mode, "ap") == 0) {
+        radioState.state = false;
+        if (strcmp(g_audio_source, "wifi") == 0) {
+            audio.setVolume(0);
+            if (audio.isRunning()) {
+                audio.stopSong();
+            }
+        }
+        apply_output_volume();
+        airplay_set_accept(true);
+    } else {
+        airplay_set_accept(false);
+    }
+    Serial.printf("[Mode] %s\n", strcmp(g_play_mode, "ap") == 0 ? "AIR" : "FM");
+    if (!same) {
+        change_state();
+    }
+    matrix_show_play_mode();
 }
 
 extern Data radioState;
@@ -78,6 +116,7 @@ void setup() {
         prefs.begin("bende", true);
         g_warm_boot_after_mode_switch = prefs.getBool("wmrst", false);
         String s = prefs.getString("aud", "wifi");
+        String play = prefs.getString("play", "radio");
         if (!RadioConfig::bluetoothEnable || (s != "wifi" && s != "bt")) {
             s = "wifi";
             prefs.end();
@@ -87,6 +126,14 @@ void setup() {
         } else {
             prefs.end();
         }
+        if (play != "radio" && play != "ap") {
+            play = "radio";
+        }
+        if (!RadioConfig::airplayEnable) {
+            play = "radio";
+        }
+        strncpy(g_play_mode, play.c_str(), sizeof(g_play_mode) - 1);
+        g_play_mode[sizeof(g_play_mode) - 1] = '\0';
         strncpy(g_audio_source, s.c_str(), sizeof(g_audio_source));
         g_audio_source[sizeof(g_audio_source) - 1] = '\0';
         if (g_warm_boot_after_mode_switch) {
@@ -179,8 +226,10 @@ void setup() {
     webUiBegin();
     bender_ai_begin();
     airplay_begin();
+    airplay_set_accept(play_mode_is_airplay());
     Serial.println(F("Bender AI: hold=talk; 7 clicks=sleep; 8=restart; idle 5 min=calm, 30 min=sleep"));
-    Serial.println(F("AirPlay: iPhone Control Center → Bender"));
+    Serial.println(F("Mode: 4 clicks = FM / AIR"));
+    Serial.println(F("AirPlay: 1 click=pause, 2=next, 3=prev"));
 
     if (!(esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 && RadioConfig::wakeAfterSleepAnimMs > 0)) {
         change_state();

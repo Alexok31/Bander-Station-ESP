@@ -21,7 +21,4 @@ void bender_ai_ptt_arm();
 void bender_ai_ptt_down();
 void bender_ai_ptt_up();
 void bender_ai_ptt_cancel();
-// 2 кліки: 3 с запису з INMP441 і відтворення в колонку.
-void bender_ai_mic_demo();
-// Клік play: якщо сокета немає, віддати I2S радіо (інакше стрім мертвий).
 void bender_ai_yield_radio();

@@ -147,7 +147,8 @@ static bool s_matrix_ui_started = false;
 
 // Выбор Wi‑Fi / Bluetooth: 4×клик + удержание + поворот — текст на рту; применение при отпускании кнопки.
 static bool s_mode_pick_active = false;
-static char s_mode_pick_choice[8] = "wifi";
+static char s_mode_pick_choice[8] = "radio";
+static volatile bool s_mode_flash_req = false;
 
 static inline bool matrix_display_ready() {
     if (g_matrix_display_enable_ms == 0xFFFFFFFFu) {
@@ -252,33 +253,49 @@ static void draw_mode_pick_glyph_cell(uint8_t cell, const uint8_t rows[7]) {
         const uint8_t bits = rows[y];
         for (uint8_t c = 0; c < 5u; c++) {
             if ((bits >> (4u - c)) & 1u) {
-                mtrx.dot(x0 + c, y, GFX_FILL);
+                mtrx.dot(x0 + c, y + 1, GFX_FILL);
             }
         }
     }
 }
 
-// Рот: «wfi» / «bt» — по одной букве на квадратик (8×8), без библиотечного print.
+// Рот: «FM» / «AIR» / «wfi» / «bt»
 static void draw_mode_pick_mouth() {
     mtrx.rect(0, 0, RadioConfig::analyzWidth - 1, 7, GFX_CLEAR);
-    // W
     static const uint8_t gW[7] = {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A};
-    // F
     static const uint8_t gF[7] = {0x1E, 0x10, 0x10, 0x1C, 0x10, 0x10, 0x10};
-    // I
     static const uint8_t gI[7] = {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1F};
-    // B, T
     static const uint8_t gB[7] = {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E};
     static const uint8_t gT[7] = {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04};
+    static const uint8_t gA[7] = {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11};
+    static const uint8_t gM[7] = {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11};
+    static const uint8_t gR[7] = {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11};
 
     if (strcmp(s_mode_pick_choice, "bt") == 0) {
         draw_mode_pick_glyph_cell(0, gB);
         draw_mode_pick_glyph_cell(1, gT);
-    } else {
+    } else if (strcmp(s_mode_pick_choice, "ap") == 0) {
+        draw_mode_pick_glyph_cell(0, gA);
+        draw_mode_pick_glyph_cell(1, gI);
+        draw_mode_pick_glyph_cell(2, gR);
+    } else if (strcmp(s_mode_pick_choice, "wifi") == 0) {
         draw_mode_pick_glyph_cell(0, gW);
         draw_mode_pick_glyph_cell(1, gF);
         draw_mode_pick_glyph_cell(2, gI);
+    } else {
+        draw_mode_pick_glyph_cell(0, gF);
+        draw_mode_pick_glyph_cell(1, gM);
     }
+}
+
+static void draw_current_play_mode_mouth() {
+    strncpy(s_mode_pick_choice, play_mode_is_airplay() ? "ap" : "radio", sizeof(s_mode_pick_choice) - 1);
+    s_mode_pick_choice[sizeof(s_mode_pick_choice) - 1] = '\0';
+    draw_mode_pick_mouth();
+}
+
+void matrix_show_play_mode() {
+    s_mode_flash_req = true;
 }
 
 static void pong_sync_matrix_brightness() {
@@ -664,7 +681,7 @@ static uint8_t pcm_vis_after_noise_gate(uint8_t vw) {
 }
 
 static uint8_t pcm_wave_level_after_gate() {
-    if (bender_ai_tts_playing()) {
+    if (bender_ai_tts_playing() || airplay_playing()) {
         return g_pcm_vis;
     }
     return pcm_vis_after_noise_gate(g_pcm_vis);
@@ -707,22 +724,23 @@ static void analyz_eq_bars(uint8_t v_gate, bool invert, bool rest = false) {
     }
 }
 
-// Режим 5: бегущая строка (Gyver print) + таймлайн на нижнем ряду (без отступа между ними).
+// Режим 5: бегущая строка (Gyver print) + таймлайн на нижнем ряду (BT / AIR).
 static void analyz_bt_track_progress(bool invert) {
     const int W = RadioConfig::analyzWidth;
     static uint32_t s_bt_marquee_serial = 0xFFFFFFFFu;
     static int16_t s_bt_marquee_x = (int16_t)RadioConfig::analyzWidth;
     static uint32_t s_bt_marquee_adv_ms = 0;
 
-    if (strcmp(g_audio_source, "bt") == 0) {
-        const uint32_t ser = bt_audio_track_meta_serial();
+    const bool ap = play_mode_is_airplay();
+    const bool show_text = ap || strcmp(g_audio_source, "bt") == 0;
+    if (show_text) {
+        const uint32_t ser = ap ? airplay_track_meta_serial() : bt_audio_track_meta_serial();
         if (ser != s_bt_marquee_serial) {
             s_bt_marquee_serial = ser;
             s_bt_marquee_x = (int16_t)W;
         }
-        const char* const line = bt_audio_track_scroll_cstr();
+        const char* const line = ap ? airplay_track_scroll_cstr() : bt_audio_track_scroll_cstr();
         const uint32_t now_ms = millis();
-        // ~84 ms на пиксель — в 2 раза медленнее прежних ~42 ms.
         constexpr uint32_t kBtMarqueeMsPerPx = 84u;
         if ((uint32_t)(now_ms - s_bt_marquee_adv_ms) >= kBtMarqueeMsPerPx) {
             s_bt_marquee_adv_ms = now_ms;
@@ -745,8 +763,8 @@ static void analyz_bt_track_progress(bool invert) {
     for (int x = 0; x < W; x++) {
         mtrx.dot(x, y, mouth_gfx_on(invert));
     }
-    uint32_t dur = bt_audio_track_duration_ms();
-    uint32_t pos = bt_audio_track_position_ms();
+    uint32_t dur = ap ? airplay_track_duration_ms() : bt_audio_track_duration_ms();
+    uint32_t pos = ap ? airplay_track_position_ms() : bt_audio_track_position_ms();
     int gx = 0;
     if (dur > 1u) {
         if (pos >= dur) {
@@ -760,7 +778,6 @@ static void analyz_bt_track_progress(bool invert) {
     if (gx >= W) {
         gx = W - 1;
     }
-    // Маркер позиции мигает (~2 Гц), чтобы было заметнее на статичной дорожке.
     constexpr uint32_t kBtProgBlinkHalfMs = 250u;
     const bool show_pos_marker = ((millis() / kBtProgBlinkHalfMs) & 1u) == 0u;
     if (show_pos_marker) {
@@ -1047,7 +1064,7 @@ static void analyz_mouth_robot_backup(uint8_t vol, bool invert, bool animate = t
     mouth_robot_one_frame(vol, invert, animate);
 }
 
-// 0 хвиля; 1 інв.; 2 EQ; 3 рот; 4 рот інв.; 5 прогрес BT.
+// 0 хвиля; 1 інв.; 2 EQ; 3 рот; 4 рот інв.; 5 прогрес трека (BT / AIR).
 static uint8_t mouth_anim_mode() {
     uint8_t m = radioState.mode;
     if (m > 5) {
@@ -1504,6 +1521,13 @@ void core0(void* p) {
             print_val('v', s_ui_vol_val);
             matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
         }
+        if (s_mode_flash_req) {
+            s_mode_flash_req = false;
+            s_batt_matrix_overlay = false;
+            draw_current_play_mode_mouth();
+            matrix_flush();
+            matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
+        }
         if (s_batt_matrix_overlay && !matrix_tmr.state()) {
             s_batt_matrix_overlay = false;
             s_batt_overlay_prev_chg = false;
@@ -1730,7 +1754,7 @@ void core0(void* p) {
                 }
             }
 
-            // Режимы рта 0…5: хвиля / інв. / EQ / рот / рот інв. / прогрес трека (BT).
+            // Режимы рта 0…5: хвиля / інв. / EQ / рот / рот інв. / прогрес трека (BT / AIR).
             (void)mouth_anim_mode();
             if (s_mode_pick_active) {
                 upd_bright();
@@ -1760,6 +1784,10 @@ void core0(void* p) {
                     s_bender_live = true;
                     s_bender_quiet_ms = 0;
                     draw_mouth_anim(v_mouth > 0 ? v_mouth : (uint8_t)22, mouth_invert);
+                } else if (airplay_playing()) {
+                    s_bender_live = false;
+                    s_bender_quiet_ms = 0;
+                    draw_mouth_anim(v_mouth, mouth_invert);
                 } else {
                     s_bender_live = false;
                     s_bender_quiet_ms = 0;
@@ -1782,7 +1810,17 @@ void core0(void* p) {
 
                 // hasClicks() до turn(): иначе на том же тике поворот уходит в громкость.
                 if (eb.hasClicks() && !s_ptt_this_press) {
-                    switch (eb.getClicks()) {
+                    const uint8_t clicks = eb.getClicks();
+                    if (play_mode_is_airplay() && clicks >= 1 && clicks <= 3) {
+                        if (clicks == 1) {
+                            airplay_dacp_command("playpause");
+                        } else if (clicks == 2) {
+                            airplay_dacp_command("nextitem");
+                        } else {
+                            airplay_dacp_command("previtem");
+                        }
+                    } else {
+                    switch (clicks) {
                         case 1:
                             radioState.state = !radioState.state;
                             if (radioState.state) {
@@ -1807,11 +1845,13 @@ void core0(void* p) {
                             syncWifiWithAudioSilence();
                             change_state();
                             break;
-                        case 2:
-                            bender_ai_mic_demo();
-                            break;
                         case 3:
                             radioState.trsh = (uint16_t)constrain((int)g_pcm_level_adc * 2 / 3, 4, 3800);
+                            break;
+                        case 4:
+                            if (RadioConfig::airplayEnable) {
+                                commitPlayModeSwitch(play_mode_is_airplay() ? "radio" : "ap");
+                            }
                             break;
                         case 5:
                             if (RadioConfig::batteryMonitorEnable) {
@@ -1847,6 +1887,7 @@ void core0(void* p) {
                             ESP.restart();
                             break;
                     }
+                    }
                 }
 
                 if (eb.turn() && !s_ptt_this_press && !bender_ai_recording()) {
@@ -1859,10 +1900,12 @@ void core0(void* p) {
                         // 0 — один клик + поворот; 1 — двойной; 2 — тройной (яркость); 3 — четверной (Wi‑Fi / Bluetooth).
                         switch (eb.getClicks()) {
                             case 0:
-                                if (airplay_owns_speaker()) {
+                                if (airplay_owns_speaker() || play_mode_is_airplay()) {
                                     radioState.vol += eb.dir();
                                     radioState.vol = constrain(radioState.vol, 0, RadioConfig::ampVolumeUiMax);
-                                    airplay_encoder_vol_changed();
+                                    if (airplay_owns_speaker()) {
+                                        airplay_encoder_vol_changed();
+                                    }
                                     Serial.printf("[Vol] %d\n", (int)radioState.vol);
                                     print_val('v', radioState.vol);
                                     s_batt_matrix_overlay = false;
@@ -1904,6 +1947,22 @@ void core0(void* p) {
                                 break;
                             }
                             case 3: {
+                                if (RadioConfig::airplayEnable && !RadioConfig::bluetoothEnable) {
+                                    if (!s_mode_pick_active) {
+                                        s_mode_pick_active = true;
+                                        strncpy(s_mode_pick_choice, play_mode_is_airplay() ? "radio" : "ap",
+                                                sizeof(s_mode_pick_choice) - 1);
+                                        s_mode_pick_choice[sizeof(s_mode_pick_choice) - 1] = '\0';
+                                    } else {
+                                        if (strcmp(s_mode_pick_choice, "ap") == 0) {
+                                            strncpy(s_mode_pick_choice, "radio", sizeof(s_mode_pick_choice));
+                                        } else {
+                                            strncpy(s_mode_pick_choice, "ap", sizeof(s_mode_pick_choice));
+                                        }
+                                        s_mode_pick_choice[sizeof(s_mode_pick_choice) - 1] = '\0';
+                                    }
+                                    break;
+                                }
                                 if (!RadioConfig::bluetoothEnable) {
                                     break;
                                 }
@@ -1964,7 +2023,10 @@ void core0(void* p) {
                     }
                     if (s_mode_pick_active) {
                         s_mode_pick_active = false;
-                        if (strcmp(s_mode_pick_choice, g_audio_source) != 0) {
+                        if (strcmp(s_mode_pick_choice, "ap") == 0 ||
+                            strcmp(s_mode_pick_choice, "radio") == 0) {
+                            commitPlayModeSwitch(s_mode_pick_choice);
+                        } else if (strcmp(s_mode_pick_choice, g_audio_source) != 0) {
                             Serial.printf("[Mode] switch to %s\n", s_mode_pick_choice);
                             commitSourceModeSwitch(s_mode_pick_choice);
                         }
@@ -1989,7 +2051,8 @@ void core0(void* p) {
             const bool ap_up = (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA);
             const bool charging = RadioConfig::chargingDetectEnable && battery_is_charging();
             const bool stay_awake =
-                radioState.state || bender_ai_busy() || airplay_playing() || pong_active() ||
+                radioState.state || bender_ai_busy() || airplay_playing() || play_mode_is_airplay() ||
+                    pong_active() ||
                 s_mode_pick_active || wifiConnecting || show_wake_after_sleep_anim || ap_up ||
                 charging || (strcmp(g_audio_source, "bt") == 0 && bt_audio_needs_pairing_ui());
             if (stay_awake) {
