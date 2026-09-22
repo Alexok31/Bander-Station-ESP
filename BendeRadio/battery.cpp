@@ -11,6 +11,8 @@ static uint32_t s_last_sample_ms;
 static uint16_t s_smooth_mv;
 static uint8_t s_percent;
 static bool s_gauge_ready;
+static bool s_sense_present;  // latched: делитель реально бачили
+static uint8_t s_sense_latch_streak;
 
 static uint32_t s_charging_read_ms;
 static bool s_charging_cached;
@@ -103,6 +105,8 @@ void battery_init() {
     s_smooth_mv = 0;
     s_percent = 0;
     s_gauge_ready = false;
+    s_sense_present = false;
+    s_sense_latch_streak = 0;
     s_charging_read_ms = 0;
     s_charging_cached = false;
     if (RadioConfig::chargingDetectEnable) {
@@ -141,11 +145,21 @@ static void battery_sample_apply() {
     const bool chg = charging_pin_majority_high();
 
     uint32_t acc = 0;
+    uint16_t pin_min = 0xFFFF;
+    uint16_t pin_max = 0;
     constexpr uint8_t kSamples = 12;
     for (uint8_t i = 0; i < kSamples; i++) {
-        acc += adc_pin_millivolts();
+        const uint32_t pmv = adc_pin_millivolts();
+        acc += pmv;
+        if (pmv < pin_min) {
+            pin_min = (uint16_t)pmv;
+        }
+        if (pmv > pin_max) {
+            pin_max = (uint16_t)pmv;
+        }
     }
     const uint32_t pin_mv = acc / kSamples;
+    const uint16_t pin_spread = (uint16_t)(pin_max - pin_min);
     const float ratio = RadioConfig::batteryDividerRatio;
     uint32_t pack_mv = (uint32_t)((float)pin_mv * ratio + 0.5f);
     if (pack_mv > 20000u) {
@@ -170,6 +184,32 @@ static void battery_sample_apply() {
     s_charging_cached = chg;
     s_charging_read_ms = millis();
     s_gauge_ready = true;
+
+    // Обрив GPIO1: шумний/середній АЦП. Реальний 2S у вікні + стабільний pin → latch.
+    const bool candidate =
+        !s_sense_present && pack_mv >= RadioConfig::batterySensePresentMinMv &&
+        pack_mv <= RadioConfig::batterySensePresentMaxMv &&
+        pin_spread <= RadioConfig::batterySenseStablePinSpreadMv;
+    if (s_sense_present) {
+        // вже підтвердили делитель — не скидаємо (розряд до 5.6 В має будити sleep)
+    } else if (candidate) {
+        if (++s_sense_latch_streak >= RadioConfig::batterySenseLatchSamples) {
+            s_sense_present = true;
+            Serial.printf("[Batt] sense OK mv=%u pin_spread=%u — %% sleep armed\n",
+                          (unsigned)s_smooth_mv, (unsigned)pin_spread);
+        }
+    } else {
+        if (s_sense_latch_streak > 0) {
+            s_sense_latch_streak = 0;
+        }
+        static uint32_t s_sense_warn_ms = 0;
+        const uint32_t now = millis();
+        if (s_sense_warn_ms == 0 || (uint32_t)(now - s_sense_warn_ms) > 15000u) {
+            s_sense_warn_ms = now;
+            Serial.printf("[Batt] no pack sense (mv=%u spread=%u) — skip %% sleep\n",
+                          (unsigned)s_smooth_mv, (unsigned)pin_spread);
+        }
+    }
 }
 
 void battery_force_sample() {
@@ -247,10 +287,15 @@ bool battery_is_charging() {
     return s_charging_cached;
 }
 
+bool battery_sense_present() {
+    return RadioConfig::batteryMonitorEnable && s_gauge_ready && s_sense_present;
+}
+
 bool battery_low_power_sleep_active() {
     // Без линии зарядки с IP2326 нельзя отличить «идёт зарядка» от «сел АКБ» — не уходим в вечный deep sleep.
+    // Без нормального делителя на GPIO1 (обрыв → mv≈0) тоже не спим по %.
     return RadioConfig::batteryShutdownEnable && RadioConfig::batteryMonitorEnable &&
-           RadioConfig::chargingDetectEnable;
+           RadioConfig::chargingDetectEnable && battery_sense_present();
 }
 
 uint8_t battery_eye_mood() {

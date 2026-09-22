@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hmac
 import json
 import os
 import re
@@ -22,6 +23,7 @@ import sys
 import uuid
 import unicodedata
 import urllib.request
+from http import HTTPStatus
 from pathlib import Path
 
 import httpx
@@ -34,6 +36,7 @@ import stress_convert
 import voice_commands
 
 HERE = Path(__file__).resolve().parent
+TUNNEL_URL_PATH = HERE / "tunnel_url.txt"
 MODELS = HERE / "models"
 MODELS.mkdir(exist_ok=True)
 (HERE / "voice_clone" / "raw").mkdir(parents=True, exist_ok=True)
@@ -53,15 +56,22 @@ CONFIG_PATH = HERE / "config.json"
 
 
 def _secrets_h_key(name: str) -> str:
-    p = HERE.parent / "secrets.h"
-    if not p.is_file():
-        return ""
-    try:
-        text = p.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        return ""
-    m = re.search(rf'#define\s+{re.escape(name)}\s+"([^"]*)"', text)
-    return (m.group(1) if m else "").strip()
+    paths = (
+        HERE.parent.parent / "secrets.h",  # прошивка BendeRadio/secrets.h
+        HERE.parent / "secrets.h",
+    )
+    for p in paths:
+        if not p.is_file():
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        m = re.search(rf'#define\s+{re.escape(name)}\s+"([^"]*)"', text)
+        val = (m.group(1) if m else "").strip()
+        if val:
+            return val
+    return ""
 
 
 def load_config() -> dict:
@@ -125,6 +135,8 @@ def load_config() -> dict:
 
 
 CFG = load_config()
+WS_USER = os.environ.get("BENDER_WS_USER", "").strip() or _secrets_h_key("LOCAL_WS_USER")
+WS_PASS = os.environ.get("BENDER_WS_PASS", "").strip() or _secrets_h_key("LOCAL_WS_PASS")
 LLM_PROVIDER = CFG["llm"]
 OLLAMA_MODEL = str(CFG["ollama_model"] or "aya-expanse:8b")
 GROK_MODEL = str(CFG["grok_model"] or "grok-4.3")
@@ -2388,18 +2400,116 @@ def lan_ipv4() -> list[str]:
     return found
 
 
+def _header_get(headers, name: str) -> str:
+    if headers is None:
+        return ""
+    try:
+        v = headers.get(name)
+        if v:
+            return str(v)
+    except Exception:
+        pass
+    try:
+        v = headers.get(name.lower())
+        if v:
+            return str(v)
+    except Exception:
+        pass
+    try:
+        for k, val in headers:
+            if str(k).lower() == name.lower():
+                return str(val)
+    except Exception:
+        pass
+    return ""
+
+
+def _basic_ok(header: str) -> bool:
+    if not WS_USER or not WS_PASS:
+        return False
+    kind, _, rest = (header or "").partition(" ")
+    if kind.lower() != "basic" or not rest.strip():
+        return False
+    try:
+        decoded = base64.b64decode(rest.strip()).decode("utf-8")
+    except Exception:
+        return False
+    user, sep, pw = decoded.partition(":")
+    if not sep:
+        return False
+    return hmac.compare_digest(user, WS_USER) and hmac.compare_digest(pw, WS_PASS)
+
+
+def _unauthorized(connection=None):
+    extra = [
+        ("WWW-Authenticate", 'Basic realm="Bender"'),
+        ("Content-Type", "text/plain"),
+    ]
+    if connection is not None and hasattr(connection, "respond"):
+        try:
+            return connection.respond(HTTPStatus.UNAUTHORIZED, "auth required\n")
+        except Exception:
+            pass
+    return HTTPStatus.UNAUTHORIZED, extra, b"auth required\n"
+
+
+def _http_plain(connection, status: HTTPStatus, body: str):
+    raw = body.encode("utf-8")
+    extra = [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(raw)))]
+    if connection is not None and hasattr(connection, "respond"):
+        try:
+            return connection.respond(status, body)
+        except Exception:
+            pass
+    return status, extra, raw
+
+
+def _request_path(path: str) -> str:
+    p = (path or "").split("?")[0].strip()
+    if p.endswith("/") and len(p) > 1:
+        p = p[:-1]
+    return p
+
+
+def current_tunnel_url() -> str:
+    try:
+        return TUNNEL_URL_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 async def process_request(*args):
-    """Лог рукопожатия. Если этого нет при PTT — пакеты ESP не доходят (файрвол)."""
+    """Basic-auth + лог рукопожатия. GET /v1/tunnel — текущий публичный URL для колонки."""
+    connection = None
+    path = ""
+    addr = "?"
+    headers = None
     try:
         if len(args) >= 2:
-            connection, request = args[0], args[1]
-            path = getattr(request, "path", None) or str(request)
-            addr = getattr(connection, "remote_address", connection)
-            log(f"handshake {path} from {addr}")
+            a0, a1 = args[0], args[1]
+            if hasattr(a1, "headers") or hasattr(a1, "path"):
+                connection, request = a0, a1
+                path = getattr(request, "path", None) or str(request)
+                addr = getattr(connection, "remote_address", connection)
+                headers = getattr(request, "headers", None)
+            else:
+                path, headers = str(a0), a1
         elif args:
-            log(f"handshake {args[0]}")
+            path = str(args[0])
     except Exception as e:
         log(f"handshake log: {e}")
+        return _unauthorized(connection)
+
+    auth = _header_get(headers, "Authorization")
+    if not _basic_ok(auth):
+        log(f"handshake deny {path} from {addr}")
+        return _unauthorized(connection)
+    p = _request_path(path)
+    if p in ("/v1/tunnel", "/tunnel"):
+        url = current_tunnel_url()
+        log(f"tunnel url query from {addr}")
+        return _http_plain(connection, HTTPStatus.OK, (url + "\n") if url else "\n")
+    log(f"handshake {path} from {addr}")
     return None
 
 
@@ -2471,6 +2581,13 @@ async def main() -> None:
     if rvc_convert.enabled():
         ok, msg = rvc_convert.ready()
         log(f"RVC {'OK' if ok else 'skip'}: {msg}")
+        try:
+            Path(r"A:\tmp").mkdir(parents=True, exist_ok=True)
+            Path(r"A:\tmp\bender_status.txt").write_text(
+                f"RVC={'OK' if ok else 'OFF'} {msg}\n", encoding="utf-8"
+            )
+        except OSError:
+            pass
         if ok:
             log("RVC warmup (модель у VRAM, один раз)…")
             try:
@@ -2478,8 +2595,15 @@ async def main() -> None:
                 log("RVC worker ready")
             except Exception as e:
                 log(f"RVC warmup fail: {e}")
+        else:
+            log("RVC off (пародія: voice_clone/README.md, потім start.bat)")
     else:
-        log("RVC off (пародія: voice_clone/README.md, потім run_rvc.bat)")
+        log("RVC off (пародія: voice_clone/README.md, потім start.bat)")
+        try:
+            Path(r"A:\tmp").mkdir(parents=True, exist_ok=True)
+            Path(r"A:\tmp\bender_status.txt").write_text("RVC=OFF enabled=false\n", encoding="utf-8")
+        except OSError:
+            pass
     CHAT[:] = load_chat()
     log(f"BENDER_LEVEL={BENDER_LEVEL}/10 (config.json або BENDER_LEVEL)")
     log(
@@ -2508,7 +2632,10 @@ async def main() -> None:
                 await asyncio.to_thread(warm_ollama)
 
     ips = ", ".join(lan_ipv4()) or "(не видно IPv4 — смотри ipconfig)"
-    log(f"listen ws://0.0.0.0:{PORT}/v1/realtime")
+    if not WS_USER or not WS_PASS:
+        log("нет LOCAL_WS_USER / LOCAL_WS_PASS в secrets.h — сокет не слушаю")
+        sys.exit(1)
+    log(f"listen ws://0.0.0.0:{PORT}/v1/realtime auth=basic user={WS_USER}")
     log(f"IPv4 этого ПК: {ips}")
     log("В secrets.h — LAN IPv4 (192.168.x.x), не 127.0.0.1 и не Radmin 26.x")
     log("Если ESP пишет connect failed ~3с — запусти open_firewall.bat от администратора")

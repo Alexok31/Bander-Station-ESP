@@ -17,5 +17,7 @@ bool battery_is_charging();
 // 0 веселий (≥batteryMoodCheerfulMinPct), 1 звичайний, 2 сумний (<batteryMoodNormalMinPct).
 uint8_t battery_eye_mood();
 
-// true — можно уводить в deep sleep по критическому % (нужны и АЦП, и пин зарядки).
+// true — делитель на GPIO1 похож на живую 2S (не «обрыв»).
+bool battery_sense_present();
+// true — можно уводить в deep sleep по критическому % (АЦП + зарядка + sense).
 bool battery_low_power_sleep_active();

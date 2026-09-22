@@ -21,3 +21,11 @@ void nvsLoadMatrixBrightnessTrim(int8_t* outTrim, uint8_t count);
 void nvsSaveMatrixBrightnessTrim(const int8_t* trim, uint8_t count);
 bool nvsTakePendingBrightnessOverride(uint8_t& outValue);
 void nvsSetPendingBrightnessOverride(uint8_t value);
+
+// Пустая строка = брать LOCAL_WS_HOST из secrets.h (дом). Иначе полный ws:// или wss:// URL.
+void nvsLoadAiWsUrl(String& outUrl);
+void nvsSaveAiWsUrl(const String& url);
+bool nvsNormalizeAiWsUrl(String& url);
+
+bool nvsLoadAiDebug();
+void nvsSaveAiDebug(bool on);

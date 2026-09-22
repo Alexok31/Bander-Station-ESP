@@ -38,6 +38,10 @@ void core0(void *p);
 void syncWifiWithAudioSilence();
 void wifi_touch_activity();
 void wifi_ap_toggle_from_core0();
+// Уйти с SoftAP (если был) и снова к STA из NVS. softap_on_fail=true → при неудаче вернуть SoftAP.
+void wifi_request_sta_reconnect(bool softap_on_fail);
+// STA с настройками под iPhone hotspot / обычный роутер. true = подключились.
+bool wifi_sta_connect(const String& ssid, const String& pass, uint32_t timeout_ms = 30000);
 void matrix_get_brightness_trim(int8_t* outTrim, uint8_t count);
 void matrix_set_brightness_trim(const int8_t* trim, uint8_t count, bool persist);
 uint8_t matrix_get_base_brightness();

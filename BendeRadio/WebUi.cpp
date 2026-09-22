@@ -63,6 +63,21 @@ static void webUiOnWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     s_web_need_listen_reset = true;
 }
 
+static void htmlAppendEscaped(String& html, const String& s) {
+    for (unsigned i = 0; i < s.length(); i++) {
+        const char c = s[i];
+        if (c == '&') {
+            html += F("&amp;");
+        } else if (c == '"') {
+            html += F("&quot;");
+        } else if (c == '<') {
+            html += F("&lt;");
+        } else {
+            html += c;
+        }
+    }
+}
+
 static void sendPage() {
     wifi_touch_activity();
     const bool staOk = (WiFi.status() == WL_CONNECTED);
@@ -80,7 +95,7 @@ static void sendPage() {
     }
 
     String html;
-    html.reserve(3200);
+    html.reserve(4200);
     html += F("<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
               "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
               "<title>Bender Station</title>"
@@ -124,6 +139,9 @@ static void sendPage() {
     html += F("\" autocomplete=\"off\">");
     html += F("<label>Пароль</label>");
     html += F("<input name=\"sta_pass\" type=\"password\" maxlength=\"64\" placeholder=\"новый пароль\" autocomplete=\"new-password\">");
+    html += F("<p class=\"muted\">Колонка только 2.4 ГГц. Раздача с iPhone: Настройки → Режим модема → "
+              "Максимальная совместимость (иначе часто только 5 ГГц и ESP не видит сеть). "
+              "Имя сети — как у iPhone, без опечаток.</p>");
 
     html += F("<h2>Wi-Fi Bender</h2>");
     html += F("<label>Имя точки доступа</label>");
@@ -149,6 +167,25 @@ static void sendPage() {
     html += F("<p class=\"muted\">Можно сохранить до ");
     html += String((int)RadioConfig::customStationMaxCount);
     html += F(" ссылок.</p>");
+
+    String aiUrl;
+    nvsLoadAiWsUrl(aiUrl);
+    html += F("<h2>AI сервер</h2>");
+    html += F("<label>WebSocket (пусто = домашний ПК в той же Wi‑Fi)</label>");
+    html += F("<input name=\"ai_ws\" maxlength=\"160\" placeholder=\"ws://192.168.0.173:8765/v1/realtime\" value=\"");
+    htmlAppendEscaped(html, aiUrl);
+    html += F("\" autocomplete=\"off\">");
+    html += F("<p class=\"muted\">Пусто = дома LAN, иначе постоянный Tailscale Funnel "
+              "из прошивки. ПК: start.bat + один раз enable_funnel.bat. "
+              "Колонке в другом городе нужна любая Wi‑Fi с интернетом.</p>");
+
+    const bool dbgOn = bender_ai_debug();
+    html += F("<h2>AI DEBUG</h2>");
+    html += F("<button class=\"btn\" type=\"button\" id=\"dbgBtn\" onclick=\"toggleDbg()\">");
+    html += dbgOn ? F("DEBUG MODE: ВКЛ") : F("DEBUG MODE: ВЫКЛ");
+    html += F("</button>");
+    html += F("<p class=\"muted\">Вкл: после ответа Бендера колонка проиграет твою запись с микрофона. "
+              "Выкл: только ответ Бендера. Без перезагрузки.</p>");
 
     int8_t trim[RadioConfig::matrixModuleCount] = {0, 0, 0, 0, 0};
     matrix_get_brightness_trim(trim, RadioConfig::matrixModuleCount);
@@ -191,6 +228,10 @@ static void sendPage() {
               "function evtAdj(ev,i,d){ev.stopPropagation();adj(i,d);}"
               "function startCalib(){for(let i=0;i<5;i++){setV(i,CALIB_START,false);}queueCalib();}"
               "for(let i=0;i<5;i++){setV(i,getV(i),false);}"
+              "function toggleDbg(){fetch('/debug',{method:'POST'}).then(r=>r.json()).then(j=>{"
+              "const b=document.getElementById('dbgBtn');"
+              "if(b)b.textContent=j.on?'DEBUG MODE: ВКЛ':'DEBUG MODE: ВЫКЛ';"
+              "}).catch(()=>{});}"
               "</script>"
               "</body></html>");
 
@@ -218,6 +259,12 @@ static void handleSave() {
     apSsidIn.trim();
     String apPassIn = server.arg("ap_pass");
     String stationsIn = server.arg("stations");
+    String aiWsIn = server.arg("ai_ws");
+    if (!nvsNormalizeAiWsUrl(aiWsIn)) {
+        web_send_close_connection();
+        server.send(400, "text/plain", "AI URL: ws:// или wss://");
+        return;
+    }
     int8_t trim[RadioConfig::matrixModuleCount] = {0, 0, 0, 0, 0};
     for (uint8_t i = 0; i < RadioConfig::matrixModuleCount; i++) {
         String v = server.arg(String("mbr") + String((int)i));
@@ -259,6 +306,7 @@ static void handleSave() {
         from = nl + 1;
     }
     nvsSaveCustomStations(parsed, parsedCount);
+    nvsSaveAiWsUrl(aiWsIn);
     matrix_set_brightness_trim(trim, RadioConfig::matrixModuleCount, true);
 
     web_send_close_connection();
@@ -269,6 +317,19 @@ static void handleSave() {
                  "</body></html>");
     delay(300);
     ESP.restart();
+}
+
+static void handleDebug() {
+    wifi_touch_activity();
+    if (server.method() != HTTP_POST) {
+        web_send_close_connection();
+        server.send(405, "text/plain", "Method Not Allowed");
+        return;
+    }
+    const bool on = !bender_ai_debug();
+    bender_ai_set_debug(on);
+    web_send_close_connection();
+    server.send(200, "application/json", on ? "{\"ok\":true,\"on\":true}" : "{\"ok\":true,\"on\":false}");
 }
 
 static void handleCalib() {
@@ -307,6 +368,7 @@ void webUiBegin() {
         server.on("/ncsi.txt", HTTP_ANY, captiveProbeOk);              // Windows fallback
         server.on("/", HTTP_GET, sendPage);
         server.on("/calib", HTTP_POST, handleCalib);
+        server.on("/debug", HTTP_POST, handleDebug);
         server.on("/save", HTTP_POST, handleSave);
         server.onNotFound([]() {
             web_send_close_connection();

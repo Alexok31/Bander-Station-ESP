@@ -152,6 +152,8 @@ Audio audio;
 String streamname;
 const char* reconnect = nullptr;
 volatile bool wifiConnecting = false;
+static uint32_t s_sta_connect_started_ms = 0;
+static bool s_sta_softap_on_fail = true;
 
 static uint32_t s_wake_after_sleep_anim_until_ms = 0;
 static bool s_pending_change_state_after_wake = false;
@@ -1177,7 +1179,7 @@ void syncWifiWithAudioSilence() {
     }
 }
 
-void wifi_ap_toggle_from_core0() {
+void wifi_request_sta_reconnect(bool softap_on_fail) {
     if (strcmp(g_audio_source, "bt") == 0) {
         return;
     }
@@ -1188,28 +1190,50 @@ void wifi_ap_toggle_from_core0() {
     nvsLoadWifi(w);
     const String staSsid = w.staSsid.length() ? w.staSsid : String(RadioConfig::wifiSsid);
     const String staPass = w.staPass.length() ? w.staPass : String(RadioConfig::wifiPass);
+
+    const wifi_mode_t mode = WiFi.getMode();
+    const bool ap_mode = (mode == WIFI_AP || mode == WIFI_AP_STA);
+    if (ap_mode) {
+        if (audio.isRunning()) {
+            audio.stopSong();
+        }
+        WiFi.softAPdisconnect(true);
+    }
+
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.setMinSecurity(WIFI_AUTH_WPA_PSK);
+    WiFi.disconnect(false, false);
+    delay(50);
+    Serial.printf("[WiFi] reconnect STA \"%s\" (softap_on_fail=%d)\n", staSsid.c_str(),
+                  (int)softap_on_fail);
+    WiFi.begin(staSsid.c_str(), staPass.c_str());
+    wifiConnecting = true;
+    s_sta_connect_started_ms = millis();
+    s_sta_softap_on_fail = softap_on_fail;
+    wifi_touch_activity();
+    syncWifiWithAudioSilence();
+}
+
+void wifi_ap_toggle_from_core0() {
+    if (strcmp(g_audio_source, "bt") == 0) {
+        return;
+    }
+    if (wifiConnecting) {
+        return;
+    }
+    WifiStored w;
+    nvsLoadWifi(w);
     const String apSsid = nvsEffectiveApSsid(w);
     const String apPwd = nvsEffectiveApPass(w);
 
     const wifi_mode_t mode = WiFi.getMode();
     const bool ap_mode = (mode == WIFI_AP || mode == WIFI_AP_STA);
 
-    // AP on -> off: вернуться в STA и попробовать переподключиться к домашней сети.
+    // AP on -> off: к домашней сети; если не вышло — SoftAP снова.
     if (ap_mode) {
-        WiFi.softAPdisconnect(true);
-        WiFi.mode(WIFI_STA);
-        wifiConnecting = true;
-        WiFi.begin(staSsid.c_str(), staPass.c_str());
-        const uint32_t t0 = millis();
-        while (WiFi.status() != WL_CONNECTED && (uint32_t)(millis() - t0) < 15000u) {
-            delay(25);
-        }
-        wifiConnecting = false;
-        if (WiFi.status() == WL_CONNECTED) {
-            reconnect = station_url_for_current();
-        }
-        wifi_touch_activity();
-        syncWifiWithAudioSilence();
+        wifi_request_sta_reconnect(true);
         print_val('A', 0);
         return;
     }
@@ -1218,6 +1242,7 @@ void wifi_ap_toggle_from_core0() {
     if (audio.isRunning()) {
         audio.stopSong();
     }
+    radioState.state = false;
     WiFi.disconnect(true);
     WiFi.mode(WIFI_AP);
     if (apPwd.length() >= 8) {
@@ -1227,7 +1252,37 @@ void wifi_ap_toggle_from_core0() {
     }
     wifi_touch_activity();
     syncWifiWithAudioSilence();
+    change_state();
     print_val('A', 1);
+}
+
+bool wifi_sta_connect(const String& ssid, const String& pass, uint32_t timeout_ms) {
+    wifiConnecting = true;
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    // iPhone hotspot / смешанный WPA2-WPA3: не требовать только WPA3.
+    WiFi.setMinSecurity(WIFI_AUTH_WPA_PSK);
+    WiFi.disconnect(true, true);
+    delay(100);
+    Serial.printf("[WiFi] STA connect SSID=\"%s\" …\n", ssid.c_str());
+    WiFi.begin(ssid.c_str(), pass.c_str());
+    const uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && (uint32_t)(millis() - t0) < timeout_ms) {
+        delay(50);
+    }
+    wifiConnecting = false;
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("[WiFi] OK %s ch=%d rssi=%d\n", WiFi.localIP().toString().c_str(),
+                      (int)WiFi.channel(), (int)WiFi.RSSI());
+        syncWifiWithAudioSilence();
+        return true;
+    }
+    const wl_status_t st = WiFi.status();
+    Serial.printf("[WiFi] FAIL status=%d (1=idle 4=fail 6=disc). "
+                  "ESP32 only 2.4GHz — on iPhone Hotspot enable Maximize Compatibility.\n",
+                  (int)st);
+    return false;
 }
 
 void apply_output_volume() {
@@ -1309,6 +1364,27 @@ void audio_hw_init(bool log_serial) {
     }
 }
 
+// Pololu OFF: короткий HIGH → VOUT гаснет (банка больше не кормит понижайку).
+// На OFF нужно >1 V; GPIO даёт 3.3 V. Если руками выключало только от VIN (8 V) —
+// поставь NPN/PNP: GPIO7 открывает путь VIN→OFF.
+static void pololu_power_cut() {
+    if (RadioConfig::pololuOffPin == 255) {
+        return;
+    }
+    pinMode(RadioConfig::pololuOffPin, OUTPUT);
+    digitalWrite(RadioConfig::pololuOffPin, LOW);
+    delay(5);
+    // Два импульса — надёжнее одного короткого.
+    for (uint8_t i = 0; i < 2; i++) {
+        digitalWrite(RadioConfig::pololuOffPin, HIGH);
+        delay(RadioConfig::pololuOffPulseMs);
+        digitalWrite(RadioConfig::pololuOffPin, LOW);
+        delay(30);
+    }
+    Serial.printf("[Power] Pololu OFF pulse GPIO%u %ums x2\n", (unsigned)RadioConfig::pololuOffPin,
+                  (unsigned)RadioConfig::pololuOffPulseMs);
+}
+
 // Критический заряд: уводим в deep sleep без wake sources — меньше ток, чем у «живой» прошивки
 // (типичный цикл: Brownout → reset → снова нагрузка → снова Brownout).
 static void low_battery_enter_deep_sleep_forever() {
@@ -1336,7 +1412,9 @@ static void low_battery_enter_deep_sleep_forever() {
 #if defined(ESP_SLEEP_WAKEUP_ULP)
     (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ULP);
 #endif
-    // Кнопка будить: інакше при хибному «не заряджається» колонка цеглина до зняття живлення.
+    // Сначала рвём Pololu (если пропаян). Если питание ушло — сюда уже не вернёмся.
+    pololu_power_cut();
+    // Fallback: deep sleep + кнопка будить (если OFF не сработал / пин не подключён).
     esp_sleep_enable_ext0_wakeup((gpio_num_t)RadioConfig::encBtn, 0);
     esp_deep_sleep_start();
     delay(1000);
@@ -1390,15 +1468,25 @@ static void radio_enter_deep_sleep() {
         mtrx.clear();
         matrix_flush();
     }
+    Serial.println(F("[Power] sleep → Pololu OFF then deep sleep"));
+    delay(50);
+    pololu_power_cut();
+    delay(100);
+    // Если Pololu срезал питание — сюда не дойдём. Иначе fallback deep sleep.
     esp_sleep_enable_ext0_wakeup((gpio_num_t)RadioConfig::encBtn, 0);
     esp_deep_sleep_start();
 }
 
 void core0(void* p) {
     // ========================= SETUP =========================
+    if (RadioConfig::pololuOffPin != 255) {
+        pinMode(RadioConfig::pololuOffPin, OUTPUT);
+        digitalWrite(RadioConfig::pololuOffPin, LOW);  // не держать OFF при загрузке
+    }
     EncButton eb(RadioConfig::encS1, RadioConfig::encS2, RadioConfig::encBtn);
-    eb.setClickTimeout(480);
-    eb.setDebTimeout(80);
+    // Было 480 — при SoftAP/без сети тики реже, серии 6–9 кликов рвались.
+    eb.setClickTimeout(900);
+    eb.setDebTimeout(60);
     eb.setEncType(EB_STEP4_LOW);
     Tmr viz_tmr(RadioConfig::matrixVizRefreshMs);
     Tmr tts_mouth_tmr(RadioConfig::matrixVizTtsRefreshMs);
@@ -1415,8 +1503,6 @@ void core0(void* p) {
     static bool s_enc_hold_had_turn_while_pressed = false;
     // BT: 4 клика + удержание без поворота — сброс сопряжений и вход в поиск нового телефона.
     static bool s_bt_forget_pair_hold_ready = false;
-    // Wi‑Fi: то же число кликов + удержание — вкл/выкл SoftAP для веб‑настройки.
-    static bool s_softap_hold_ready = false;
     static bool s_ptt_this_press = false;
 
     EEPROM.begin(memory.blockSize());
@@ -1521,6 +1607,41 @@ void core0(void* p) {
 
     // ========================= LOOP =========================
     for (;;) {
+        if (wifiConnecting && s_sta_connect_started_ms) {
+            if (WiFi.status() == WL_CONNECTED) {
+                wifiConnecting = false;
+                s_sta_connect_started_ms = 0;
+                Serial.printf("[WiFi] OK %s\n", WiFi.localIP().toString().c_str());
+                if (radioState.state && strcmp(g_audio_source, "wifi") == 0) {
+                    reconnect = station_url_for_current();
+                }
+                syncWifiWithAudioSilence();
+                change_state();
+            } else if ((uint32_t)(millis() - s_sta_connect_started_ms) > 20000u) {
+                wifiConnecting = false;
+                s_sta_connect_started_ms = 0;
+                if (s_sta_softap_on_fail) {
+                    Serial.println(F("[WiFi] STA timeout — SoftAP back"));
+                    WifiStored wfail;
+                    nvsLoadWifi(wfail);
+                    const String apSsidFail = nvsEffectiveApSsid(wfail);
+                    const String apPwdFail = nvsEffectiveApPass(wfail);
+                    WiFi.mode(WIFI_AP);
+                    if (apPwdFail.length() >= 8) {
+                        WiFi.softAP(apSsidFail.c_str(), apPwdFail.c_str());
+                    } else {
+                        WiFi.softAP(apSsidFail.c_str());
+                    }
+                    print_val('A', 1);
+                } else {
+                    Serial.println(F("[WiFi] STA timeout — click play to retry"));
+                }
+                radioState.state = false;
+                apply_output_volume();
+                syncWifiWithAudioSilence();
+                change_state();
+            }
+        }
         if (s_matrix_brightness_trim_dirty && matrix_display_ready()) {
             s_matrix_brightness_trim_dirty = false;
             upd_bright();
@@ -1606,10 +1727,14 @@ void core0(void* p) {
             enc_btn_press_ms = millis();
             s_enc_hold_had_turn_while_pressed = false;
             s_bt_forget_pair_hold_ready = false;
-            s_softap_hold_ready = false;
             s_ptt_this_press = false;
+            // Без STA не будить AI: иначе каждый клик → WSS connect fail и клики «сыпаются».
+            const wifi_mode_t wm = WiFi.getMode();
+            const bool softap_only =
+                (wm == WIFI_AP) || (wm == WIFI_AP_STA && WiFi.status() != WL_CONNECTED);
             if (!pong_active() && !s_mode_pick_active && !show_wake_after_sleep_anim &&
-                strcmp(g_audio_source, "bt") != 0) {
+                strcmp(g_audio_source, "bt") != 0 && !softap_only &&
+                WiFi.status() == WL_CONNECTED) {
                 bender_ai_ptt_arm();
             }
         }
@@ -1624,6 +1749,7 @@ void core0(void* p) {
         if (eb_tick && eb.pressing() && !s_ptt_this_press && !s_enc_hold_had_turn_while_pressed &&
             eb.getClicks() == 0 && !pong_active() && !s_mode_pick_active &&
             !show_wake_after_sleep_anim && strcmp(g_audio_source, "bt") != 0 &&
+            WiFi.status() == WL_CONNECTED &&
             eb.pressFor() >= RadioConfig::encoderPttHoldMs && !bender_ai_recording()) {
             s_ptt_this_press = true;
             bender_ai_ptt_down();
@@ -1634,11 +1760,6 @@ void core0(void* p) {
             strcmp(g_audio_source, "bt") == 0 && eb.getClicks() == 3 &&
             eb.pressFor() >= RadioConfig::btForgetPairedHoldMs) {
             s_bt_forget_pair_hold_ready = true;
-        }
-        if (eb_tick && eb.pressing() && !s_enc_hold_had_turn_while_pressed &&
-            strcmp(g_audio_source, "wifi") == 0 && eb.getClicks() == 3 &&
-            eb.pressFor() >= RadioConfig::encoderSoftApToggleHoldMs) {
-            s_softap_hold_ready = true;
         }
 
         if (matrix_display_ready()) {
@@ -1673,7 +1794,6 @@ void core0(void* p) {
                     if (eb.pressing()) {
                         s_enc_hold_had_turn_while_pressed = true;
                         s_bt_forget_pair_hold_ready = false;
-                        s_softap_hold_ready = false;
                         bender_ai_ptt_cancel();
                     } else {
                         pong_paddle_nudge(eb.dir());
@@ -1691,10 +1811,14 @@ void core0(void* p) {
                         draw_eyes_follow_ball(pong_ball_x(), pong_ball_y());
                         pong_sync_matrix_brightness();
                         matrix_flush();
-                    } else if (n == 6) {
+                    } else if (n == RadioConfig::encoderPongClicks) {
                         pong_set_active(false);
                         upd_bright();
                         matrix_flush();
+                    } else if (n == RadioConfig::encoderSoftApToggleClicks) {
+                        if (strcmp(g_audio_source, "wifi") == 0) {
+                            wifi_ap_toggle_from_core0();
+                        }
                     } else if (n == RadioConfig::encoderSleepClicks) {
                         radio_enter_deep_sleep();
                     } else if (n == RadioConfig::encoderRestartClicks) {
@@ -1848,13 +1972,18 @@ void core0(void* p) {
                                     audio.setVolume(0);
                                     audio.stopSong();
                                 }
-                            } else {
-                                if (strcmp(g_audio_source, "wifi") == 0) {
+                            } else if (strcmp(g_audio_source, "wifi") == 0) {
+                                if (WiFi.status() == WL_CONNECTED) {
                                     reconnect = station_url_for_current();
+                                } else if (wifiConnecting) {
+                                    Serial.println(F("[Radio] wait WiFi…"));
+                                } else {
+                                    // Офлайн / SoftAP: play = переподключить STA, потом станцию.
+                                    Serial.println(F("[Radio] no WiFi → reconnect then play"));
+                                    wifi_request_sta_reconnect(false);
                                 }
-                                if (strcmp(g_audio_source, "bt") == 0) {
-                                    bt_audio_avrcp_play();
-                                }
+                            } else if (strcmp(g_audio_source, "bt") == 0) {
+                                bt_audio_avrcp_play();
                             }
                             apply_output_volume();
                             syncWifiWithAudioSilence();
@@ -1869,7 +1998,11 @@ void core0(void* p) {
                                               station_url_by_index(radioState.station));
                                 s_batt_matrix_overlay = false;
                                 matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
-                                reconnect = station_url_for_current();
+                                if (WiFi.status() == WL_CONNECTED) {
+                                    reconnect = station_url_for_current();
+                                } else if (radioState.state && !wifiConnecting) {
+                                    wifi_request_sta_reconnect(false);
+                                }
                             }
                             break;
                         case 3:
@@ -1881,7 +2014,11 @@ void core0(void* p) {
                                               station_url_by_index(radioState.station));
                                 s_batt_matrix_overlay = false;
                                 matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
-                                reconnect = station_url_for_current();
+                                if (WiFi.status() == WL_CONNECTED) {
+                                    reconnect = station_url_for_current();
+                                } else if (radioState.state && !wifiConnecting) {
+                                    wifi_request_sta_reconnect(false);
+                                }
                             } else {
                                 radioState.trsh = (uint16_t)constrain((int)g_pcm_level_adc * 2 / 3, 4, 3800);
                             }
@@ -1891,7 +2028,7 @@ void core0(void* p) {
                                 commitPlayModeSwitch(play_mode_is_airplay() ? "radio" : "ap");
                             }
                             break;
-                        case 5:
+                        case RadioConfig::encoderBatteryClicks:
                             if (RadioConfig::batteryMonitorEnable) {
                                 battery_force_sample();
                                 s_batt_matrix_overlay = true;
@@ -1909,7 +2046,14 @@ void core0(void* p) {
                                 }
                             }
                             break;
-                        case 6:
+                        case RadioConfig::encoderSoftApToggleClicks:
+                            if (strcmp(g_audio_source, "wifi") == 0) {
+                                wifi_ap_toggle_from_core0();
+                                s_batt_matrix_overlay = false;
+                                matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
+                            }
+                            break;
+                        case RadioConfig::encoderPongClicks:
                             pong_start();
                             pong_tmr.start();
                             pong_draw();
@@ -1932,7 +2076,6 @@ void core0(void* p) {
                     if (eb.pressing()) {
                         s_enc_hold_had_turn_while_pressed = true;
                         s_bt_forget_pair_hold_ready = false;
-                        s_softap_hold_ready = false;
                         bender_ai_ptt_cancel();
                         // getClicks() при удержании = число уже завершённых кликов в серии:
                         // 0 — один клик + поворот; 1 — двойной; 2 — тройной (яркость); 3 — четверной (Wi‑Fi / Bluetooth).
@@ -2042,14 +2185,6 @@ void core0(void* p) {
                             bt_audio_forget_paired_devices();
                         }
                     }
-                    if (s_softap_hold_ready) {
-                        s_softap_hold_ready = false;
-                        if (strcmp(g_audio_source, "wifi") == 0) {
-                            wifi_ap_toggle_from_core0();
-                            s_batt_matrix_overlay = false;
-                            matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
-                        }
-                    }
                     if (s_mode_pick_active) {
                         s_mode_pick_active = false;
                         if (strcmp(s_mode_pick_choice, "ap") == 0 ||
@@ -2067,7 +2202,6 @@ void core0(void* p) {
                                       reconnect ? reconnect : "(null)");
                     }
                     s_bt_forget_pair_hold_ready = false;
-                    s_softap_hold_ready = false;
                 }
                 memory.update();
             }

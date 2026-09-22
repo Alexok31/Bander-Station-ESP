@@ -92,23 +92,29 @@ class RadioConfig {
     static constexpr uint8_t encS1 = 4;
     static constexpr uint8_t encS2 = 5;
     static constexpr uint8_t encBtn = 6;
-    // 2 кліки — демо мікрофона (3 с запис → відтворення). 5 — % АКБ; 6 — Pong; 7 — сон; 8 — restart.
-    // Утримання без кліків/повороту (~0.5 с) підтверджує PTT (не клік). Мікрофон пише з моменту натискання.
+    // Pololu Mini Pushbutton Power Switch: импульс HIGH на OFF рвёт питание понижайки.
+    // Включение — железом (энкодер → PNP → ON). 255 = не использовать.
+    static constexpr uint8_t pololuOffPin = 7;
+    static constexpr uint16_t pololuOffPulseMs = 200;
+    // 5 — % АКБ; 6 — SoftAP; 7 — Pong; 8 — сон; 9 — restart.
     static constexpr uint16_t encoderPttHoldMs = 520;
     static constexpr uint16_t micDemoMs = 3000;
-    static constexpr uint8_t encoderSleepClicks = 7;
-    static constexpr uint8_t encoderRestartClicks = 8;
+    static constexpr uint8_t encoderBatteryClicks = 5;
+    static constexpr uint8_t encoderSoftApToggleClicks = 6;
+    static constexpr uint8_t encoderPongClicks = 7;
+    static constexpr uint8_t encoderSleepClicks = 8;
+    static constexpr uint8_t encoderRestartClicks = 9;
     // Без музики і без розмови з Бендером — очі/рот у спокійний режим (не deep sleep).
     static constexpr uint32_t benderFaceCalmAfterMs = 5ul * 60ul * 1000ul;
     // Далі бездіяльність (немає музики, PTT, енкодера, WebUI) — deep sleep, будить кнопка.
-    // На зарядці автосон не вмикається (7 кліків — так).
+    // На зарядці автосон не вмикається (8 кліків — так).
     static constexpr uint32_t benderIdleDeepSleepMs = 30ul * 60ul * 1000ul;
     // Застарілі пороги hold-sleep/reset (сон і restart тепер кліками).
     static constexpr uint16_t encoderSleepHoldMs = 5000;
     static constexpr uint16_t encoderHardResetHoldMs = 10000;
     static constexpr uint16_t btForgetPairedHoldMs = 1400;
-    // Wi‑Fi: 4×клик + удержание без поворота — вкл/выкл SoftAP (как по духу жесту сброса BT).
-    static constexpr uint16_t encoderSoftApToggleHoldMs = 2000;
+    // Wi‑Fi: SoftAP по encoderSoftApToggleClicks (просто клики).
+    // % АКБ — encoderBatteryClicks.
 
     // Раньше: АЦП для VolAnalyzer. Сейчас уровень берётся из PCM в audio_process_extern (см. BendeRadio.ino).
     static constexpr uint8_t analyzPin = 34;
@@ -135,6 +141,12 @@ class RadioConfig {
     static constexpr uint16_t batteryShutdownBelowMv = 6200;
     // Нижче цього зарядка НЕ рятує: робочий ЗП тримав би банку вище.
     static constexpr uint16_t batteryCriticalMv = 5600;
+    // Sleep по % тільки після «живого» делителя: пакет у вікні і стабільний АЦП.
+    // Плаваючий GPIO1 часто дає ~5–5.5 В і раніше хибно вмикав sleep.
+    static constexpr uint16_t batterySensePresentMinMv = 6000;
+    static constexpr uint16_t batterySensePresentMaxMv = 9200;
+    static constexpr uint16_t batterySenseStablePinSpreadMv = 100;  // max−min pin за замір
+    static constexpr uint8_t batterySenseLatchSamples = 2;
     // Подряд столько замеров (с интервалом выше) должны быть < порога — защита от шума АЦП.
     static constexpr uint8_t batteryShutdownConsecutiveSamples = 2;
     // Ниже этого % (без активной зарядки) — грустные глаза по битмапу (левый/правый — отдельные массивы в core0).
@@ -146,7 +158,7 @@ class RadioConfig {
     static constexpr uint16_t batterySadEyesPupilStepMs = 1200;
     // Грустные глаза: зрачок позиционируется от центра (dx,dy) в core0; сдвиг не используется.
     static constexpr int8_t batterySadEyesPupilOffsetY = 0;
-    // 5 кликов: % АКБ на «роте»; скільки мс показувати (потім зникає).
+    // encoderBatteryClicks: % АКБ на «роте»; скільки мс показувати (потім зникає).
     static constexpr uint32_t batteryPercentShowDurationMs = 3000;
     // Пока идёт зарядка — дольше держим иконку (анимация заливки).
     static constexpr uint32_t batteryPercentShowDurationChargingMs = 12000;
@@ -178,7 +190,7 @@ class RadioConfig {
     static constexpr uint8_t micPcmShiftRight = 14;
     static constexpr int micDigitalGain = 4;
 
-    // SoftAP: см. encoderSoftApToggleHoldMs + жест 4×клик+удерж. в режиме Wi‑Fi.
+    // SoftAP: encoderSoftApToggleClicks (просто клики, без удержания).
     // Станція / гучність на роті — фіксований період matrix_tmr (не довше за batteryPercentShowDurationMs після батареї).
     static constexpr uint16_t matrixOverlayDigitsMs = 1000;
 

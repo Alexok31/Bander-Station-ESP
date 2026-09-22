@@ -191,17 +191,7 @@ void setup() {
     String apSsid = nvsEffectiveApSsid(w);
     String apPwd = nvsEffectiveApPass(w);
 
-    WiFi.mode(WIFI_STA);
-    wifiConnecting = true;
-    WiFi.begin(staSsid.c_str(), staPass.c_str());
-
-    uint32_t tWifi = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - tWifi < 25000) {
-        delay(50);
-    }
-    wifiConnecting = false;
-
-    if (WiFi.status() != WL_CONNECTED) {
+    if (!wifi_sta_connect(staSsid, staPass, 30000u)) {
         // Стабильность WebUI выше в AP-only (без одновременного STA-трафика и стрима).
         WiFi.mode(WIFI_AP);
         if (apPwd.length() >= 8) {
@@ -214,7 +204,8 @@ void setup() {
     Serial.println();
     if (WiFi.status() == WL_CONNECTED) {
         Serial.println(WiFi.localIP());
-        Serial.println(F("SoftAP: Wi-Fi mode — 4 clicks + hold 2s (no turn) to toggle AP for setup"));
+        Serial.println(F("SoftAP: 6 clicks | offline WiFi+radio: 1 click play when offline"));
+        Serial.println(F("Battery %: 5 | Pong: 7 | Sleep: 8 | Restart: 9"));
     } else {
         Serial.println(F("STA: not connected (use SoftAP for setup)"));
     }
@@ -227,10 +218,15 @@ void setup() {
     bender_ai_begin();
     airplay_begin();
     airplay_set_accept(play_mode_is_airplay());
-    Serial.println(F("Bender AI: hold=talk; 7 clicks=sleep; 8=restart; idle 5 min=calm, 30 min=sleep"));
+    Serial.println(F("Bender AI: hold=talk; 8 clicks=sleep; 9=restart; idle 5 min=calm, 30 min=sleep"));
     Serial.println(F("Mode: 4 clicks = FM / AIR"));
     Serial.println(F("FM: 2 clicks=next station, 3=prev"));
     Serial.println(F("AirPlay: 1 click=pause, 2=next, 3=prev"));
+    Serial.println(F("5=battery  6=SoftAP  7=pong  8=sleep  9=restart"));
+    Serial.println(F("Offline: 1 click play = reconnect WiFi then radio"));
+    if (RadioConfig::pololuOffPin != 255) {
+        Serial.printf("Pololu OFF: GPIO%u (8 clicks / low batt)\n", (unsigned)RadioConfig::pololuOffPin);
+    }
 
     if (!(esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 && RadioConfig::wakeAfterSleepAnimMs > 0)) {
         change_state();
@@ -312,6 +308,11 @@ void loop() {
             if (audio.isRunning()) {
                 audio.stopSong();
             }
+            apply_output_volume();
+            syncWifiWithAudioSilence();
+        } else if (WiFi.status() != WL_CONNECTED) {
+            // Без сети connecttohost надолго блокирует loop — клики «тупят».
+            Serial.println(F("[Audio] skip reconnect: no WiFi"));
             apply_output_volume();
             syncWifiWithAudioSilence();
         } else {

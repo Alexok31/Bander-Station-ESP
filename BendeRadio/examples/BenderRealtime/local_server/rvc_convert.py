@@ -42,7 +42,16 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def enabled() -> bool:
-    return _env_bool("RVC_ENABLE", False)
+    # Якщо модель є — RVC за замовчуванням увімкнений (інакше Piper «не Бендер»).
+    # Вимкнути явно: RVC_ENABLE=0
+    v = os.environ.get("RVC_ENABLE")
+    if v is not None and v.strip() != "":
+        return _env_bool("RVC_ENABLE", True)
+    pth = _resolve(os.environ.get("RVC_PTH"), None)
+    if pth is None:
+        cands = sorted(DEFAULT_MODELS.glob("*.pth"))
+        pth = cands[0] if cands else None
+    return bool(pth and pth.is_file())
 
 
 def _resolve(p: str | None, default: Path | None = None) -> Path | None:
@@ -129,6 +138,10 @@ def _start_worker() -> subprocess.Popen:
     log = Path(r"A:\tmp\rvc_worker.log")
     log.parent.mkdir(parents=True, exist_ok=True)
     err = open(log, "ab", buffering=0)
+    # Без консолі: інакше CLOSE вікна start.bat / cmd вбиває Applio (forrtl 200).
+    flags = 0
+    if os.name == "nt":
+        flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
     proc = subprocess.Popen(
         [c["python"], "-u", str(HERE / "rvc_worker.py")],
         cwd=str(c["applio"]),
@@ -138,6 +151,7 @@ def _start_worker() -> subprocess.Popen:
         text=True,
         env=env,
         bufsize=1,
+        creationflags=flags,
     )
     msg = _read_rvcjson(proc, 120.0)
     if not msg.get("ok"):

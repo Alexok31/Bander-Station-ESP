@@ -10,6 +10,7 @@
 #include <mbedtls/base64.h>
 
 #include "AirPlay.h"
+#include "NvsConfig.h"
 #include "RadioConfig.h"
 #include "core0.h"
 #include "pcm_analyzer.h"
@@ -63,20 +64,96 @@ static const char* apiHost() {
     }
     return providerIsXai() ? "api.x.ai" : "api.openai.com";
 }
-static String wsUrl() {
-    if (providerIsLocal()) {
-        String u = "ws://";
-        u += LOCAL_WS_HOST;
+static String defaultLocalWsUrl() {
+    String u = LOCAL_WS_USE_TLS ? String("wss://") : String("ws://");
+    u += LOCAL_WS_HOST;
+    const bool omitPort = LOCAL_WS_USE_TLS && ((int)LOCAL_WS_PORT == 443);
+    if (!omitPort) {
         u += ":";
         u += String(LOCAL_WS_PORT);
-        u += "/v1/realtime";
-        return u;
+    }
+    u += "/v1/realtime";
+    return u;
+}
+
+static String publicWsUrl() {
+#ifdef LOCAL_WS_PUBLIC_HOST
+    const char* host = LOCAL_WS_PUBLIC_HOST;
+    if (host == nullptr || host[0] == '\0') {
+        return String();
+    }
+    String u = "wss://";
+    u += host;
+    u += "/v1/realtime";
+    return u;
+#else
+    return String();
+#endif
+}
+
+static uint32_t s_lan_chk_ms = 0;
+static bool s_lan_ok = false;
+
+static bool lanHostReachable() {
+    if (WiFi.status() != WL_CONNECTED) {
+        s_lan_ok = false;
+        return false;
+    }
+    if (s_lan_chk_ms && (uint32_t)(millis() - s_lan_chk_ms) < 15000u) {
+        return s_lan_ok;
+    }
+    s_lan_chk_ms = millis();
+    WiFiClient c;
+    c.setTimeout(2);
+    s_lan_ok = c.connect(LOCAL_WS_HOST, (uint16_t)LOCAL_WS_PORT);
+    c.stop();
+    return s_lan_ok;
+}
+
+static String wsUrl() {
+    if (providerIsLocal()) {
+        if (lanHostReachable()) {
+            return defaultLocalWsUrl();
+        }
+        String pub = publicWsUrl();
+        if (pub.length()) {
+            return pub;
+        }
+        String ov;
+        nvsLoadAiWsUrl(ov);
+        if (ov.length()) {
+            return ov;
+        }
+        return defaultLocalWsUrl();
     }
     String u = "wss://";
     u += apiHost();
     u += "/v1/realtime?model=";
     u += realtimeModel();
     return u;
+}
+
+static bool wsUrlUsesTls(const String& u) {
+    return u.startsWith("wss://");
+}
+
+static String localBasicAuthHeader() {
+    const String raw = String(LOCAL_WS_USER) + ":" + String(LOCAL_WS_PASS);
+    size_t outLen = 0;
+    const size_t cap = ((raw.length() + 2u) / 3u) * 4u + 8u;
+    unsigned char* out = (unsigned char*)malloc(cap);
+    if (!out) {
+        return String();
+    }
+    const int rc = mbedtls_base64_encode(out, cap, &outLen, (const unsigned char*)raw.c_str(),
+                                         raw.length());
+    String hdr;
+    if (rc == 0 && outLen > 0) {
+        hdr = "Basic ";
+        hdr += String((const char*)out, (unsigned)outLen);
+    }
+    free(out);
+    return hdr;
 }
 
 static const char* SYS_PROMPT =
@@ -167,6 +244,12 @@ static uint8_t* s_demo_pcm = nullptr;
 static size_t s_demo_cap = 0;
 static volatile uint32_t s_progress_ms = 0;
 static volatile uint32_t s_last_pcm_ms = 0;
+
+static bool s_ai_debug = false;
+static uint8_t* s_dbg_pcm = nullptr;
+static size_t s_dbg_cap = 0;
+static size_t s_dbg_len = 0;
+static volatile bool s_dbg_play = false;
 
 static size_t rbFree() {
     return (tail - head - 1 + RING_BYTES) % RING_BYTES;
@@ -353,6 +436,8 @@ static void forceRecover(const char* why) {
     speaking = false;
     s_tts_out_ms = 0;
     s_last_pcm_ms = 0;
+    s_dbg_play = false;
+    s_dbg_len = 0;
     portENTER_CRITICAL(&mux);
     head = tail = 0;
     portEXIT_CRITICAL(&mux);
@@ -433,6 +518,8 @@ static void resetTxState() {
     preN = 0;
     preHead = 0;
     s_preN_at_arm = 0;
+    s_dbg_play = false;
+    s_dbg_len = 0;
     micResetSmooth();
 }
 
@@ -558,6 +645,26 @@ static void sendMicAppendBytes(const uint8_t* pcm, size_t nbytes) {
     wsSendRaw(json);
 }
 
+static void dbgCaptureClear() {
+    s_dbg_len = 0;
+    s_dbg_play = false;
+}
+
+static void dbgCaptureAppend(const uint8_t* pcm, size_t nbytes) {
+    if (!s_ai_debug || !s_dbg_pcm || !pcm || !nbytes) {
+        return;
+    }
+    size_t room = (s_dbg_cap > s_dbg_len) ? (s_dbg_cap - s_dbg_len) : 0;
+    if (nbytes > room) {
+        nbytes = room;
+    }
+    if (!nbytes) {
+        return;
+    }
+    memcpy(s_dbg_pcm + s_dbg_len, pcm, nbytes);
+    s_dbg_len += nbytes;
+}
+
 static void prePush(const uint8_t* pcm) {
     if (!prebuf) {
         return;
@@ -595,6 +702,7 @@ static void drainPrebufToWs(uint8_t max_n) {
             n++;
         }
         sendMicAppendBytes(pack, (size_t)got * CHUNK_BYTES);
+        dbgCaptureAppend(pack, (size_t)got * CHUNK_BYTES);
     }
 }
 
@@ -605,6 +713,7 @@ static void pttStartCapture() {
     serverCommitted = false;
     commitWhenReady = false;
     micResetSmooth();
+    dbgCaptureClear();
     convState = ST_RECORDING;
     stateSinceMs = millis();
     ALOG("[PTT] REC queued=%u ms\n", (unsigned)preN * 10);
@@ -1011,9 +1120,13 @@ static void wsTask(void*) {
             ALOG("[WSS] connecting… heap=%u\n", (unsigned)ESP.getFreeHeap());
             sessionReady = false;
             wsClient.close();
-            if (!wsClient.connect(wsUrl())) {
+            const String url = wsUrl();
+            if (wsUrlUsesTls(url)) {
+                wsClient.setInsecure();
+            }
+            if (!wsClient.connect(url)) {
                 wsClient.close();
-                ALOG("[WSS] connect fail %s heap=%u\n", wsUrl().c_str(),
+                ALOG("[WSS] connect fail %s heap=%u\n", url.c_str(),
                      (unsigned)ESP.getFreeHeap());
                 backoff = minOfU32(backoff ? backoff * 2 : 500u, 8000u);
                 if (!pttHeld && (s_owns_spk || convState != ST_IDLE || s_taking)) {
@@ -1103,13 +1216,21 @@ static void wsTask(void*) {
         }
 
         if (respPlaybackPending && rbUsed() == 0 && !speaking) {
-            respPlaybackPending = false;
-            convState = ST_IDLE;
-            requestHangup();
+            if (!s_dbg_play && s_ai_debug && s_dbg_pcm && s_dbg_len >= CHUNK_BYTES) {
+                s_dbg_play = true;
+                ALOG("[DBG] play mic %u ms\n", (unsigned)((s_dbg_len / CHUNK_BYTES) * 10u));
+                pushPcmBytes(s_dbg_pcm, s_dbg_len);
+            } else {
+                s_dbg_play = false;
+                respPlaybackPending = false;
+                convState = ST_IDLE;
+                requestHangup();
+            }
         }
 
         const bool busy = convState == ST_RECORDING || convState == ST_WAIT_RESP || waitingACK ||
-                          responsePending || speaking || (respPlaybackPending && rbUsed() > 0);
+                          responsePending || speaking || (respPlaybackPending && rbUsed() > 0) ||
+                          s_dbg_play;
         if (hangupPending && wantOnline && !busy && !pttHeld) {
             doHangup();
         }
@@ -1161,7 +1282,7 @@ static bool initMic() {
 
 bool bender_ai_busy() {
     return s_demo || s_owns_spk || convState != ST_IDLE || speaking || waitingACK || responsePending ||
-           (respPlaybackPending && rbUsed() > 0) || pttHeld;
+           (respPlaybackPending && rbUsed() > 0) || pttHeld || s_dbg_play;
 }
 
 bool bender_ai_recording() {
@@ -1309,7 +1430,7 @@ void bender_ai_tick() {
     }
     const bool pcm_fresh = s_last_pcm_ms && (millis() - s_last_pcm_ms < 800);
     if (s_giveback && !pttHeld && convState != ST_RECORDING && convState != ST_WAIT_RESP &&
-        !responsePending && !waitingACK && rbUsed() == 0 && !pcm_fresh) {
+        !responsePending && !waitingACK && !s_dbg_play && rbUsed() == 0 && !pcm_fresh) {
         s_giveback = false;
         s_demo = 0;
         speaking = false;
@@ -1344,10 +1465,23 @@ void bender_ai_begin() {
         ALOGLN(F("[MIC] demo buf fail"));
         s_demo_cap = 0;
     }
+    // До 15 с запису мікрофона для debug-прослушки після відповіді.
+    s_dbg_cap = (size_t)RATE * 2u * (size_t)(MAX_RECORD_MS / 1000u);
+    s_dbg_pcm = (uint8_t*)ps_malloc(s_dbg_cap);
+    if (!s_dbg_pcm) {
+        ALOGLN(F("[DBG] capture buf fail"));
+        s_dbg_cap = 0;
+    }
+    s_ai_debug = nvsLoadAiDebug();
+    ALOG("[DBG] mode %s\n", s_ai_debug ? "ON" : "OFF");
+    wsClient.setInsecure();
     if (providerIsLocal()) {
-        ALOG("[WSS] local %s (sleep until PTT)\n", wsUrl().c_str());
+        const String basic = localBasicAuthHeader();
+        if (basic.length()) {
+            wsClient.addHeader("Authorization", basic);
+        }
+        ALOG("[WSS] local %s auth=basic (sleep until PTT)\n", wsUrl().c_str());
     } else {
-        wsClient.setInsecure();
         wsClient.addHeader("Authorization", String("Bearer ") + apiKey());
     }
     wsClient.onEvent(onEvent);
@@ -1356,5 +1490,18 @@ void bender_ai_begin() {
     xTaskCreatePinnedToCore(speakerTask, "ai_spk", 4096, nullptr, 2, nullptr, 1);
     xTaskCreatePinnedToCore(wsTask, "ai_ws", 16384, nullptr, 5, nullptr, 1);
     s_started = true;
-    ALOGLN(F("[AI] PTT hold=talk  7=sleep  8=restart"));
+    ALOGLN(F("[AI] PTT hold=talk  8=sleep  9=restart"));
+}
+
+void bender_ai_set_debug(bool on) {
+    s_ai_debug = on;
+    nvsSaveAiDebug(on);
+    if (!on) {
+        dbgCaptureClear();
+    }
+    ALOG("[DBG] mode %s\n", on ? "ON" : "OFF");
+}
+
+bool bender_ai_debug() {
+    return s_ai_debug;
 }

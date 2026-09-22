@@ -22,3 +22,6 @@ void bender_ai_ptt_down();
 void bender_ai_ptt_up();
 void bender_ai_ptt_cancel();
 void bender_ai_yield_radio();
+
+void bender_ai_set_debug(bool on);
+bool bender_ai_debug();

@@ -172,3 +172,77 @@ void nvsSetPendingBrightnessOverride(uint8_t value) {
     p.putUChar("br_ovr", (uint8_t)constrain((int)value, 0, 15));
     p.end();
 }
+
+bool nvsNormalizeAiWsUrl(String& url) {
+    url.trim();
+    url.replace(" ", "");
+    if (url.length() == 0) {
+        return true;
+    }
+    if (url.startsWith("https://")) {
+        url = String("wss://") + url.substring(8);
+    } else if (url.startsWith("http://")) {
+        url = String("ws://") + url.substring(7);
+    }
+    if (!url.startsWith("ws://") && !url.startsWith("wss://")) {
+        return false;
+    }
+    const int schemeEnd = url.startsWith("wss://") ? 6 : 5;
+    if (url.indexOf('/', schemeEnd) < 0) {
+        if (url.endsWith("/")) {
+            url.remove(url.length() - 1);
+        }
+        url += F("/v1/realtime");
+    }
+    return url.length() > 0 && url.length() <= 160;
+}
+
+void nvsLoadAiWsUrl(String& outUrl) {
+    outUrl = "";
+    Preferences p;
+    if (!p.begin(kNs, true)) {
+        return;
+    }
+    String v = p.getString("ai_wsurl", "");
+    p.end();
+    if (!nvsNormalizeAiWsUrl(v)) {
+        return;
+    }
+    outUrl = v;
+}
+
+void nvsSaveAiWsUrl(const String& url) {
+    String v = url;
+    if (!nvsNormalizeAiWsUrl(v)) {
+        v = "";
+    }
+    Preferences p;
+    if (!p.begin(kNs, false)) {
+        return;
+    }
+    if (v.length() == 0) {
+        p.remove("ai_wsurl");
+    } else {
+        p.putString("ai_wsurl", v);
+    }
+    p.end();
+}
+
+bool nvsLoadAiDebug() {
+    Preferences p;
+    if (!p.begin(kNs, true)) {
+        return false;
+    }
+    const bool on = p.getBool("ai_debug", false);
+    p.end();
+    return on;
+}
+
+void nvsSaveAiDebug(bool on) {
+    Preferences p;
+    if (!p.begin(kNs, false)) {
+        return;
+    }
+    p.putBool("ai_debug", on);
+    p.end();
+}
