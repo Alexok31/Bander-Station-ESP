@@ -7,7 +7,6 @@
 
 #include "NvsConfig.h"
 #include "RadioConfig.h"
-#include "BenderAi.h"
 #include "core0.h"
 
 static WebServer server(80);
@@ -179,14 +178,6 @@ static void sendPage() {
               "из прошивки. ПК: start.bat + один раз enable_funnel.bat. "
               "Колонке в другом городе нужна любая Wi‑Fi с интернетом.</p>");
 
-    const bool dbgOn = bender_ai_debug();
-    html += F("<h2>AI DEBUG</h2>");
-    html += F("<button class=\"btn\" type=\"button\" id=\"dbgBtn\" onclick=\"toggleDbg()\">");
-    html += dbgOn ? F("DEBUG MODE: ВКЛ") : F("DEBUG MODE: ВЫКЛ");
-    html += F("</button>");
-    html += F("<p class=\"muted\">Вкл: после ответа Бендера колонка проиграет твою запись с микрофона. "
-              "Выкл: только ответ Бендера. Без перезагрузки.</p>");
-
     int8_t trim[RadioConfig::matrixModuleCount] = {0, 0, 0, 0, 0};
     matrix_get_brightness_trim(trim, RadioConfig::matrixModuleCount);
     html += F("<h2>КАЛИБРОВКА МАТРИЦ</h2>");
@@ -228,10 +219,6 @@ static void sendPage() {
               "function evtAdj(ev,i,d){ev.stopPropagation();adj(i,d);}"
               "function startCalib(){for(let i=0;i<5;i++){setV(i,CALIB_START,false);}queueCalib();}"
               "for(let i=0;i<5;i++){setV(i,getV(i),false);}"
-              "function toggleDbg(){fetch('/debug',{method:'POST'}).then(r=>r.json()).then(j=>{"
-              "const b=document.getElementById('dbgBtn');"
-              "if(b)b.textContent=j.on?'DEBUG MODE: ВКЛ':'DEBUG MODE: ВЫКЛ';"
-              "}).catch(()=>{});}"
               "</script>"
               "</body></html>");
 
@@ -319,19 +306,6 @@ static void handleSave() {
     ESP.restart();
 }
 
-static void handleDebug() {
-    wifi_touch_activity();
-    if (server.method() != HTTP_POST) {
-        web_send_close_connection();
-        server.send(405, "text/plain", "Method Not Allowed");
-        return;
-    }
-    const bool on = !bender_ai_debug();
-    bender_ai_set_debug(on);
-    web_send_close_connection();
-    server.send(200, "application/json", on ? "{\"ok\":true,\"on\":true}" : "{\"ok\":true,\"on\":false}");
-}
-
 static void handleCalib() {
     wifi_touch_activity();
     if (server.method() != HTTP_POST) {
@@ -368,7 +342,6 @@ void webUiBegin() {
         server.on("/ncsi.txt", HTTP_ANY, captiveProbeOk);              // Windows fallback
         server.on("/", HTTP_GET, sendPage);
         server.on("/calib", HTTP_POST, handleCalib);
-        server.on("/debug", HTTP_POST, handleDebug);
         server.on("/save", HTTP_POST, handleSave);
         server.onNotFound([]() {
             web_send_close_connection();

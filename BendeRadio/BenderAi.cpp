@@ -6,6 +6,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <cstring>
+#include <atomic>
 #include <esp_wifi.h>
 #include <mbedtls/base64.h>
 
@@ -259,6 +260,12 @@ static size_t rbUsed() {
 }
 
 static volatile uint32_t s_tts_out_ms = 0;
+static std::atomic<uint32_t> s_face_error_ms{0};
+
+static void showFaceError() {
+    const uint32_t now = millis();
+    s_face_error_ms.store(now ? now : UINT32_MAX, std::memory_order_relaxed);
+}
 
 static void ampMuteHw(bool mute) {
     if (RadioConfig::ampMutePin == 255) {
@@ -423,7 +430,10 @@ static void noteProgress() {
 
 static uint32_t s_sock_wait_ms;
 
-static void forceRecover(const char* why) {
+static void forceRecover(const char* why, bool show_error = false) {
+    if (show_error) {
+        showFaceError();
+    }
     ALOG("[AI] recover %s heap=%u\n", why ? why : "?", (unsigned)ESP.getFreeHeap());
     waitingACK = false;
     responsePending = false;
@@ -752,6 +762,7 @@ static void tryPttCommit() {
     ALOG("[PTT] %s recMs=%u peak=%d\n", ok ? "COMMIT" : "CLEAR", (unsigned)recMs, (int)recPeak);
     resetRecStats();
     if (!ok) {
+        showFaceError();  // Too short/quiet: acknowledge the rejected recording visually.
         convState = ST_IDLE;
         requestHangup();
     }
@@ -941,7 +952,7 @@ static void onMessage(websockets::WebsocketsMessage m) {
     } else if (!strcmp(t, "error")) {
         const char* msg = j["error"]["message"] | "";
         ALOG("[WSS] error: %s\n", msg);
-        forceRecover("ws error");
+        forceRecover("ws error", true);
     } else if (!strcmp(t, "device.command")) {
         const char* name = j["name"] | "";
         const int st = j["args"]["station"] | -1;
@@ -954,10 +965,12 @@ static void onEvent(websockets::WebsocketsEvent e, String) {
         wsReady = true;
         ALOGLN(F("[WSS] opened"));
     } else if (e == websockets::WebsocketsEvent::ConnectionClosed) {
+        // Closing an idle/prewarmed socket is normal, not a failed conversation.
+        const bool interrupted = convState != ST_IDLE || pttHeld || waitingACK || responsePending || speaking;
         wsReady = false;
         sessionReady = false;
         ALOGLN(F("[WSS] closed"));
-        forceRecover("ws closed");
+        forceRecover("ws closed", interrupted);
     } else if (e == websockets::WebsocketsEvent::GotPing) {
         wsClient.pong();
     }
@@ -1130,7 +1143,7 @@ static void wsTask(void*) {
                      (unsigned)ESP.getFreeHeap());
                 backoff = minOfU32(backoff ? backoff * 2 : 500u, 8000u);
                 if (!pttHeld && (s_owns_spk || convState != ST_IDLE || s_taking)) {
-                    forceRecover("connect fail");
+                    forceRecover("connect fail", true);
                 }
             } else {
                 backoff = 0;
@@ -1206,26 +1219,20 @@ static void wsTask(void*) {
         const uint32_t waitLim = providerIsLocal() ? 45000u : 20000u;
         if (convState == ST_WAIT_RESP && s_progress_ms && (millis() - s_progress_ms > waitLim)) {
             ALOGLN(F("[PTT] timeout"));
-            forceRecover("wait timeout");
+            forceRecover("wait timeout", true);
             requestHangup();
         }
         if (s_sock_wait_ms && !sessionReady && !pttHeld &&
             (uint32_t)(millis() - s_sock_wait_ms) > 5000u) {
             ALOGLN(F("[PTT] no socket — radio back"));
-            forceRecover("no socket");
+            forceRecover("no socket", true);
         }
 
         if (respPlaybackPending && rbUsed() == 0 && !speaking) {
-            if (!s_dbg_play && s_ai_debug && s_dbg_pcm && s_dbg_len >= CHUNK_BYTES) {
-                s_dbg_play = true;
-                ALOG("[DBG] play mic %u ms\n", (unsigned)((s_dbg_len / CHUNK_BYTES) * 10u));
-                pushPcmBytes(s_dbg_pcm, s_dbg_len);
-            } else {
-                s_dbg_play = false;
-                respPlaybackPending = false;
-                convState = ST_IDLE;
-                requestHangup();
-            }
+            s_dbg_play = false;
+            respPlaybackPending = false;
+            convState = ST_IDLE;
+            requestHangup();
         }
 
         const bool busy = convState == ST_RECORDING || convState == ST_WAIT_RESP || waitingACK ||
@@ -1304,6 +1311,19 @@ bool bender_ai_tts_playing() {
     return t != 0 && (millis() - t) < 80u;
 }
 
+BenderFaceState bender_ai_face_state() {
+    const uint32_t now = millis();
+    const bool output_recent = s_owns_spk && bender_face_recent(now, s_tts_out_ms, 300u);
+    return bender_face_resolve({
+        bender_face_recent(now, s_face_error_ms.load(std::memory_order_relaxed), 2200u),
+        convState == ST_RECORDING,
+        !pttHeld || s_need_commit,
+        output_recent,
+        convState == ST_WAIT_RESP || waitingACK || responsePending || s_need_speaker ||
+            (respPlaybackPending && rbUsed() > 0),
+    });
+}
+
 void bender_ai_wake() {
     s_ai_awake = true;
     wantOnline = true;
@@ -1366,6 +1386,11 @@ void bender_ai_ptt_down() {
         ALOGLN(F("[PTT] wait answer"));
         return;
     }
+    s_face_error_ms.store(0, std::memory_order_relaxed);
+    if (!s_started || WiFi.status() != WL_CONNECTED || !s_mic_on) {
+        showFaceError();
+        return;
+    }
     if (!wsReady) {
         const uint32_t t0 = millis();
         while (!wsReady && (uint32_t)(millis() - t0) < 1200u) {
@@ -1373,6 +1398,7 @@ void bender_ai_ptt_down() {
         }
         if (!wsReady) {
             ALOGLN(F("[PTT] no socket — radio stays"));
+            showFaceError();
             return;
         }
     }
@@ -1391,6 +1417,7 @@ void bender_ai_ptt_down() {
     }
     if (!takeSpeaker()) {
         ALOGLN(F("[PTT] no speaker — TTS mute"));
+        showFaceError();
     }
     pttHeld = true;
     wantOnline = true;
@@ -1426,6 +1453,7 @@ void bender_ai_tick() {
         s_need_speaker = false;
         if (!takeSpeaker()) {
             ALOGLN(F("[AI] take speaker fail"));
+            showFaceError();
         }
     }
     const bool pcm_fresh = s_last_pcm_ms && (millis() - s_last_pcm_ms < 800);
@@ -1472,7 +1500,12 @@ void bender_ai_begin() {
         ALOGLN(F("[DBG] capture buf fail"));
         s_dbg_cap = 0;
     }
-    s_ai_debug = nvsLoadAiDebug();
+    // Debug playback is opt-in for the current session, including after an update
+    // from firmware that persisted an enabled debug flag.
+    s_ai_debug = false;
+    if (nvsLoadAiDebug()) {
+        nvsSaveAiDebug(false);
+    }
     ALOG("[DBG] mode %s\n", s_ai_debug ? "ON" : "OFF");
     wsClient.setInsecure();
     if (providerIsLocal()) {
@@ -1495,7 +1528,6 @@ void bender_ai_begin() {
 
 void bender_ai_set_debug(bool on) {
     s_ai_debug = on;
-    nvsSaveAiDebug(on);
     if (!on) {
         dbgCaptureClear();
     }

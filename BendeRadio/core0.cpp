@@ -414,6 +414,42 @@ static void draw_eyes_radio_idle_off() {
     draw_eyeb(1, 3, 5);
 }
 
+// Called only by core0. Clear the eye area so lids from the previous expression
+// cannot leak into the next one. Mouth overlays (volume/battery) remain separate.
+static void draw_ai_eyes(BenderFaceState state, uint32_t elapsed) {
+    const int x0 = RadioConfig::analyzWidth;
+    mtrx.rect(x0, 0, x0 + 15, 7, GFX_CLEAR);
+    for (uint8_t i = 0; i < 2; ++i) {
+        draw_eye(i);
+        const int x = x0 + i * 8;
+        if (state == BenderFaceState::Listening) {
+            // Wide, attentive eyes. One short blink, not a constant flashing cue.
+            draw_eyeb(i, 3, 3, 3);
+            if (elapsed % 3200u > 3050u) {
+                mtrx.rect(x, 0, x + 7, 2, GFX_CLEAR);
+                mtrx.rect(x, 5, x + 7, 7, GFX_CLEAR);
+            }
+        } else if (state == BenderFaceState::Thinking) {
+            const int gaze = ((elapsed / 900u) % 2u) ? 4 : 2;
+            draw_eyeb(i, gaze, 1);
+            mtrx.lineH(7, x, x + 7, GFX_CLEAR);
+        } else if (state == BenderFaceState::Error) {
+            // Asymmetric lids and a small sideways glance: puzzled/annoyed.
+            mtrx.rect(x, 0, x + 7, i == 0 ? 2 : 1, GFX_CLEAR);
+            draw_eyeb(i, elapsed < 700u ? 2 : 4, 4);
+        } else {
+            draw_eyeb(i, ((elapsed / 1100u) % 2u) ? 3 : 2, 3);
+        }
+    }
+}
+
+static void draw_ai_error_mouth() {
+    mtrx.rect(0, 0, RadioConfig::analyzWidth - 1, 7, GFX_CLEAR);
+    const int mid = RadioConfig::analyzWidth / 2;
+    mtrx.lineH(4, mid - 7, mid + 2);
+    mtrx.lineH(3, mid + 3, mid + 6);
+}
+
 // Грустные глаза: uint8_t IMAGES[][8] пользователя → uint64 (младший байт = верхняя строка кадра для blit).
 // Левый: 0x00,0x1e,0x3f,0x7f,0xff,0xff,0x7e,0x3c
 static const uint64_t kBatterySadEyeFramesLeft[] = {
@@ -1140,6 +1176,59 @@ static void draw_mouth_anim_rest(bool invert) {
     }
 }
 
+// Bend the selected resting artwork, rather than replace it with a loading icon.
+// Logical coordinates via get()/dot() respect MAX7219 rotation and wiring.
+static void draw_ai_thinking_mouth(uint32_t elapsed, uint32_t started_ms) {
+    constexpr int W = RadioConfig::analyzWidth;
+    static uint8_t resting_columns[W];
+    static uint8_t cached_mode = 255;
+    static uint32_t cached_start_ms = 0;
+    const uint8_t mode = mouth_anim_mode();
+    const bool invert = mode == 1 || mode == 4;
+
+    if (cached_mode != mode || cached_start_ms != started_ms) {
+        mtrx.rect(0, 0, W - 1, 7, mouth_gfx_off(invert));
+        draw_mouth_anim_rest(invert);
+        for (int x = 0; x < W; ++x) {
+            uint8_t column = 0;
+            for (int y = 0; y < 8; ++y) {
+                if (mtrx.get(x, y) != invert) {
+                    column |= uint8_t(1u << y);
+                }
+            }
+            resting_columns[x] = column;
+        }
+        cached_mode = mode;
+        cached_start_ms = started_ms;
+    }
+
+    // Ease into a thoughtful, slightly downturned mouth over 900 ms, then hold.
+    // Raising the middle relative to the corners also works for an EQ/progress
+    // frame resting on the bottom row, without pushing pixels off the display.
+    const float t = elapsed < 900u ? float(elapsed) / 900.f : 1.f;
+    const float strength = t * t * (3.f - 2.f * t);
+    for (int x = 0; x < W; ++x) {
+        const float side = W > 1 ? 2.f * float(x) / float(W - 1) - 1.f : 0.f;
+        // Middle +2 px, left corner +1 px, right corner unchanged: an asymmetric
+        // arch like the thinking reference, with the right corner sitting lower.
+        const float arch = 1.5f * (1.f - side * side) + 0.5f * (1.f - side);
+        uint8_t lift = uint8_t(roundf(strength * arch));
+        const uint8_t column = resting_columns[x];
+        uint8_t room = 0;
+        while (room < 8u && !(column & (1u << room))) {
+            ++room;
+        }
+        if (lift > room) {
+            lift = room;  // Preserve every foreground pixel, even at the top edge.
+        }
+        const uint8_t bent = column >> lift;
+        for (int y = 0; y < 8; ++y) {
+            const bool foreground = (bent & (1u << y)) != 0;
+            mtrx.dot(x, y, foreground ? mouth_gfx_on(invert) : mouth_gfx_off(invert));
+        }
+    }
+}
+
 // ========================= SYSTEM =========================
 static uint32_t s_wifi_last_activity_ms = 0;
 
@@ -1505,6 +1594,9 @@ void core0(void* p) {
     // BT: 4 клика + удержание без поворота — сброс сопряжений и вход в поиск нового телефона.
     static bool s_bt_forget_pair_hold_ready = false;
     static bool s_ptt_this_press = false;
+    BenderFaceState previous_ai_face = BenderFaceState::Idle;
+    uint32_t ai_face_since_ms = 0;
+    uint32_t ai_face_frame_ms = 0;
 
     EEPROM.begin(memory.blockSize());
     memory.begin(0, 'b');
@@ -1757,7 +1849,6 @@ void core0(void* p) {
         if (eb_tick && eb.pressing() && !s_ptt_this_press && !s_enc_hold_had_turn_while_pressed &&
             eb.getClicks() == 0 && !pong_active() && !s_mode_pick_active &&
             !show_wake_after_sleep_anim && strcmp(g_audio_source, "bt") != 0 &&
-            WiFi.status() == WL_CONNECTED &&
             eb.pressFor() >= RadioConfig::encoderPttHoldMs && !bender_ai_recording()) {
             s_ptt_this_press = true;
             bender_ai_ptt_down();
@@ -1837,12 +1928,59 @@ void core0(void* p) {
                 memory.update();
             }
         } else {
-            if ((wifiConnecting || (strcmp(g_audio_source, "bt") == 0 && bt_audio_needs_pairing_ui())) &&
+            const BenderFaceState ai_face = bender_ai_face_state();
+            const uint32_t face_now = millis();
+            const bool ai_face_changed = ai_face != previous_ai_face;
+            if (ai_face_changed) {
+                previous_ai_face = ai_face;
+                ai_face_since_ms = face_now;
+                Serial.printf("[Face] %s\n", ai_face == BenderFaceState::Listening ? "listening" :
+                              ai_face == BenderFaceState::Thinking ? "thinking" :
+                              ai_face == BenderFaceState::Speaking ? "speaking" :
+                              ai_face == BenderFaceState::Error ? "error" : "idle");
+            }
+            if (ai_face != BenderFaceState::Idle && !s_mode_pick_active) {
+                s_face_last_live_ms = face_now;
+                const uint32_t frame_ms = ai_face == BenderFaceState::Speaking
+                                              ? RadioConfig::matrixVizTtsRefreshMs : 50u;
+                if (ai_face_changed || uint32_t(face_now - ai_face_frame_ms) >= frame_ms) {
+                    ai_face_frame_ms = face_now;
+                    upd_bright();
+                    draw_ai_eyes(ai_face, uint32_t(face_now - ai_face_since_ms));
+                    if (!matrix_tmr.state()) {
+                        if (ai_face == BenderFaceState::Speaking) {
+                            const uint8_t mode = mouth_anim_mode();
+                            const bool invert = mode == 1 || mode == 4;
+                            mtrx.rect(0, 0, RadioConfig::analyzWidth - 1, 7, mouth_gfx_off(invert));
+                            analyz_note_frame_dt(true);
+                            const uint8_t level = pcm_wave_level_after_gate();
+                            // Track-progress mode has no meaning for a spoken reply.
+                            if (mode == 5) {
+                                analyz_mouth_robot_backup(level, false);
+                            } else if (level > 0) {
+                                draw_mouth_anim(level, invert);
+                            } else {
+                                draw_mouth_anim_rest(invert);
+                            }
+                        } else if (ai_face == BenderFaceState::Listening) {
+                            const uint8_t mode = mouth_anim_mode();
+                            const bool invert = mode == 1 || mode == 4;
+                            mtrx.rect(0, 0, RadioConfig::analyzWidth - 1, 7, mouth_gfx_off(invert));
+                            draw_mouth_anim_rest(invert);
+                        } else if (ai_face == BenderFaceState::Thinking) {
+                            draw_ai_thinking_mouth(uint32_t(face_now - ai_face_since_ms), ai_face_since_ms);
+                        } else {
+                            draw_ai_error_mouth();
+                        }
+                    }
+                    matrix_flush();
+                }
+            } else if ((wifiConnecting || (strcmp(g_audio_source, "bt") == 0 && bt_audio_needs_pairing_ui())) &&
                 !s_mode_pick_active) {
                 anim_search();
             } else {
             if (matrix_face_awake()) {
-                if (eye_tmr) {
+                if (ai_face_changed || eye_tmr) {
                     upd_bright();
                     if (battery_sad_eyes_wanted()) {
                         draw_battery_sad_eyes_both();
@@ -1886,7 +2024,7 @@ void core0(void* p) {
                     }
                 }
             } else {
-                if (eye_tmr) {
+                if (ai_face_changed || eye_tmr) {
                     upd_bright();
                     // Радио выкл.: рот не визуализируется — после оверлея батареи (matrix_tmr) цифры иначе не снимаются.
                     if (!matrix_tmr.state()) {
@@ -1907,7 +2045,7 @@ void core0(void* p) {
                 upd_bright();
                 draw_mode_pick_mouth();
                 matrix_flush();
-            } else if ((viz_tmr || (bender_ai_tts_playing() && tts_mouth_tmr)) && !matrix_tmr.state() &&
+            } else if ((ai_face_changed || viz_tmr || (bender_ai_tts_playing() && tts_mouth_tmr)) && !matrix_tmr.state() &&
                        radioState.mode <= 5 && matrix_face_awake()) {
                 const bool talk = bender_ai_tts_playing() || airplay_playing() ||
                                   (radioState.state && !bender_ai_busy());

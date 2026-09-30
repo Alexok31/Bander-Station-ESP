@@ -54,6 +54,8 @@ HOST = os.environ.get("BENDER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("BENDER_PORT", "8765"))
 IN_RATE = 24000
 OUT_RATE = 24000
+# Mic echo after Bender reply removed (was BENDER_ASR_DEBUG_REPLAY).
+ASR_DEBUG_REPLAY = False
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "").strip()
 XAI_CHAT_URL = "https://api.x.ai/v1/chat/completions"
@@ -2394,8 +2396,6 @@ async def run_turn(ws, pcm_in: bytes, prompt: str, history: list) -> None:
                     history.append({"role": "assistant", "content": _join_reply(parts)})
                 fold_old_turns(history)
                 save_chat(history)
-        if text and asr_ok and not voice_commands.match(text, DEVICE_STATIONS or None):
-            await send_asr_debug_replay(ws, pcm_in)
         await ws.send(dumps({"type": "response.output_audio.done"}))
         await ws.send(dumps({"type": "response.done"}))
     except Exception as e:
