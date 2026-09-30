@@ -23,8 +23,10 @@ import sys
 import uuid
 import unicodedata
 import urllib.request
+from contextlib import aclosing
 from http import HTTPStatus
 from pathlib import Path
+from time import perf_counter
 
 import httpx
 import numpy as np
@@ -41,6 +43,7 @@ except ImportError:
 import rvc_convert
 import stress_convert
 import voice_commands
+from speech_pipeline import TurnTiming, stream_speech
 
 HERE = Path(__file__).resolve().parent
 TUNNEL_URL_PATH = HERE / "tunnel_url.txt"
@@ -1949,17 +1952,17 @@ async def _grok_pieces(history: list[dict], n_pred: int, n_temp: float):
                     yield ev
 
     try:
-        events = _stream(body)
-        async for ev in events:
-            rid = _grok_event_id(ev)
-            if rid:
-                CHAT_GROK_RESP_ID = rid
-            piece = _grok_delta_text(ev)
-            if piece:
-                yield piece
-            err = ev.get("error")
-            if err:
-                raise RuntimeError(str(err)[:300])
+        async with aclosing(_stream(body)) as events:
+            async for ev in events:
+                rid = _grok_event_id(ev)
+                if rid:
+                    CHAT_GROK_RESP_ID = rid
+                piece = _grok_delta_text(ev)
+                if piece:
+                    yield piece
+                err = ev.get("error")
+                if err:
+                    raise RuntimeError(str(err)[:300])
     except RuntimeError as e:
         msg = str(e)
         if prev and ("previous_response" in msg.lower() or "404" in msg or "400" in msg):
@@ -1967,13 +1970,14 @@ async def _grok_pieces(history: list[dict], n_pred: int, n_temp: float):
             CHAT_GROK_RESP_ID = ""
             body.pop("previous_response_id", None)
             body["instructions"] = bender_prompt()
-            async for ev in _stream(body):
-                rid = _grok_event_id(ev)
-                if rid:
-                    CHAT_GROK_RESP_ID = rid
-                piece = _grok_delta_text(ev)
-                if piece:
-                    yield piece
+            async with aclosing(_stream(body)) as events:
+                async for ev in events:
+                    rid = _grok_event_id(ev)
+                    if rid:
+                        CHAT_GROK_RESP_ID = rid
+                    piece = _grok_delta_text(ev)
+                    if piece:
+                        yield piece
         else:
             raise
 
@@ -1990,22 +1994,23 @@ async def iter_llm_sentences(prompt: str, lang: str, asr_p: float, history: list
             pieces = _grok_pieces(history, n_pred, n_temp)
         else:
             pieces = _ollama_pieces(payload)
-        async for piece in pieces:
-            if _cjk_heavy(piece):
-                dropped_cjk = True
-                log("LLM CJK chunk skipped")
-                continue
-            buf += piece
-            sents, buf = _pop_sentences(buf)
-            for s in sents:
-                if _cjk_heavy(s):
+        async with aclosing(pieces):
+            async for piece in pieces:
+                if _cjk_heavy(piece):
                     dropped_cjk = True
-                    log(f"LLM drop CJK: {s[:60]!r}")
+                    log("LLM CJK chunk skipped")
                     continue
-                s = _clean_llm(s)
-                if s:
-                    n_ok += 1
-                    yield s
+                buf += piece
+                sents, buf = _pop_sentences(buf)
+                for s in sents:
+                    if _cjk_heavy(s):
+                        dropped_cjk = True
+                        log(f"LLM drop CJK: {s[:60]!r}")
+                        continue
+                    s = _clean_llm(s)
+                    if s:
+                        n_ok += 1
+                        yield s
         tail = buf
         if tail:
             if _cjk_heavy(tail):
@@ -2141,6 +2146,7 @@ def _piper_pcm(voice, syn, ready, text: str) -> tuple[np.ndarray, int]:
 
 
 def synth(text: str) -> bytes:
+    voice_started = perf_counter()
     if not text.strip():
         text = "Нічого не розчув. Повтори, м'ясний мішок."
     use_en = piper_voice_en is not None and _latin_letter_share(text) > 0.55
@@ -2172,12 +2178,15 @@ def synth(text: str) -> bytes:
             spans22.append((pos, pos + int(p.size)))
         pos += int(p.size)
     pcm = np.concatenate(pieces)
+    piper_ms = (perf_counter() - voice_started) * 1000
     n_q = len(spans22)
     pcm = resample_int16(pcm, sr, OUT_RATE)
     scale = OUT_RATE / float(sr or 22050)
     spans = [(int(a * scale), int(b * scale)) for a, b in spans22]
     out = pcm.tobytes()
+    rvc_ms = 0.0
     if rvc_convert.enabled():
+        rvc_started = perf_counter()
         try:
             n0 = max(1, len(out) // 2)
             out = rvc_convert.convert_pcm(out, OUT_RATE)
@@ -2187,6 +2196,8 @@ def synth(text: str) -> bytes:
             log("RVC ok")
         except Exception as e:
             log(f"RVC fail (Piper raw): {e}")
+        finally:
+            rvc_ms = (perf_counter() - rvc_started) * 1000
     if spans:
         y = np.frombuffer(out, dtype=np.int16).copy()
         for a, b in spans:
@@ -2200,7 +2211,10 @@ def synth(text: str) -> bytes:
         f"TTS {len(out) // 2} samples peak={peak} "
         f"pauses={max(0, len(units) - 1)} q={n_q}"
     )
-    return _trim_pcm_silence(out, OUT_RATE)
+    out = _trim_pcm_silence(out, OUT_RATE)
+    log(f"[Latency] voice chars={len(text)} piper={piper_ms:.0f}ms "
+        f"rvc={rvc_ms:.0f}ms total={(perf_counter() - voice_started) * 1000:.0f}ms")
+    return out
 
 
 def _trim_pcm_silence(pcm: bytes, sr: int, abs_thr: int = 200, pad_ms: int = 120) -> bytes:
@@ -2247,7 +2261,7 @@ async def send_asr_debug_replay(ws, pcm_in: bytes) -> None:
     await send_pcm_deltas(ws, replay)
 
 
-async def send_pcm_deltas(ws, pcm: bytes) -> None:
+async def send_pcm_deltas(ws, pcm: bytes, timing: TurnTiming | None = None) -> None:
     step = 2400 * 2  # 100 ms @ 24 kHz
     if not pcm:
         return
@@ -2257,6 +2271,8 @@ async def send_pcm_deltas(ws, pcm: bytes) -> None:
         piece = pcm[i : i + step]
         b64 = base64.b64encode(piece).decode("ascii")
         await ws.send(dumps({"type": "response.output_audio.delta", "delta": b64}))
+        if timing is not None:
+            timing.mark("first_pcm_sent")
         n += 1
         if n > burst:
             await asyncio.sleep(0.055)
@@ -2272,7 +2288,74 @@ async def send_audio(ws, pcm: bytes, *, emit_created: bool = True) -> None:
     await ws.send(dumps({"type": "response.done"}))
 
 
+async def _iter_checked_reply(text: str, lang: str, asr_p: float, history: list, timing: TurnTiming):
+    """Validate before voicing each sentence; never retry over an accepted prefix."""
+    last_assts = [m.get("content") or "" for m in reversed(history[:-1])
+                  if m.get("role") == "assistant"][:3]
+    limit = max(1, LLM_STORY_SENTS if _is_story(text) else LLM_MAX_SENTS)
+    accepted: list[str] = []
+    rejected = ""
+    for attempt in range(2):
+        hist = list(history)
+        if attempt:
+            hist.append({"role": "user", "content": _LLM_RETRY_NUDGE + "\nБуло:\n" + rejected[:400]})
+        retry = False
+        async with aclosing(iter_llm_sentences(bender_prompt(), lang, asr_p, hist)) as source:
+            async for sentence in source:
+                timing.mark("first_llm_sentence")
+                if len(accepted) >= limit:
+                    # Drain the bounded model response so its stored conversation
+                    # completes normally while the queued speech is already playing.
+                    continue
+                prefix = accepted + [sentence]
+                bad = (
+                    not _strip_loop_sents([sentence])
+                    or _is_canned(prefix)
+                    or _too_like_any([sentence], last_assts + accepted)
+                    or _too_like_any(prefix, last_assts)
+                    or _too_like_user(prefix, text)
+                    or (attempt > 0 and _too_like_last(prefix, rejected))
+                )
+                if bad:
+                    rejected = _join_reply(prefix)
+                    grok_break_chain("canned/repeat during streaming")
+                    if accepted:
+                        log("LLM repeat in tail — keep accepted prefix, drop tail")
+                        return
+                    log("LLM canned/repeat before speech — retry" if not attempt
+                        else "LLM canned again — fallback")
+                    retry = True
+                    break
+                accepted.append(sentence)
+                timing.mark("first_accepted_sentence")
+                log(f"LLM: {sentence!r}")
+                yield sentence
+        if accepted:
+            return
+        if not retry:
+            yield "Не розчув. Повтори."
+            return
+    if _is_story(text):
+        yield _story_fallback(history)
+    elif _is_greet(text):
+        yield _greet_fallback(history)
+    else:
+        yield "Платівка заїла. Повтори коротше, без шаблону."
+
+
 async def run_turn(ws, pcm_in: bytes, prompt: str, history: list) -> None:
+    timing = TurnTiming(log)
+    delivered: list[str] = []
+    reply_recorded = False
+
+    async def synth_sentence(sentence: str) -> bytes:
+        pcm = await asyncio.to_thread(synth, sentence)
+        timing.mark("first_sentence_audio_ready")
+        return pcm
+
+    async def send_sentence(pcm: bytes) -> None:
+        await send_pcm_deltas(ws, pcm, timing)
+
     await ws.send(dumps({"type": "response.created"}))
     stop = asyncio.Event()
 
@@ -2292,13 +2375,14 @@ async def run_turn(ws, pcm_in: bytes, prompt: str, history: list) -> None:
     try:
         log(f"STT {len(pcm_in)} bytes ({whisper_device}/{whisper_name}) …")
         text, lang, asr_p, asr_ok = await asyncio.to_thread(transcribe, pcm_in)
+        timing.mark("stt_done")
         log(f"ASR: {text!r}")
         if not text or not asr_ok:
             log("ASR drop (тиша або сміття) — без LLM, історію не псуємо")
             reply = _miss_fallback()
             log(f"ASR miss → {reply!r}")
-            pcm_out = await asyncio.to_thread(synth, reply)
-            await send_pcm_deltas(ws, pcm_out)
+            pcm_out = await synth_sentence(reply)
+            await send_sentence(pcm_out)
         else:
             history.append({"role": "user", "content": text})
             cmd = voice_commands.match(text, DEVICE_STATIONS or None)
@@ -2307,8 +2391,8 @@ async def run_turn(ws, pcm_in: bytes, prompt: str, history: list) -> None:
                 reply = cmd.reply(len(history))
                 send_name = cmd.name
                 log(f"CMD {send_name or 'talk'} {play_args} → {reply!r}")
-                pcm_out = await asyncio.to_thread(synth, reply)
-                await send_pcm_deltas(ws, pcm_out)
+                pcm_out = await synth_sentence(reply)
+                await send_sentence(pcm_out)
                 history.append({"role": "assistant", "content": reply})
                 if send_name:
                     await ws.send(dumps({
@@ -2321,90 +2405,30 @@ async def run_turn(ws, pcm_in: bytes, prompt: str, history: list) -> None:
             else:
                 reply_lang = _reply_lang(text, lang)
                 log(f"LLM {LLM_PROVIDER} (reply_lang={reply_lang})")
-                n = 0
-                parts: list[str] = []
-                max_sents = LLM_STORY_SENTS if _is_story(text) else LLM_MAX_SENTS
-
-                async def _collect(extra: list[dict] | None = None) -> list[str]:
-                    out: list[str] = []
-                    hist = history if not extra else (list(history) + extra)
-                    async for sent in iter_llm_sentences(
-                        bender_prompt(), reply_lang, asr_p, hist
-                    ):
-                        out.append(sent)
-                        log(f"LLM: {sent!r}")
-                        if len(out) >= max_sents:
-                            break
-                    return out
-
-                parts = await _collect()
-                last_assts: list[str] = []
-                for m in reversed(history[:-1]):
-                    if m.get("role") == "assistant":
-                        last_assts.append(m.get("content") or "")
-                        if len(last_assts) >= 3:
-                            break
-                parts = _strip_loop_sents(parts) or parts
-                looped = (
-                    _is_canned(parts)
-                    or _too_like_any(parts, last_assts)
-                    or _too_like_user(parts, text)
+                await stream_speech(
+                    _iter_checked_reply(text, reply_lang, asr_p, history, timing),
+                    synth_sentence, send_sentence, delivered,
                 )
-                if looped or not _strip_loop_sents(parts):
-                    bad = _join_reply(parts)
-                    log("LLM canned/repeat — retry")
-                    grok_break_chain("canned/repeat")
-                    parts = await _collect([
-                        {
-                            "role": "user",
-                            "content": _LLM_RETRY_NUDGE + "\nБуло:\n" + bad[:400],
-                        },
-                    ])
-                    stripped = _strip_loop_sents(parts)
-                    still = (
-                        _is_canned(parts)
-                        or _too_like_last(parts, bad)
-                        or _too_like_any(parts, last_assts)
-                        or _too_like_user(parts, text)
-                    )
-                    if stripped and not still:
-                        parts = stripped
-                    elif _is_story(text):
-                        grok_break_chain("canned again")
-                        parts = [_story_fallback(history)]
-                        log(f"LLM canned again — fallback: {parts[0]!r}")
-                    elif _is_greet(text):
-                        grok_break_chain("canned again")
-                        parts = [_greet_fallback(history)]
-                        log(f"LLM canned again — greet fallback: {parts[0]!r}")
-                    else:
-                        grok_break_chain("canned again")
-                        parts = ["Платівка заїла. Повтори коротше, без шаблону."]
-                        log("LLM canned again — drop loop")
-                n = len(parts)
-                if n == 0:
-                    pcm_out = await asyncio.to_thread(synth, "Не розчув. Повтори.")
-                    await send_pcm_deltas(ws, pcm_out)
-                else:
-                    if rvc_convert.enabled():
-                        pcm_out = await asyncio.to_thread(synth, _join_reply(parts))
-                        await send_pcm_deltas(ws, pcm_out)
-                    else:
-                        for sent in parts:
-                            pcm_out = await asyncio.to_thread(synth, sent)
-                            await send_pcm_deltas(ws, pcm_out)
-                    history.append({"role": "assistant", "content": _join_reply(parts)})
+                history.append({"role": "assistant", "content": _join_reply(delivered)})
+                reply_recorded = True
                 fold_old_turns(history)
                 save_chat(history)
         await ws.send(dumps({"type": "response.output_audio.done"}))
         await ws.send(dumps({"type": "response.done"}))
     except Exception as e:
         log(f"turn fail: {e}")
+        if delivered and not reply_recorded:
+            history.append({"role": "assistant", "content": _join_reply(delivered)})
+            grok_break_chain("partial spoken reply")
+            try:
+                save_chat(history)
+            except Exception as save_error:
+                log(f"partial reply save fail: {save_error}")
         try:
-            pcm_out = await asyncio.to_thread(
-                synth, "Ой, мізки заклинило. Скажи ще раз, м'ясний мішок."
-            )
-            await send_audio(ws, pcm_out, emit_created=False)
+            pcm_out = await synth_sentence("Ой, мізки заклинило. Скажи ще раз, м'ясний мішок.")
+            await send_sentence(pcm_out)
+            await ws.send(dumps({"type": "response.output_audio.done"}))
+            await ws.send(dumps({"type": "response.done"}))
         except Exception as e2:
             log(f"turn fail-safe: {e2}")
             try:
@@ -2414,6 +2438,8 @@ async def run_turn(ws, pcm_in: bytes, prompt: str, history: list) -> None:
     finally:
         stop.set()
         keeper.cancel()
+        await asyncio.gather(keeper, return_exceptions=True)
+        timing.mark("turn_done")
 
 
 def lan_ipv4() -> list[str]:
