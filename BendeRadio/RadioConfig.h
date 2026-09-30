@@ -332,6 +332,17 @@ class RadioConfig {
     // После пробуждения из deep sleep (ext0): «бегающие глаза» как при поиске Wi‑Fi (0 = выкл.).
     static constexpr uint32_t wakeAfterSleepAnimMs = 3500;
 
+    // MPU-6050 (тряска): I2C SDA=14, SCL=13. AD0=GND → адрес 0x68.
+    static constexpr bool mpu6050Enable = true;
+    static constexpr uint8_t mpu6050SdaPin = 14;
+    static constexpr uint8_t mpu6050SclPin = 13;
+    static constexpr uint8_t mpu6050I2cAddr = 0x68;
+    static constexpr uint32_t mpu6050PollMs = 40;
+    // Сумма |Δax|+|Δay|+|Δaz| (сырые ±2g). 4000–8000 — тряска руками; выше — менее чувствительно.
+    static constexpr uint16_t mpu6050ShakeDeltaSum = 5500;
+    static constexpr uint16_t mpu6050ShakeCooldownMs = 800;
+    static constexpr uint16_t mpu6050AngryEyesMs = 900;
+
     // Отладка PCM в audio_process_extern: редкие строки в Serial (не на каждый буфер — иначе глотает аудио/Wi‑Fi).
     static constexpr bool debugAudioPcmSerial = false;
     static constexpr uint32_t debugAudioPcmSerialMs = 300;

@@ -21,6 +21,7 @@
 #include "pong.h"
 #include "tmr.h"
 #include "BenderAi.h"
+#include "mpu6050.h"
 #include "secrets.h"
 
 static inline uint8_t mouth_gfx_on(bool invert) {
@@ -1492,7 +1493,7 @@ void core0(void* p) {
     Tmr tts_mouth_tmr(RadioConfig::matrixVizTtsRefreshMs);
     Tmr eye_tmr(RadioConfig::matrixEyeRefreshMs);
     Tmr matrix_tmr(1000);
-    Tmr angry_tmr(800);
+    Tmr angry_tmr(RadioConfig::mpu6050AngryEyesMs);
     Tmr pong_tmr(145);
     matrix_tmr.timerMode(1);
     angry_tmr.timerMode(1);
@@ -1594,6 +1595,7 @@ void core0(void* p) {
     // Первый замер делаем сразу на старте, а не через интервальный таймер.
     battery_force_sample();
     battery_shutdown_guard_on_sample();
+    mpu6050_init();
 
     s_wifi_last_activity_ms = millis();
     if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 && RadioConfig::wakeAfterSleepAnimMs > 0) {
@@ -1686,6 +1688,12 @@ void core0(void* p) {
         }
         angry_tmr.tick();
         memory.tick();
+
+        if (mpu6050_poll_shake()) {
+            angry_tmr.start();
+            wifi_touch_activity();
+            Serial.println(F("[MPU] → angry eyes (shake OK)"));
+        }
 
         if (s_pending_change_state_after_wake) {
             if ((int32_t)(millis() - s_wake_after_sleep_anim_until_ms) >= 0) {

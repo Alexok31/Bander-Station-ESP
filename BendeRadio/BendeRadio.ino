@@ -227,6 +227,10 @@ void setup() {
     if (RadioConfig::pololuOffPin != 255) {
         Serial.printf("Pololu OFF: GPIO%u (8 clicks / low batt)\n", (unsigned)RadioConfig::pololuOffPin);
     }
+    if (RadioConfig::mpu6050Enable) {
+        Serial.printf("MPU-6050: SDA=GPIO%u SCL=GPIO%u (shake → angry eyes)\n",
+                      (unsigned)RadioConfig::mpu6050SdaPin, (unsigned)RadioConfig::mpu6050SclPin);
+    }
 
     if (!(esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 && RadioConfig::wakeAfterSleepAnimMs > 0)) {
         change_state();

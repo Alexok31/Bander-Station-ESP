@@ -31,6 +31,13 @@ import numpy as np
 import websockets
 from piper import PiperVoice, SynthesisConfig
 
+try:
+    import certifi
+
+    _SSL_VERIFY: str | bool = certifi.where()
+except ImportError:
+    _SSL_VERIFY = True
+
 import rvc_convert
 import stress_convert
 import voice_commands
@@ -325,7 +332,24 @@ piper_syn_en = None
 
 
 def log(msg: str) -> None:
-    print(msg, flush=True)
+    try:
+        print(msg, flush=True)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+        sys.stdout.buffer.write((str(msg) + "\n").encode(enc, errors="replace"))
+        sys.stdout.flush()
+
+
+def _httpx_sync(**kwargs):
+    kwargs.setdefault("verify", _SSL_VERIFY)
+    kwargs.setdefault("timeout", 120.0)
+    return httpx.Client(**kwargs)
+
+
+def _httpx_async(**kwargs):
+    kwargs.setdefault("verify", _SSL_VERIFY)
+    kwargs.setdefault("timeout", 120.0)
+    return httpx.AsyncClient(**kwargs)
 
 
 def dumps(obj: dict) -> str:
@@ -1790,7 +1814,9 @@ def chat(prompt: str, lang: str = "uk", asr_p: float = 1.0, history: list | None
     payload.pop("_n_pred", None)
     payload.pop("_n_temp", None)
     try:
-        r = httpx.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=120.0)
+        r = httpx.post(
+            f"{OLLAMA_URL}/api/chat", json=payload, timeout=120.0, verify=_SSL_VERIFY
+        )
         r.raise_for_status()
         out = (r.json().get("message") or {}).get("content") or ""
         return _clean_llm(out)
@@ -1811,7 +1837,7 @@ def _pop_sentences(buf: str) -> tuple[list[str], str]:
 
 
 async def _ollama_pieces(payload: dict):
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with _httpx_async() as client:
         async with client.stream("POST", f"{OLLAMA_URL}/api/chat", json=payload) as r:
             r.raise_for_status()
             async for line in r.aiter_lines():
@@ -1912,7 +1938,7 @@ async def _grok_pieces(history: list[dict], n_pred: int, n_temp: float):
     }
 
     async def _stream(req: dict):
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with _httpx_async() as client:
             async with client.stream("POST", XAI_RESP_URL, headers=headers, json=req) as r:
                 if r.status_code >= 400:
                     err = (await r.aread()).decode("utf-8", "replace")[:500]
@@ -2012,7 +2038,9 @@ def warm_ollama() -> None:
         "options": {"temperature": 0, "num_predict": 8},
     }
     try:
-        r = httpx.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=180.0)
+        r = httpx.post(
+            f"{OLLAMA_URL}/api/chat", json=payload, timeout=180.0, verify=_SSL_VERIFY
+        )
         r.raise_for_status()
         log("Ollama ready")
     except Exception as e:
@@ -2622,7 +2650,7 @@ async def main() -> None:
             log("Grok: немає ключа — постав xai_api_key у config.json або XAI_API_KEY у secrets.h")
     else:
         try:
-            r = httpx.get(f"{OLLAMA_URL}/api/tags", timeout=3.0)
+            r = httpx.get(f"{OLLAMA_URL}/api/tags", timeout=3.0, verify=_SSL_VERIFY)
             names = [m.get("name", "") for m in r.json().get("models", [])]
             log(f"Ollama models: {names or '(пусто — ollama pull aya-expanse:8b)'}")
         except Exception:
