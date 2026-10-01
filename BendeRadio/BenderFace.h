@@ -3,7 +3,11 @@
 #include <cstdint>
 
 // Presentation only: these states never take ownership of audio or the microphone.
-enum class BenderFaceState : uint8_t { Idle, Listening, Thinking, Speaking, Error };
+enum class BenderFaceState : uint8_t { Idle, Listening, Thinking, Speaking, Error, Pleased, Curious, Tired, Annoyed };
+
+constexpr bool bender_face_show_error(bool requested, bool backgroundEvent, bool userActive) {
+    return requested && (!backgroundEvent || userActive);
+}
 
 struct BenderFaceInput {
     bool error;

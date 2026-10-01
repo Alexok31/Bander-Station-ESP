@@ -32,6 +32,7 @@ import httpx
 import numpy as np
 import websockets
 from piper import PiperVoice, SynthesisConfig
+from asr_audio import ASR_RATE, pcm16_for_asr
 
 try:
     import certifi
@@ -43,9 +44,14 @@ except ImportError:
 import rvc_convert
 import stress_convert
 import voice_commands
+from personal_memory import PersonalMemory
+from event_reactions import EventReactions
 from speech_pipeline import PcmPacer, TurnTiming, stream_speech
 
 HERE = Path(__file__).resolve().parent
+MEMORY = PersonalMemory(HERE / "personal_memory.json")
+DEVICE_CURRENT_STATION = None
+EVENT_REACTIONS = EventReactions()
 TUNNEL_URL_PATH = HERE / "tunnel_url.txt"
 MODELS = HERE / "models"
 MODELS.mkdir(exist_ok=True)
@@ -159,7 +165,7 @@ CHAT: list[dict] = []
 CHAT_CONV_ID = ""
 CHAT_SUMMARY = ""
 CHAT_GROK_RESP_ID = ""
-GROK_PROMPT_REV = 5
+GROK_PROMPT_REV = 7
 DEVICE_STATIONS: list[dict] = []
 
 VOICE_ONNX = MODELS / "uk_UA-ukrainian_tts-medium.onnx"
@@ -243,13 +249,12 @@ def bender_level_rules(level: int | None = None) -> str:
 
 
 _NUDGE_PREFIX = "Стоп. Це ти вже казав."
-_TURN_HINTS = (
-    "Вигадай новий підкол. Інша будова речення, ніж минулого разу.",
-    "Здивуй. Не калькуй їхні слова і не кажи «X сам / бо я не твій».",
-    "Жива сцена, не скріпт. Можна деталь про Фрая, пиво чи крадіжку — один раз, по-новому.",
-    "Спочатку суть їхньої репліки, потім характер. Свіжий мат, не той самий.",
-    "Якщо факт чи число — відповідь першим реченням, далі вигадка.",
-    "Не починай з того ж слова що в попередній своїй репліці.",
+_TURN_GUIDANCE = (
+    "Відгукнися на зміст і тон репліки та продовжуй поточну тему. "
+    "Характер проявляється у ставленні; окремий жарт не обов'язковий. "
+    "Довжина залежить від ситуації. Питання — лише коли воно доречне, не щоразу. "
+    "Текст отримано з мікрофона і він може містити помилки розпізнавання. "
+    "Якщо зміст незрозумілий навіть з історією, коротко перепитай; не вигадуй, що людина мала на увазі."
 )
 
 
@@ -276,20 +281,22 @@ def _history_user_asst_nudge(history: list[dict] | None) -> tuple[str, str, str]
 
 
 def grok_turn_text(user_text: str, last_assistant: str = "", nudge: str = "") -> str:
-    hint = _TURN_HINTS[len(CHAT) % len(_TURN_HINTS)]
-    bits = [f"[BENDER_LEVEL {BENDER_LEVEL}/10]", hint]
+    bits = [f"[BENDER_LEVEL {BENDER_LEVEL}/10]", _TURN_GUIDANCE]
+    memory_context = MEMORY.context(user_text, DEVICE_STATIONS)
+    if memory_context:
+        bits.append(memory_context)
     if BENDER_LEVEL >= 8:
         bits.append(
-            "Мат є, але вбудований у нову вигадку. Не шаблон образи. "
+            "Різкість і мат за обраним рівнем вплітай у відповідь по суті. Не шаблон образи. "
             "Без ехо + «бля?!» + «найкращий робот» + «йди нахуй, м'ясний мішок»."
         )
     if last_assistant:
-        bits.append("Минулу свою репліку не копіюй ні словами, ні каркасом.")
+        bits.append("Не копіюй минулу репліку. Доречну деталь зі спільної теми можна розвинути.")
     if nudge:
         bits.append(nudge)
     bits.append("Користувач сказав:\n" + user_text)
     bits.append(
-        "Відповідь своїми словами, ніби вперше. "
+        "Відповідь своїми словами з урахуванням доступної історії. Не вигадуй спільних спогадів. "
         "Заборонено папужити їхню фразу і каркас «сам / бо я не твій / лайковий»."
     )
     bits.append(
@@ -547,7 +554,7 @@ def _add_cuda_dll_dirs() -> None:
 
 
 def _probe_whisper(model) -> None:
-    audio = np.zeros(IN_RATE, dtype=np.float32)
+    audio = np.zeros(ASR_RATE, dtype=np.float32)
     segments, _info = model.transcribe(
         audio, language="uk", beam_size=1, vad_filter=False, without_timestamps=True
     )
@@ -865,7 +872,7 @@ def _latin_to_uk(word: str) -> str:
 
 _ACUTE = "\u0301"
 _UK_VOWELS = set("аеєиіїоуюя")
-_UK_WORD = re.compile(r"[а-яіїєґ'\u0301]+")
+_UK_WORD = re.compile(r"[а-яіїєґ][а-яіїєґ'\u0301]*")
 _uk_stress = None
 _STRESS_WORDS_PATH = HERE / "stress_words.json"
 # Запас, якщо JSON немає. Файл перекриває ці ключі.
@@ -981,29 +988,49 @@ def _keep_first_acute(word: str) -> str:
 def apply_uk_stress(text: str) -> str:
     if not text:
         return text
-    if _ACUTE not in text:
+    # Analyse the whole sentence for context, even if some words already have
+    # explicit accents. Merge by occurrence so homographs can keep different
+    # accents within the same sentence. Dictionary overrides retain priority.
+    plain = text.replace(_ACUTE, "")
+    predicted = plain
+    needs_auto = any(
+        _ACUTE not in m.group(0)
+        and m.group(0) not in _STRESS_FIX
+        and sum(ch in _UK_VOWELS for ch in m.group(0)) > 1
+        for m in _UK_WORD.finditer(text)
+    )
+    if needs_auto:
         if stress_convert.available():
             try:
-                text = stress_convert.stress(text)
+                predicted = stress_convert.stress(plain)
+                if predicted.replace(_ACUTE, "") != plain:
+                    raise ValueError("stress worker changed sentence text")
             except Exception as e:
                 log(f"UK stress worker: {e}")
+                predicted = plain
                 if _uk_stress:
                     try:
-                        text = _uk_stress(text)
-                    except Exception:
-                        pass
+                        predicted = _uk_stress(plain)
+                    except Exception as fallback_error:
+                        log(f"UK stress dictionary: {fallback_error}")
         elif _uk_stress:
             try:
-                text = _uk_stress(text)
-            except Exception:
-                pass
+                predicted = _uk_stress(plain)
+            except Exception as e:
+                log(f"UK stress dictionary: {e}")
+
+    if predicted.replace(_ACUTE, "") != plain:
+        log("UK stress ignored: predictor changed sentence text")
+        predicted = plain
+    predictions = iter(_UK_WORD.finditer(predicted))
 
     def one(m: re.Match[str]) -> str:
         w = m.group(0)
+        candidate = next(predictions).group(0)
         base = w.replace(_ACUTE, "")
         if base in _STRESS_FIX:
             return _STRESS_FIX[base]
-        return _keep_first_acute(w)
+        return _keep_first_acute(w if _ACUTE in w else candidate)
 
     return _UK_WORD.sub(one, text)
 
@@ -1366,9 +1393,8 @@ def _asr_ok(
     if rms < ASR_MIN_RMS:
         return False
     if avg_lp < ASR_MIN_LOGPROB:
-        loud = rms >= 3500 and no_speech <= 0.25 and avg_lp >= -0.85
-        if not loud:
-            return False
+        # Loud audio is not evidence that the decoded words are correct.
+        return False
     if no_speech > ASR_MAX_NO_SPEECH:
         return False
     if _is_hallucination(text, avg_lp, rms):
@@ -1428,8 +1454,8 @@ _last_whisper_pcm = b""
 
 
 def _pcm_for_whisper(pcm16: bytes) -> np.ndarray:
-    audio = np.frombuffer(pcm16, dtype=np.int16).astype(np.float32) / 32768.0
-    return _asr_enhance(audio, IN_RATE)
+    audio = pcm16_for_asr(pcm16, IN_RATE)
+    return _asr_enhance(audio, ASR_RATE)
 
 
 def _whisper_once(audio, language: str | None, *, use_vad: bool = True) -> tuple[str, str, float, float, float]:
@@ -1514,7 +1540,7 @@ def transcribe(pcm16: bytes) -> tuple[str, str, float, bool]:
     audio = _pcm_for_whisper(pcm16)
     global _last_whisper_pcm
     _last_whisper_pcm = np.clip(np.round(audio * 32767.0), -32767, 32767).astype(np.int16).tobytes()
-    raw = np.frombuffer(pcm16, dtype=np.int16).astype(np.float32) / 32768.0
+    raw = pcm16_for_asr(pcm16, IN_RATE)
     best = None
     for lang_try in ASR_LANGS:
         try:
@@ -1617,9 +1643,9 @@ _GREET_FALLBACKS = (
     "Ага, чую. Кажи справу, поки пиво не скіпіло.",
 )
 _MISS_FALLBACKS = (
-    "Не розчув. Повтори коротше.",
-    "Нічого не зрозумів. Кажи ще раз, гучніше.",
-    "Шум якийсь. Повтори, м'ясний мішок.",
+    "Не розчув. Повтори, будь ласка.",
+    "Зачекай, останню фразу не розібрав. Скажи ще раз.",
+    "Мої залізні вуха щось пропустили. Повториш?",
 )
 
 _LLM_RETRY_NUDGE = (
@@ -1732,6 +1758,9 @@ def _llm_payload(
         n_pred = 140
     # Системний промпт однаковий щоразу на тому ж рівні — інакше Grok не кешує.
     messages: list[dict] = [{"role": "system", "content": bender_prompt()}]
+    memory_context = MEMORY.context(last_user, DEVICE_STATIONS)
+    if memory_context:
+        messages.append({"role": "system", "content": memory_context})
     if LLM_PROVIDER == "grok":
         # Історію Grok тримає сам (Responses API). Локальний чат у запит не пихаємо.
         last = history[-1] if history else None
@@ -2130,10 +2159,11 @@ def _pause_samples(unit: str, sr: int) -> int:
     return max(0, int(sr * ms / 1000.0))
 
 
-def _piper_pcm(voice, syn, ready, text: str) -> tuple[np.ndarray, int]:
+def _piper_pcm(voice, syn, text: str) -> tuple[np.ndarray, int]:
+    """Synthesize text already normalized/stressed once by synth()."""
     chunks: list[np.ndarray] = []
     sr = 22050
-    for chunk in voice.synthesize(ready(text), syn):
+    for chunk in voice.synthesize(text, syn):
         sr = chunk.sample_rate
         if hasattr(chunk, "audio_int16_array"):
             audio = np.asarray(chunk.audio_int16_array, dtype=np.int16)
@@ -2160,7 +2190,7 @@ def synth(text: str) -> bytes:
     q_flags: list[bool] = []
     sr = 22050
     for i, unit in enumerate(units):
-        pcm, sr = _piper_pcm(voice, syn, ready, unit)
+        pcm, sr = _piper_pcm(voice, syn, unit)
         if pcm.size:
             pieces.append(pcm)
             q_flags.append(_is_question(unit))
@@ -2245,7 +2275,7 @@ def _mic_debug_pcm(pcm: bytes) -> bytes:
         body = np.clip(np.round(y * 32767.0), -32767, 32767).astype(np.int16).tobytes()
     if not body:
         return b""
-    x = np.frombuffer(body, dtype=np.int16)
+    x = resample_int16(np.frombuffer(body, dtype=np.int16), ASR_RATE, OUT_RATE)
     if x.size == 0 or int(np.max(np.abs(x))) < 80:
         return b""
     gap = np.zeros(int(OUT_RATE * 0.12), dtype=np.int16)
@@ -2344,6 +2374,32 @@ async def _iter_checked_reply(text: str, lang: str, asr_p: float, history: list,
         yield "Платівка заїла. Повтори коротше, без шаблону."
 
 
+def handle_personal_command(text: str, history: list):
+    global CHAT_SUMMARY, CHAT_CONV_ID
+    result = MEMORY.handle(text, DEVICE_STATIONS, DEVICE_CURRENT_STATION)
+    if result and result.changed:
+        grok_break_chain("personal memory changed")
+        if result.forgotten:
+            history.clear()
+            CHAT_SUMMARY = ""
+            CHAT_CONV_ID = str(uuid.uuid4())
+            try:
+                CHAT_PATH.unlink(missing_ok=True)
+            except OSError:
+                result.text = "Запис забув, але старий файл історії на диску не вдалося видалити. Перевір сервер."
+    return result
+
+
+def favorite_voice_command(text: str):
+    if re.search(r"(?:включ|увімк|ввімк|постав|вмик).*?(?:любим|улюблен).*станц", text.lower()):
+        station = MEMORY.favorite(DEVICE_STATIONS)
+        if station:
+            return voice_commands.VoiceCommand("radio.station", {"station": station["id"]},
+                                               ("Вмикаю улюблену: " + station["name"] + ".",))
+        return voice_commands.VoiceCommand(None, replies=("Спочатку скажи: запам'ятай мою улюблену станцію, і назви її.",))
+    return None
+
+
 async def run_turn(ws, pcm_in: bytes, prompt: str, history: list) -> None:
     timing = TurnTiming(log)
     pacer = PcmPacer(OUT_RATE)
@@ -2386,8 +2442,16 @@ async def run_turn(ws, pcm_in: bytes, prompt: str, history: list) -> None:
             pcm_out = await synth_sentence(reply)
             await send_sentence(pcm_out)
         else:
+            personal = handle_personal_command(text, history)
+            if personal:
+                if personal.changed:
+                    await ws.send(dumps(MEMORY.profile(DEVICE_STATIONS)))
+                await send_sentence(await synth_sentence(personal.text))
+                await ws.send(dumps({"type": "response.output_audio.done"}))
+                await ws.send(dumps({"type": "response.done"}))
+                return
             history.append({"role": "user", "content": text})
-            cmd = voice_commands.match(text, DEVICE_STATIONS or None)
+            cmd = favorite_voice_command(text) or voice_commands.match(text, DEVICE_STATIONS or None)
             if cmd:
                 play_args = dict(cmd.args or {})
                 reply = cmd.reply(len(history))
@@ -2570,6 +2634,7 @@ async def process_request(*args):
 
 
 async def handle(ws) -> None:
+    global DEVICE_CURRENT_STATION
     log(f"client {ws.remote_address}")
     buf = bytearray()
     prompt = bender_prompt()
@@ -2585,6 +2650,8 @@ async def handle(ws) -> None:
             t = ev.get("type") or ""
             if t == "session.update":
                 sess = ev.get("session") if isinstance(ev.get("session"), dict) else {}
+                if type(sess.get("current_station")) is int:
+                    DEVICE_CURRENT_STATION = sess["current_station"]
                 raw_lv = ev.get("bender_level", sess.get("bender_level"))
                 if raw_lv is not None:
                     log(f"BENDER_LEVEL {BENDER_LEVEL} → {set_bender_level(raw_lv)}")
@@ -2609,6 +2676,7 @@ async def handle(ws) -> None:
                         ))
                 await ws.send(dumps({"type": "conversation.created"}))
                 await ws.send(dumps({"type": "session.updated"}))
+                await ws.send(dumps(MEMORY.profile(DEVICE_STATIONS)))
             elif t == "input_audio_buffer.append":
                 audio = ev.get("audio") or ""
                 if audio:
@@ -2619,11 +2687,28 @@ async def handle(ws) -> None:
             elif t == "input_audio_buffer.commit":
                 await ws.send(dumps({"type": "input_audio_buffer.committed"}))
             elif t == "response.create":
+                if type(ev.get("current_station")) is int:
+                    DEVICE_CURRENT_STATION = ev["current_station"]
                 pcm_in = bytes(buf)
                 buf.clear()
                 await run_turn(ws, pcm_in, prompt, CHAT)
             elif t == "response.cancel":
                 buf.clear()
+            elif t == "device.event":
+                # Firmware sends only fresh, idle-time events. Events don't enter
+                # conversation history and never require an LLM round trip.
+                if type(ev.get("station")) is int:
+                    DEVICE_CURRENT_STATION = ev["station"]
+                reply = EVENT_REACTIONS.choose(ev, MEMORY.profile(DEVICE_STATIONS)) if not buf else None
+                if reply:
+                    await ws.send(dumps({"type": "response.created"}))
+                    try:
+                        pcm = await asyncio.to_thread(synth, reply)
+                        await send_pcm_deltas(ws, pcm)
+                    except Exception as error:
+                        log(f"event voice skipped: {error}")
+                await ws.send(dumps({"type": "response.output_audio.done"}))
+                await ws.send(dumps({"type": "response.done"}))
             elif t in ("ping",):
                 await ws.send(dumps({"type": "pong"}))
     except websockets.exceptions.ConnectionClosed:

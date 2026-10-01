@@ -7,11 +7,19 @@
 
 static bool s_ok = false;
 static uint32_t s_last_poll_ms = 0;
-static uint32_t s_last_shake_ms = 0;
+static BenderShake s_shake;
 static int16_t s_prev_ax = 0;
 static int16_t s_prev_ay = 0;
 static int16_t s_prev_az = 0;
 static bool s_have_prev = false;
+static BenderMotion s_motion;
+static BenderEvent s_motion_event = BenderEvent::None;
+
+BenderEvent mpu6050_motion_event() {
+    const auto event = s_motion_event;
+    s_motion_event = BenderEvent::None;
+    return event;
+}
 
 static bool mpu_write8(uint8_t reg, uint8_t val) {
     Wire.beginTransmission(RadioConfig::mpu6050I2cAddr);
@@ -37,10 +45,12 @@ static bool mpu_read_bytes(uint8_t reg, uint8_t* buf, uint8_t n) {
 }
 
 void mpu6050_init() {
+    s_motion = BenderMotion{};
+    s_motion_event = BenderEvent::None;
     s_ok = false;
     s_have_prev = false;
     s_last_poll_ms = 0;
-    s_last_shake_ms = 0;
+    s_shake = BenderShake{};
     if (!RadioConfig::mpu6050Enable) {
         return;
     }
@@ -114,13 +124,11 @@ bool mpu6050_poll_shake() {
 
     const uint32_t sum =
         (uint32_t)((dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy) + (dz < 0 ? -dz : dz));
-    if (sum < RadioConfig::mpu6050ShakeDeltaSum) {
+    const auto motion = s_motion.sample(sum, now);
+    if (motion != BenderEvent::None) s_motion_event = motion;
+    if (!s_shake.sample(sum, now, RadioConfig::mpu6050ShakeDeltaSum, RadioConfig::mpu6050ShakeCooldownMs)) {
         return false;
     }
-    if ((uint32_t)(now - s_last_shake_ms) < RadioConfig::mpu6050ShakeCooldownMs) {
-        return false;
-    }
-    s_last_shake_ms = now;
     Serial.printf("[MPU] SHAKE Δ=%lu ax=%d ay=%d az=%d\n", (unsigned long)sum, (int)ax, (int)ay,
                   (int)az);
     return true;

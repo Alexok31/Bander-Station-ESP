@@ -1,12 +1,16 @@
 #include "AirPlay.h"
 #include "AirPlayPriv.h"
+#include "AirPlayPolicy.h"
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 #include <esp_netif.h>
 #include <mdns.h>
+#include <lwip/sockets.h>
+#include <freertos/queue.h>
 
 #include "BenderAi.h"
 #include "RadioConfig.h"
@@ -18,14 +22,39 @@ static char s_acc[kRtspClients][3072];
 static size_t s_accn[kRtspClients] = {0};
 static uint32_t s_dead_ms[kRtspClients] = {0};
 static int s_rep = 0;
+static int s_session_client = -1;  // RTSP task owns the client table
+static std::atomic<bool> s_hangup_requested{false};
 static char s_sess_id[24] = "1";
 static bool s_body_truncated = false;
 static char s_dacp_id[28] = "";
 static char s_active_remote[24] = "";
 static IPAddress s_dacp_ip;
 static uint16_t s_dacp_port = 0;
-static volatile bool s_dacp_pending = false;
-static volatile float s_dacp_db = 0;
+// RTSP owns session state; the worker receives copies and only returns results.
+struct DacpJob {
+    uint32_t generation;
+    uint32_t ip;
+    uint16_t port;
+    char id[28];
+    char remote[24];
+    char command[96];  // Empty means fetch playing time.
+};
+struct DacpResult {
+    DacpJob job;
+    size_t size;
+    uint8_t body[1024];
+};
+static_assert(std::is_trivially_copyable<DacpJob>::value, "FreeRTOS queues copy bytes");
+static_assert(std::is_trivially_copyable<DacpResult>::value, "FreeRTOS queues copy bytes");
+static QueueHandle_t s_dacp_jobs = nullptr;
+static QueueHandle_t s_dacp_results = nullptr;
+static bool s_dacp_busy = false;
+static std::atomic<uint32_t> s_dacp_generation{0};
+
+// Only short volume-state updates belong here; never I2S, networking or display work.
+static portMUX_TYPE s_volume_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool s_dacp_pending = false;
+static float s_dacp_db = 0;
 static uint32_t s_dacp_quiet_ms = 0;
 static uint32_t s_enc_guard_ms = 0;
 static float s_enc_db = 0;
@@ -434,6 +463,9 @@ const char* airplay_track_scroll_cstr() {
 }
 
 void airplay_rtsp_hangup() {
+    AirPlayAudioGuard guard;
+    ++s_dacp_generation;
+    s_session_client = -1;
     for (int i = 0; i < kRtspClients; i++) {
         if (s_cli[i]) {
             s_cli[i].stop();
@@ -447,19 +479,20 @@ void airplay_rtsp_hangup() {
     s_dacp_id[0] = 0;
     s_active_remote[0] = 0;
     s_dacp_port = 0;
+    portENTER_CRITICAL(&s_volume_mux);
     s_dacp_pending = false;
+    s_enc_guard_ms = 0;
+    portEXIT_CRITICAL(&s_volume_mux);
     s_dacp_cmd_pend = false;
     s_dacp_time_pend = false;
-    s_enc_guard_ms = 0;
 }
 
+void airplay_rtsp_request_hangup() { s_hangup_requested.store(true); }
+bool airplay_rtsp_hangup_pending() { return s_hangup_requested.load(); }
+
 bool airplay_rtsp_alive() {
-    for (int i = 0; i < kRtspClients; i++) {
-        if (s_cli[i] && s_cli[i].connected()) {
-            return true;
-        }
-    }
-    return false;
+    return s_session_client >= 0 && s_cli[s_session_client] &&
+           (s_cli[s_session_client].connected() || s_cli[s_session_client].available());
 }
 
 static const char* hdr_find(const char* req, const char* name) {
@@ -545,6 +578,14 @@ static void reply(int cseq, const char* extra, const char* body = "", int code =
     const char* reason = "OK";
     if (code == 453) {
         reason = "Not Enough Bandwidth";
+    } else if (code == 454) {
+        reason = "Session Not Found";
+    } else if (code == 455) {
+        reason = "Method Not Valid in This State";
+    } else if (code == 400) {
+        reason = "Bad Request";
+    } else if (code == 500) {
+        reason = "Internal Server Error";
     } else if (code != 200) {
         reason = "Forbidden";
     }
@@ -578,12 +619,18 @@ static void reply(int cseq, const char* extra, const char* body = "", int code =
         code, reason, cseq, apple, sess, extra ? extra : "", blen, body ? body : "");
 }
 
-static void handle_announce(const char* body) {
+static bool handle_announce(const char* body) {
+    // dispatch holds the audio mutex: no decoder or PCM writer remains in flight.
+    airplay_rtp_stop();
+    airplay_release_speaker();
+    airplay_session_clear();
+    memset(g_ap.fmtp, 0, sizeof(g_ap.fmtp));
     char fmtp[96] = "";
     if (sdp_copy(body, "fmtp", fmtp, sizeof(fmtp))) {
-        sscanf(fmtp, "%d %d %d %d %d %d %d %d %d %d %d %d", &g_ap.fmtp[0], &g_ap.fmtp[1],
+        const int fields = sscanf(fmtp, "%d %d %d %d %d %d %d %d %d %d %d %d", &g_ap.fmtp[0], &g_ap.fmtp[1],
                &g_ap.fmtp[2], &g_ap.fmtp[3], &g_ap.fmtp[4], &g_ap.fmtp[5], &g_ap.fmtp[6],
                &g_ap.fmtp[7], &g_ap.fmtp[8], &g_ap.fmtp[9], &g_ap.fmtp[10], &g_ap.fmtp[11]);
+        if (fields != 12) return false;
     } else {
         g_ap.fmtp[1] = 352;
         g_ap.fmtp[3] = 16;
@@ -593,6 +640,9 @@ static void handle_announce(const char* body) {
         g_ap.fmtp[7] = 2;
         g_ap.fmtp[11] = 44100;
     }
+    // Decoder/output storage and the DAC are fixed to this RAOP ALAC format.
+    if (g_ap.fmtp[1] != 352 || g_ap.fmtp[3] != 16 ||
+        g_ap.fmtp[7] != 2 || g_ap.fmtp[11] != 44100) return false;
     if (g_ap.alac) {
         alac_free(g_ap.alac);
         g_ap.alac = nullptr;
@@ -620,6 +670,7 @@ static void handle_announce(const char* body) {
     char ivb[64] = "";
     const bool has_key = sdp_copy(body, "rsaaeskey", keyb, sizeof(keyb));
     const bool has_iv = sdp_copy(body, "aesiv", ivb, sizeof(ivb));
+    if (has_key != has_iv) return false;
     if (has_key && has_iv) {
         uint8_t keyc[256];
         uint8_t iv[32];
@@ -629,21 +680,26 @@ static void handle_announce(const char* body) {
         size_t plen = 0;
         Serial.printf("[AirPlay] keyb64=%u kn=%u ivn=%u\n", (unsigned)strlen(keyb), (unsigned)kn,
                       (unsigned)ivn);
-        if (kn == 256 && ivn >= 16 && airplay_rsa_oaep_decrypt(keyc, kn, plain, &plen)) {
+        if (kn == 256 && ivn >= 16 && airplay_rsa_oaep_decrypt(keyc, kn, plain, &plen) && plen >= 16) {
             memcpy(g_ap.aes_key, plain, 16);
             memcpy(g_ap.aes_iv, iv, 16);
             g_ap.encrypted = true;
             airplay_aes_prepare();
-        }
+        } else return false;
     }
     Serial.printf("[AirPlay] ANNOUNCE alac=%d enc=%d frame=%d ct=%.40s\n", g_ap.alac ? 1 : 0,
                   g_ap.encrypted ? 1 : 0, g_ap.fmtp[1], body);
+    return g_ap.alac != nullptr;
 }
 
 static void handle_setup(const char* req) {
     if (!airplay_accepts()) {
         reply(hdr_int(req, "CSeq"), "", "", 453);
         Serial.println(F("[AirPlay] SETUP refused (radio mode)"));
+        return;
+    }
+    if (s_session_client != s_rep || !g_ap.alac) {
+        reply(hdr_int(req, "CSeq"), "", "", 454);
         return;
     }
     char tr[192];
@@ -664,8 +720,14 @@ static void handle_setup(const char* req) {
         Serial.println(F("[AirPlay] SETUP: speaker busy"));
         return;
     }
-    airplay_rtp_start();
+    if (!airplay_rtp_start()) {
+        airplay_rtp_stop();
+        airplay_release_speaker();
+        reply(hdr_int(req, "CSeq"), "", "", 500);
+        return;
+    }
     g_ap.session = true;
+    g_ap.paused = false;
     g_ap.last_rtp_ms = millis();
     const char* sid = hdr_find(req, "Session");
     if (sid) {
@@ -700,6 +762,7 @@ static void note_dacp_headers(const char* req, WiFiClient& c) {
         prev[sizeof(prev) - 1] = 0;
         hdr_copy_line(di, s_dacp_id, sizeof(s_dacp_id));
         if (s_dacp_id[0] && strcmp(prev, s_dacp_id) != 0) {
+            ++s_dacp_generation;
             s_dacp_port = 0;
             Serial.printf("[AirPlay] DACP-ID %s remote=%s\n", s_dacp_id, s_active_remote);
         }
@@ -709,57 +772,59 @@ static void note_dacp_headers(const char* req, WiFiClient& c) {
     }
 }
 
-static bool dacp_resolve() {
-    if (s_dacp_port || !s_dacp_id[0]) {
-        return s_dacp_port != 0;
+static bool dacp_resolve(DacpJob& job) {
+    if (job.port || !job.id[0]) {
+        return job.port != 0;
     }
     char inst[48];
-    snprintf(inst, sizeof(inst), "iTunes_Ctrl_%s", s_dacp_id);
+    snprintf(inst, sizeof(inst), "iTunes_Ctrl_%s", job.id);
     mdns_result_t* res = nullptr;
     if (mdns_query_srv(inst, "_dacp", "_tcp", 280, &res) != ESP_OK || !res) {
         return false;
     }
-    s_dacp_port = res->port;
+    job.port = res->port;
     for (mdns_ip_addr_t* a = res->addr; a; a = a->next) {
         if (a->addr.type == ESP_IPADDR_TYPE_V4) {
-            s_dacp_ip = IPAddress(a->addr.u_addr.ip4.addr);
+            job.ip = IPAddress(a->addr.u_addr.ip4.addr);
             break;
         }
     }
     mdns_query_results_free(res);
-    Serial.printf("[AirPlay] DACP %s:%u id=%s\n", s_dacp_ip.toString().c_str(),
-                  (unsigned)s_dacp_port, s_dacp_id);
-    return s_dacp_port != 0;
+    Serial.printf("[AirPlay] DACP %s:%u id=%s\n", IPAddress(job.ip).toString().c_str(),
+                  (unsigned)job.port, job.id);
+    return job.port != 0;
 }
 
-static void dacp_send_cmd(const char* cmd) {
+static void dacp_send_cmd(DacpJob& job, const char* cmd) {
+    if (job.generation != s_dacp_generation.load()) return;
     if (!cmd || !cmd[0]) {
         return;
     }
-    if (!s_active_remote[0]) {
+    if (!job.remote[0]) {
         Serial.println(F("[AirPlay] DACP: no Active-Remote"));
         return;
     }
-    if (!dacp_resolve() && s_dacp_port == 0) {
-        s_dacp_port = 3689;
+    if (!dacp_resolve(job) && job.port == 0) {
+        job.port = 3689;
     }
-    if (!s_dacp_ip) {
+    if (!job.ip || job.generation != s_dacp_generation.load()) {
         Serial.println(F("[AirPlay] DACP: no phone IP"));
         return;
     }
     WiFiClient c;
     c.setTimeout(300);
-    if (!c.connect(s_dacp_ip, s_dacp_port, 300)) {
-        Serial.printf("[AirPlay] DACP connect %s:%u fail\n", s_dacp_ip.toString().c_str(),
-                      (unsigned)s_dacp_port);
-        s_dacp_port = 0;
+    if (!c.connect(IPAddress(job.ip), job.port, 300)) {
+        Serial.printf("[AirPlay] DACP connect %s:%u fail\n", IPAddress(job.ip).toString().c_str(),
+                      (unsigned)job.port);
+        job.port = 0;
         return;
     }
+    if (job.generation != s_dacp_generation.load()) { c.stop(); return; }
     c.printf("GET /ctrl-int/1/%s HTTP/1.1\r\n"
              "Host: %s:%u\r\n"
              "Active-Remote: %s\r\n"
              "\r\n",
-             cmd, s_dacp_ip.toString().c_str(), (unsigned)s_dacp_port, s_active_remote);
+             cmd, IPAddress(job.ip).toString().c_str(), (unsigned)job.port, job.remote);
     const uint32_t t0 = millis();
     while (c.connected() && (uint32_t)(millis() - t0) < 200u) {
         if (c.available()) {
@@ -773,34 +838,35 @@ static void dacp_send_cmd(const char* cmd) {
     c.stop();
 }
 
-static bool dacp_http_get(const char* path, uint8_t* out, size_t outmax, size_t* outn) {
+static bool dacp_http_get(DacpJob& job, const char* path, uint8_t* out, size_t outmax, size_t* outn) {
     if (outn) {
         *outn = 0;
     }
-    if (!path || !out || outmax < 16) {
+    if (!path || !out || outmax < 16 || job.generation != s_dacp_generation.load()) {
         return false;
     }
-    if (!s_active_remote[0]) {
+    if (!job.remote[0]) {
         return false;
     }
-    if (!dacp_resolve() && s_dacp_port == 0) {
-        s_dacp_port = 3689;
+    if (!dacp_resolve(job) && job.port == 0) {
+        job.port = 3689;
     }
-    if (!s_dacp_ip) {
+    if (!job.ip || job.generation != s_dacp_generation.load()) {
         return false;
     }
     WiFiClient c;
     c.setTimeout(180);
-    if (!c.connect(s_dacp_ip, s_dacp_port, 180)) {
-        s_dacp_port = 0;
+    if (!c.connect(IPAddress(job.ip), job.port, 180)) {
+        job.port = 0;
         return false;
     }
+    if (job.generation != s_dacp_generation.load()) { c.stop(); return false; }
     c.printf("GET /ctrl-int/1/%s HTTP/1.1\r\n"
              "Host: %s:%u\r\n"
              "Active-Remote: %s\r\n"
              "\r\n",
-             path, s_dacp_ip.toString().c_str(), (unsigned)s_dacp_port, s_active_remote);
-    uint8_t buf[1400];
+             path, IPAddress(job.ip).toString().c_str(), (unsigned)job.port, job.remote);
+    uint8_t buf[1400] = {};
     size_t n = 0;
     const uint32_t t0 = millis();
     while ((uint32_t)(millis() - t0) < 250u && n + 1 < sizeof(buf)) {
@@ -850,40 +916,82 @@ static bool dacp_http_get(const char* path, uint8_t* out, size_t outmax, size_t*
     return copy > 8;
 }
 
-static void dacp_fetch_playing_time() {
-    uint8_t body[1024];
-    size_t n = 0;
-    if (!dacp_http_get("playstatusupdate?revision-number=1", body, sizeof(body), &n)) {
-        if (!dacp_http_get("getproperty?properties=dacp.playingtime", body, sizeof(body), &n)) {
-            static uint32_t s_fail_ms = 0;
-            if (!s_fail_ms || (uint32_t)(millis() - s_fail_ms) > 8000u) {
-                s_fail_ms = millis();
-                Serial.println(F("[AirPlay] DACP time fail"));
-            }
-            return;
+static void dacp_worker(void*) {
+    DacpJob job{};
+    DacpResult result{};
+    for (;;) {
+        if (xQueueReceive(s_dacp_jobs, &job, portMAX_DELAY) != pdTRUE) continue;
+        result.size = 0;
+        if (job.command[0]) {
+            dacp_send_cmd(job, job.command);
+        } else if (!dacp_http_get(job, "playstatusupdate?revision-number=1",
+                                  result.body, sizeof(result.body), &result.size)) {
+            dacp_http_get(job, "getproperty?properties=dacp.playingtime",
+                          result.body, sizeof(result.body), &result.size);
         }
-    }
-    const uint32_t old_pos = s_anchor_pos_ms;
-    dmap_walk_reset_times();
-    dmap_walk(body, n, 0);
-    apply_walk_times();
-    if (s_walk_got_cant && s_dur_ms > 1u && s_anchor_pos_ms != old_pos) {
-        Serial.printf("[AirPlay] dacp time %u/%u\n", (unsigned)s_anchor_pos_ms, (unsigned)s_dur_ms);
+        result.job = job;
+        xQueueSend(s_dacp_results, &result, portMAX_DELAY);
     }
 }
 
-static void dacp_send_volume(float db) {
-    char cmd[64];
-    snprintf(cmd, sizeof(cmd), "setproperty?dmcp.device-volume=%.6f", db);
-    dacp_send_cmd(cmd);
+static bool dacp_worker_ready() {
+    if (s_dacp_jobs) return true;
+    s_dacp_jobs = xQueueCreate(1, sizeof(DacpJob));
+    s_dacp_results = xQueueCreate(1, sizeof(DacpResult));
+    if (s_dacp_jobs && s_dacp_results &&
+        xTaskCreatePinnedToCore(dacp_worker, "ap_dacp", 6144, nullptr, 2, nullptr, 1) == pdPASS) {
+        return true;
+    }
+    if (s_dacp_jobs) vQueueDelete(s_dacp_jobs);
+    if (s_dacp_results) vQueueDelete(s_dacp_results);
+    s_dacp_jobs = s_dacp_results = nullptr;
+    return false;
+}
+
+static void dacp_collect_result() {
+    if (!s_dacp_results) return;
+    if (uxQueueMessagesWaiting(s_dacp_results) == 0) return;
+    AirPlayAudioGuard guard(false);
+    if (!guard.acquired()) return;  // Metadata must never hold up incoming volume.
+    DacpResult result{};
+    if (xQueueReceive(s_dacp_results, &result, 0) != pdTRUE) return;
+    s_dacp_busy = false;
+    // A reply from the previous phone/session must not change the new session.
+    if (result.job.generation != s_dacp_generation) return;
+    s_dacp_port = result.job.port;
+    s_dacp_ip = result.job.ip;
+    if (result.size) {
+        dmap_walk_reset_times();
+        dmap_walk(result.body, result.size, 0);
+        apply_walk_times();
+    }
+}
+
+static bool dacp_submit(const char* command) {
+    if (s_dacp_busy || !dacp_worker_ready()) return false;
+    DacpJob job{};
+    job.generation = s_dacp_generation;
+    job.ip = s_dacp_ip;
+    job.port = s_dacp_port;
+    strncpy(job.id, s_dacp_id, sizeof(job.id) - 1);
+    strncpy(job.remote, s_active_remote, sizeof(job.remote) - 1);
+    if (command) strncpy(job.command, command, sizeof(job.command) - 1);
+    if (xQueueSend(s_dacp_jobs, &job, 0) != pdTRUE) return false;
+    s_dacp_busy = true;
+    return true;
 }
 
 void airplay_dacp_request(float db) {
+    const float gain = airplay_db_to_gain(db);
+    portENTER_CRITICAL(&s_volume_mux);
+    const uint32_t now = millis();
+    g_ap.vol_gain = gain;
     s_dacp_db = db;
     s_enc_db = db;
-    s_enc_guard_ms = millis();
-    s_dacp_quiet_ms = millis();
+    s_enc_guard_ms = now;
+    s_dacp_quiet_ms = now;
     s_dacp_pending = true;
+    portEXIT_CRITICAL(&s_volume_mux);
 }
 
 void airplay_dacp_command(const char* cmd) {
@@ -901,20 +1009,28 @@ void airplay_dacp_command(const char* cmd) {
 }
 
 void airplay_dacp_poll() {
-    if (!s_active_remote[0]) {
+    dacp_collect_result();
+    if (!s_active_remote[0] || s_dacp_busy || !dacp_worker_ready()) {
         return;
     }
-    if (s_dacp_pending) {
-        if ((uint32_t)(millis() - s_dacp_quiet_ms) < 90u) {
-            return;
+    portENTER_CRITICAL(&s_volume_mux);
+    const uint32_t now = millis();
+    const bool pending = s_dacp_pending;
+    const bool send = pending && (uint32_t)(now - s_dacp_quiet_ms) >= 90u;
+    const float db = s_dacp_db;
+    if (send) s_dacp_pending = false;
+    portEXIT_CRITICAL(&s_volume_mux);
+    if (pending) {
+        if (send) {
+            char command[96];
+            snprintf(command, sizeof(command), "setproperty?dmcp.device-volume=%.6f", db);
+            dacp_submit(command);
         }
-        s_dacp_pending = false;
-        dacp_send_volume(s_dacp_db);
         return;
     }
     if (s_dacp_cmd_pend) {
         s_dacp_cmd_pend = false;
-        dacp_send_cmd(s_dacp_cmd);
+        dacp_submit(s_dacp_cmd);
         return;
     }
     const bool due = s_dacp_time_pend ||
@@ -922,7 +1038,7 @@ void airplay_dacp_poll() {
     if (due) {
         s_dacp_time_pend = false;
         s_dacp_time_ms = millis();
-        dacp_fetch_playing_time();
+        dacp_submit(nullptr);
     }
 }
 
@@ -949,30 +1065,22 @@ static void handle_dmap(const uint8_t* body, size_t n) {
 }
 
 static void apply_volume_db(float db) {
-    Serial.printf("[AirPlay] volume %.1f dB\n", db);
-    if (s_enc_guard_ms && (uint32_t)(millis() - s_enc_guard_ms) < 450u) {
-        const float d = db - s_enc_db;
-        if (d > 1.5f || d < -1.5f) {
-            return;
-        }
-    }
-    if (db <= -144.0f) {
-        if (g_ap.phone_vol_seen) {
-            g_ap.vol_gain = 0;
-            if (radioState.vol != 0) {
-                radioState.vol = 0;
-                matrix_show_volume(0);
-            }
-        }
+    if (!std::isfinite(db)) return;
+    const float gain = airplay_db_to_gain(db);
+    const int8_t nv = db <= -144.0f ? 0 : (int8_t)airplay_db_to_ui(db);
+    portENTER_CRITICAL(&s_volume_mux);
+    const uint32_t now = millis();
+    const bool encoderGuard = s_enc_guard_ms && (uint32_t)(now - s_enc_guard_ms) < 450u;
+    if (!airplay_accept_volume(db, encoderGuard, s_enc_db)) {
+        portEXIT_CRITICAL(&s_volume_mux);
         return;
     }
     g_ap.phone_vol_seen = true;
-    g_ap.vol_gain = airplay_db_to_gain(db);
-    const int8_t nv = (int8_t)airplay_db_to_ui(db);
-    if (nv != radioState.vol) {
-        radioState.vol = nv;
-        matrix_show_volume(nv);
-    }
+    g_ap.vol_gain = gain;
+    radioState.vol = nv;
+    s_dacp_pending = false;  // Do not send an older encoder level back over this update.
+    portEXIT_CRITICAL(&s_volume_mux);
+    matrix_show_volume(nv);  // Show phone changes even within one rounded UI step.
 }
 
 static bool bplist_volume_db(const uint8_t* b, size_t n, float* db) {
@@ -1076,11 +1184,40 @@ static void handle_set_parameter(const char* body, size_t body_n, const char* re
 }
 
 static void dispatch(char* req, size_t len) {
+    if (airplay_rtsp_hangup_pending()) return;
     char* blank = strstr(req, "\r\n\r\n");
     const char* body = blank ? blank + 4 : "";
     char method[16] = "";
     sscanf(req, "%15s", method);
     const int cseq = hdr_int(req, "CSeq");
+    // Volume changes touch only the atomic gain and the short volume-state lock.
+    // They must not queue behind decoding/I2S or their own debug output.
+    const size_t body_n = blank ? len - (size_t)(body - req) : 0;
+    if (!strcmp(method, "SET_PARAMETER") && !s_body_truncated && body_n &&
+        (strcasestr(body, "volume:") ||
+         (body_n >= 8 && !memcmp(body, "bplist00", 8)))) {
+        handle_volume(body, body_n, req);
+        reply(cseq, "");
+        return;
+    }
+    AirPlayAudioGuard guard;
+    const bool announce = !strcmp(method, "ANNOUNCE");
+    const bool setup = !strcmp(method, "SETUP");
+    const bool control = !strcmp(method, "RECORD") || !strcmp(method, "PAUSE") ||
+                         !strcmp(method, "FLUSH") || !strcmp(method, "TEARDOWN");
+    if ((announce || setup || control) && !airplay_accepts()) {
+        reply(cseq, "", "", 453);
+        return;
+    }
+    if ((announce && g_ap.session && s_session_client != s_rep) ||
+        (control && s_session_client != s_rep)) {
+        reply(cseq, "", "", 454);
+        return;
+    }
+    if (!strcmp(method, "RECORD") && (!g_ap.session || !g_ap_owns)) {
+        reply(cseq, "", "", 455);
+        return;
+    }
     if (s_rep >= 0 && s_rep < kRtspClients) {
         note_dacp_headers(req, s_cli[s_rep]);
     }
@@ -1091,11 +1228,21 @@ static void dispatch(char* req, size_t len) {
         reply(cseq, "Public: ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, "
                     "GET_PARAMETER, SET_PARAMETER, POST\r\n");
     } else if (!strcmp(method, "ANNOUNCE")) {
-        handle_announce(body);
-        reply(cseq, "");
+        ++s_dacp_generation;
+        if (s_body_truncated) {
+            reply(cseq, "", "", 400);
+        } else if (handle_announce(body)) {
+            s_session_client = s_rep;
+            reply(cseq, "");
+        } else {
+            airplay_session_clear();
+            s_session_client = -1;
+            reply(cseq, "", "", 400);
+        }
     } else if (!strcmp(method, "SETUP")) {
         handle_setup(req);
     } else if (!strcmp(method, "RECORD")) {
+        g_ap.paused = false;
         g_ap.playing = true;
         g_ap.last_rtp_ms = millis();
         wifi_touch_activity();
@@ -1112,17 +1259,19 @@ static void dispatch(char* req, size_t len) {
         reply(cseq, "Audio-Latency: 31680\r\n");
         Serial.println(F("[AirPlay] RECORD"));
     } else if (!strcmp(method, "FLUSH") || !strcmp(method, "PAUSE")) {
-        airplay_rtp_flush();
+        char info[128];
+        hdr_copy_line(hdr_find(req, "RTP-Info"), info, sizeof(info));
+        const char* timestamp = strstr(info, "rtptime=");
+        airplay_rtp_flush(timestamp != nullptr, timestamp ? strtoul(timestamp + 8, nullptr, 10) : 0);
         g_ap.last_rtp_ms = millis();
         wifi_touch_activity();
         reply(cseq, "");
     } else if (!strcmp(method, "TEARDOWN")) {
+        ++s_dacp_generation;
         reply(cseq, "");
-        // Не вішати RTSP і не віддавати I2S: iPhone часто шле TEARDOWN на паузі/скіпі,
-        // а наступний SETUP йде тим самим TCP. Інакше колонка «відвалюється».
-        g_ap.playing = false;
-        g_ap.session = false;
+        // Keep TCP/decoder for the next SETUP, but release the audio hardware now.
         airplay_rtp_stop();
+        airplay_release_speaker();
         airplay_meta_on_flush();
         Serial.println(F("[AirPlay] TEARDOWN (keep RTSP)"));
     } else if (!strcmp(method, "SET_PARAMETER")) {
@@ -1197,7 +1346,10 @@ static void poll_one(int i) {
             return;
         }
         s_rep = i;
+        const char next = s_acc[i][need];
+        s_acc[i][need] = 0;  // Bound text parsing to this request, not a pipelined successor.
         dispatch(s_acc[i], need);
+        s_acc[i][need] = next;
         if (need < s_accn[i]) {
             memmove(s_acc[i], s_acc[i] + need, s_accn[i] - need);
             s_accn[i] -= need;
@@ -1210,6 +1362,18 @@ static void poll_one(int i) {
 }
 
 void airplay_rtsp_poll() {
+    if (s_hangup_requested.exchange(false)) airplay_rtsp_hangup();
+    {
+        AirPlayAudioGuard guard(false);
+        // Retire the old owner before a dead client's table slot can be reused.
+        if (guard.acquired() && s_session_client >= 0 &&
+            airplay_session_expired(millis(), g_ap.last_rtp_ms, g_ap.session, g_ap.paused,
+                                    airplay_rtsp_alive(), WiFi.status() == WL_CONNECTED)) {
+            Serial.println(F("[AirPlay] session expired/disconnected"));
+            airplay_interrupt();
+            return;
+        }
+    }
     for (int i = 0; i < kRtspClients; i++) {
         if (s_cli[i]) {
             const bool alive = s_cli[i].connected() || s_cli[i].available();
@@ -1217,6 +1381,9 @@ void airplay_rtsp_poll() {
                 s_dead_ms[i] = 0;
                 continue;
             }
+            // Retirement may have been deferred while the audio lock was busy.
+            // Never reuse that owner's slot before its session is cleared.
+            if (i == s_session_client) continue;
             if (!s_dead_ms[i]) {
                 s_dead_ms[i] = millis();
                 continue;
@@ -1232,6 +1399,12 @@ void airplay_rtsp_poll() {
         if (c) {
             c.setNoDelay(true);
             c.setTimeout(400);
+            // Detect a vanished phone even during an intentionally long pause.
+            const int keepalive = 1, idle = 10, interval = 3, retries = 3;
+            setsockopt(c.fd(), SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+            setsockopt(c.fd(), IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+            setsockopt(c.fd(), IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+            setsockopt(c.fd(), IPPROTO_TCP, TCP_KEEPCNT, &retries, sizeof(retries));
             s_cli[i] = c;
             s_accn[i] = 0;
             s_dead_ms[i] = 0;
@@ -1240,5 +1413,14 @@ void airplay_rtsp_poll() {
     }
     for (int i = 0; i < kRtspClients; i++) {
         poll_one(i);
+    }
+    {
+        AirPlayAudioGuard guard(false);
+        if (guard.acquired() && s_session_client >= 0 &&
+            airplay_session_expired(millis(), g_ap.last_rtp_ms, g_ap.session, g_ap.paused,
+                                    airplay_rtsp_alive(), WiFi.status() == WL_CONNECTED)) {
+            Serial.println(F("[AirPlay] session expired/disconnected"));
+            airplay_interrupt();
+        }
     }
 }

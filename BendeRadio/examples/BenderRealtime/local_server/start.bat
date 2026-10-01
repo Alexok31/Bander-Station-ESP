@@ -39,7 +39,7 @@ if not defined RVC_INDEX set "RVC_INDEX=voice_clone\models\bender.index"
 if not defined RVC_PITCH set "RVC_PITCH=-1"
 if not defined RVC_INDEX_RATE set "RVC_INDEX_RATE=0.55"
 if not defined RVC_RMS set "RVC_RMS=0.75"
-if not defined RVC_PROTECT set "RVC_PROTECT=0.5"
+if not defined RVC_PROTECT set "RVC_PROTECT=0.33"
 
 echo.
 echo Bender voice server + RVC

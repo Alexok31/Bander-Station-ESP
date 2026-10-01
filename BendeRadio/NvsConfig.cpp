@@ -152,14 +152,19 @@ bool nvsTakePendingBrightnessOverride(uint8_t& outValue) {
         return false;
     }
     const bool has = p.isKey("br_ovr");
-    if (!has) {
+    // Apply the requested level once, even if the previous playing cap saved 4
+    // to EEPROM. Subsequent boots keep the user's encoder adjustment.
+    const bool migrate = !p.getBool("br_uniform8", false);
+    if (!has && !migrate) {
         p.end();
         return false;
     }
-    int v = p.getUChar("br_ovr", 8u);
+    int v = has ? p.getUChar("br_ovr", RadioConfig::matrixBrightnessDefaultBase)
+                : RadioConfig::matrixBrightnessDefaultBase;
     v = constrain(v, 0, 15);
     outValue = (uint8_t)v;
-    p.remove("br_ovr");
+    if (has) p.remove("br_ovr");
+    if (migrate) p.putBool("br_uniform8", true);
     p.end();
     return true;
 }

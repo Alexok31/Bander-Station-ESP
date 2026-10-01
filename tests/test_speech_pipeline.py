@@ -191,6 +191,7 @@ def load_server_functions():
         "transcribe": lambda pcm: ("Розкажи щось.", "uk", 1.0, True),
         "synth": lambda text: b"\x01\x00" * 300,
         "voice_commands": SimpleNamespace(match=lambda *args: None),
+        "handle_personal_command": lambda *args: None, "favorite_voice_command": lambda text: None,
         "DEVICE_STATIONS": [], "_reply_lang": lambda text, lang: lang,
         "LLM_PROVIDER": "grok", "whisper_device": "fake", "whisper_name": "fake",
         "fold_old_turns": lambda history: None, "save_chat": lambda history: None,
@@ -320,6 +321,25 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         history = []
         await self.ns["run_turn"](SimpleNamespace(send=send), b"input", "", history)
         self.assertEqual(history, [])
+        self.assertEqual(wire[-1], "response.done")
+
+    async def test_uncertain_nonempty_asr_only_asks_to_repeat(self):
+        self.ns["transcribe"] = lambda pcm: ("А то я буду взять рапунт на верхнюю школу", "ru", 1, False)
+        def forbidden(*args):
+            self.fail("Uncertain speech must not reach memory, commands or the LLM")
+        for name in ("handle_personal_command", "favorite_voice_command", "iter_llm_sentences"):
+            self.ns[name] = forbidden
+        voiced, wire = [], []
+        def synth(text):
+            voiced.append(text)
+            return b"\x01\x00" * 300
+        async def send(raw):
+            wire.append(json.loads(raw)["type"])
+        self.ns["synth"] = synth
+        history = [{"role": "user", "content": "Привет"}]
+        await self.ns["run_turn"](SimpleNamespace(send=send), b"input", "", history)
+        self.assertEqual(voiced, ["Не розчув."])
+        self.assertEqual(history, [{"role": "user", "content": "Привет"}])
         self.assertEqual(wire[-1], "response.done")
 
     async def test_minute_of_pcm_across_sentences_keeps_bounded_lead_and_byte_order(self):

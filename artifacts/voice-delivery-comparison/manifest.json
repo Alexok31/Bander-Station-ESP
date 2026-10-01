@@ -1,0 +1,155 @@
+{
+  "sample_rate": 24000,
+  "speaker_id": 1,
+  "base_length_scale": 0.7,
+  "stress": "installed dictionary",
+  "piper_seed": 20261001,
+  "note": "Offline contiguous playback; no network/STT/LLM latency is simulated. Piper uses the same seed and a fresh session for every render; RVC can still vary between renders. Identical prepared text and tempo share one cached render between A and B. Timings include cold start when applicable, not a server benchmark.",
+  "cases": [
+    {
+      "title": "Удивлённый вопрос",
+      "text": "Ти серйозно?",
+      "prepared": [
+        "ти серйо́зно?"
+      ],
+      "variants": {
+        "A": {
+          "file": "01_surprise_A.wav",
+          "settings": [
+            {
+              "length_scale": 0.7,
+              "rise_semitones": 4.2,
+              "piper_ms": 1338.5,
+              "rvc_ms": 7621.8
+            }
+          ],
+          "seconds": 1.22
+        },
+        "B": {
+          "file": "01_surprise_B.wav",
+          "settings": [
+            {
+              "length_scale": 0.7,
+              "rise_semitones": 1.8,
+              "piper_ms": 1338.5,
+              "rvc_ms": 7621.8
+            }
+          ],
+          "seconds": 1.22
+        }
+      }
+    },
+    {
+      "title": "Обычный вопрос",
+      "text": "Що цього разу сталося?",
+      "prepared": [
+        "що цього́ ра́зу ста́лося?"
+      ],
+      "variants": {
+        "A": {
+          "file": "02_question_A.wav",
+          "settings": [
+            {
+              "length_scale": 0.7,
+              "rise_semitones": 4.2,
+              "piper_ms": 1323.3,
+              "rvc_ms": 709.9
+            }
+          ],
+          "seconds": 1.76
+        },
+        "B": {
+          "file": "02_question_B.wav",
+          "settings": [
+            {
+              "length_scale": 0.7,
+              "rise_semitones": 0.6,
+              "piper_ms": 1323.3,
+              "rvc_ms": 709.9
+            }
+          ],
+          "seconds": 1.76
+        }
+      }
+    },
+    {
+      "title": "Короткая реакция",
+      "text": "О, оце вже діло!",
+      "prepared": [
+        "о, оце́ вже ді́ло!"
+      ],
+      "variants": {
+        "A": {
+          "file": "03_reaction_A.wav",
+          "settings": [
+            {
+              "length_scale": 0.7,
+              "rise_semitones": 0.0,
+              "piper_ms": 1394.0,
+              "rvc_ms": 908.8
+            }
+          ],
+          "seconds": 1.78
+        },
+        "B": {
+          "file": "03_reaction_B.wav",
+          "settings": [
+            {
+              "length_scale": 0.6719999999999999,
+              "rise_semitones": 0.0,
+              "piper_ms": 1368.0,
+              "rvc_ms": 918.1
+            }
+          ],
+          "seconds": 1.72
+        }
+      }
+    },
+    {
+      "title": "Два связанных предложения",
+      "text": "Гаразд, допоможу. Тільки не кажи Фраю, що я сьогодні добрий.",
+      "prepared": [
+        "гара́зд, допоможу́.",
+        "ті́льки не кажи́ фра́ю, що я сього́дні добрий."
+      ],
+      "variants": {
+        "A": {
+          "file": "04_conversation_A.wav",
+          "settings": [
+            {
+              "length_scale": 0.7,
+              "rise_semitones": 0.0,
+              "piper_ms": 1351.0,
+              "rvc_ms": 649.9
+            },
+            {
+              "length_scale": 0.7,
+              "rise_semitones": 0.0,
+              "piper_ms": 1382.6,
+              "rvc_ms": 821.9
+            }
+          ],
+          "seconds": 4.28
+        },
+        "B": {
+          "file": "04_conversation_B.wav",
+          "settings": [
+            {
+              "length_scale": 0.7,
+              "rise_semitones": 0.0,
+              "piper_ms": 1351.0,
+              "rvc_ms": 649.9
+            },
+            {
+              "length_scale": 0.714,
+              "rise_semitones": 0.0,
+              "piper_ms": 1368.1,
+              "rvc_ms": 664.4
+            }
+          ],
+          "seconds": 4.2
+        }
+      }
+    }
+  ]
+}

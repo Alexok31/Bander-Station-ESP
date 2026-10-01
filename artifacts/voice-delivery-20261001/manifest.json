@@ -1,0 +1,154 @@
+{
+  "sample_rate": 24000,
+  "speaker_id": 1,
+  "base_length_scale": 0.7,
+  "stress": "installed dictionary",
+  "note": "Offline contiguous playback; no network/STT/LLM latency is simulated. Piper/RVC synthesis can vary between renders. Identical prepared text and tempo share one cached render between A and B. Timings include cold start when applicable, not a server benchmark.",
+  "cases": [
+    {
+      "title": "Удивлённый вопрос",
+      "text": "Ти серйозно?",
+      "prepared": [
+        "ти серйо́зно?"
+      ],
+      "variants": {
+        "A": {
+          "file": "01_surprise_A.wav",
+          "settings": [
+            {
+              "length_scale": 0.7,
+              "rise_semitones": 4.2,
+              "piper_ms": 40.8,
+              "rvc_ms": 7811.7
+            }
+          ],
+          "seconds": 1.28
+        },
+        "B": {
+          "file": "01_surprise_B.wav",
+          "settings": [
+            {
+              "length_scale": 0.7,
+              "rise_semitones": 1.8,
+              "piper_ms": 40.8,
+              "rvc_ms": 7811.7
+            }
+          ],
+          "seconds": 1.28
+        }
+      }
+    },
+    {
+      "title": "Обычный вопрос",
+      "text": "Що цього разу сталося?",
+      "prepared": [
+        "що цього́ ра́зу ста́лося?"
+      ],
+      "variants": {
+        "A": {
+          "file": "02_question_A.wav",
+          "settings": [
+            {
+              "length_scale": 0.7,
+              "rise_semitones": 4.2,
+              "piper_ms": 61.7,
+              "rvc_ms": 749.9
+            }
+          ],
+          "seconds": 1.88
+        },
+        "B": {
+          "file": "02_question_B.wav",
+          "settings": [
+            {
+              "length_scale": 0.7,
+              "rise_semitones": 0.6,
+              "piper_ms": 61.7,
+              "rvc_ms": 749.9
+            }
+          ],
+          "seconds": 1.88
+        }
+      }
+    },
+    {
+      "title": "Короткая реакция",
+      "text": "О, оце вже діло!",
+      "prepared": [
+        "о, оце́ вже ді́ло!"
+      ],
+      "variants": {
+        "A": {
+          "file": "03_reaction_A.wav",
+          "settings": [
+            {
+              "length_scale": 0.7,
+              "rise_semitones": 0.0,
+              "piper_ms": 69.9,
+              "rvc_ms": 906.6
+            }
+          ],
+          "seconds": 1.72
+        },
+        "B": {
+          "file": "03_reaction_B.wav",
+          "settings": [
+            {
+              "length_scale": 0.6719999999999999,
+              "rise_semitones": 0.0,
+              "piper_ms": 60.9,
+              "rvc_ms": 651.6
+            }
+          ],
+          "seconds": 1.78
+        }
+      }
+    },
+    {
+      "title": "Два связанных предложения",
+      "text": "Гаразд, допоможу. Тільки не кажи Фраю, що я сьогодні добрий.",
+      "prepared": [
+        "гара́зд, допоможу́.",
+        "ті́льки не кажи́ фра́ю, що я сього́дні добрий."
+      ],
+      "variants": {
+        "A": {
+          "file": "04_conversation_A.wav",
+          "settings": [
+            {
+              "length_scale": 0.7,
+              "rise_semitones": 0.0,
+              "piper_ms": 51.7,
+              "rvc_ms": 790.8
+            },
+            {
+              "length_scale": 0.7,
+              "rise_semitones": 0.0,
+              "piper_ms": 90.9,
+              "rvc_ms": 703.7
+            }
+          ],
+          "seconds": 4.52
+        },
+        "B": {
+          "file": "04_conversation_B.wav",
+          "settings": [
+            {
+              "length_scale": 0.7,
+              "rise_semitones": 0.0,
+              "piper_ms": 51.7,
+              "rvc_ms": 790.8
+            },
+            {
+              "length_scale": 0.714,
+              "rise_semitones": 0.0,
+              "piper_ms": 92.7,
+              "rvc_ms": 743.5
+            }
+          ],
+          "seconds": 4.7
+        }
+      }
+    }
+  ]
+}

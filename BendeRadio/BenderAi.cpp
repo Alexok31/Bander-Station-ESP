@@ -211,6 +211,12 @@ static volatile bool hangupPending = false;
 static volatile bool sessionArmed = false;
 static volatile bool pttHeld = false;
 static volatile bool s_ptt_armed = false;
+static std::atomic<uint32_t> s_favorites_lo{0}, s_favorites_hi{0};
+static std::atomic<bool> s_event_voice_enabled{true};
+static std::atomic<uint32_t> s_pending_event{0};
+static std::atomic<uint32_t> s_pending_event_ms{0};
+static volatile bool s_event_reply = false;
+static volatile bool s_drop_event_reply = false;
 static volatile bool s_need_mic_clear = false;
 static volatile bool s_need_commit = false;
 static volatile bool respPlaybackPending = false;
@@ -344,6 +350,8 @@ static void i2sWriteSilenceChunks(uint8_t n) {
 }
 
 static void spkWrite(uint8_t* buf, size_t n, bool from_pcm) {
+    AirPlayAudioGuard guard;
+    if (!s_owns_spk) return;
     const int vol = pcmScaleFromRadioVol();
     if (n >= 2 && vol != 256) {
         int16_t* s = (int16_t*)buf;
@@ -374,9 +382,11 @@ static void spkWriteSilence() {
 }
 
 static bool takeSpeaker() {
+    AirPlayAudioGuard guard;
     if (s_owns_spk) {
         return true;
     }
+    if (airplay_owns_speaker()) return false;
     s_taking = true;
     s_need_speaker = false;
     delay(8);
@@ -403,6 +413,7 @@ static bool takeSpeaker() {
 }
 
 static void releaseSpeakerFromLoop() {
+    AirPlayAudioGuard guard;
     if (!s_owns_spk && !s_taking) {
         return;
     }
@@ -433,8 +444,15 @@ static void noteProgress() {
 static uint32_t s_sock_wait_ms;
 
 static void forceRecover(const char* why, bool show_error = false) {
-    if (show_error) {
+    const bool background_event = s_event_reply || s_drop_event_reply || s_pending_event.load() != 0;
+    const bool user_active = pttHeld || s_ptt_armed || convState == ST_RECORDING;
+    if (bender_face_show_error(show_error, background_event, user_active)) {
         showFaceError();
+    }
+    if (background_event) {
+        s_pending_event.store(0);
+        s_event_reply = false;
+        s_drop_event_reply = true;
     }
     ALOG("[AI] recover %s heap=%u\n", why ? why : "?", (unsigned)ESP.getFreeHeap());
     waitingACK = false;
@@ -752,6 +770,7 @@ static void tryPttCommit() {
     if (serverCommitted && ok) {
         JsonDocument r;
         r["type"] = "response.create";
+        if (providerIsLocal()) r["current_station"] = (int)radioState.station;
         wsSend(r);
         waitingACK = false;
     } else {
@@ -878,6 +897,7 @@ static void onMessage(websockets::WebsocketsMessage m) {
         return;
     }
     if (isAudioDeltaMsg(payload)) {
+        if (s_drop_event_reply) return;
         size_t dlen = 0;
         const char* delta = jsonStringField(payload, "delta", &dlen);
         if (delta && dlen) {
@@ -891,10 +911,16 @@ static void onMessage(websockets::WebsocketsMessage m) {
         return;
     }
     const char* t = j["type"] | "";
+    if (s_drop_event_reply && (!strcmp(t, "response.created") || !strcmp(t, "response.output_audio.done") ||
+                              !strcmp(t, "response.audio.done") || !strcmp(t, "response.done"))) {
+        if (!strcmp(t, "response.done")) s_drop_event_reply = false;
+        return;
+    }
     if (strcmp(t, "session.created") == 0) {
         JsonDocument u;
         u["type"] = "session.update";
         JsonObject s = u["session"].to<JsonObject>();
+        if (providerIsLocal()) s["current_station"] = (int)radioState.station;
         s["instructions"] = SYS_PROMPT;
         s["voice"] = rtVoice();
         s["turn_detection"] = nullptr;
@@ -935,6 +961,7 @@ static void onMessage(websockets::WebsocketsMessage m) {
             waitingACK = false;
             JsonDocument r;
             r["type"] = "response.create";
+            if (providerIsLocal()) r["current_station"] = (int)radioState.station;
             wsSend(r);
         }
     } else if (!strcmp(t, "response.created")) {
@@ -947,6 +974,7 @@ static void onMessage(websockets::WebsocketsMessage m) {
         speaking = false;
         noteProgress();
     } else if (!strcmp(t, "response.done")) {
+        s_event_reply = false;
         speaking = false;
         waitingACK = false;
         responsePending = false;
@@ -960,6 +988,16 @@ static void onMessage(websockets::WebsocketsMessage m) {
         const char* msg = j["error"]["message"] | "";
         ALOG("[WSS] error: %s\n", msg);
         forceRecover("ws error", true);
+    } else if (!strcmp(t, "device.profile") && providerIsLocal()) {
+        uint32_t lo = 0, hi = 0;
+        for (JsonVariant id : j["favorites"].as<JsonArray>()) {
+            const int i = id.as<int>();
+            if (i >= 0 && i < 32) lo |= uint32_t(1) << i;
+            else if (i >= 32 && i < 64) hi |= uint32_t(1) << (i - 32);
+        }
+        s_favorites_lo.store(lo);
+        s_favorites_hi.store(hi);
+        s_event_voice_enabled.store(j["event_voice"] | true);
     } else if (!strcmp(t, "device.command")) {
         const char* name = j["name"] | "";
         const int st = j["args"]["station"] | -1;
@@ -978,6 +1016,8 @@ static void onEvent(websockets::WebsocketsEvent e, String) {
         sessionReady = false;
         ALOGLN(F("[WSS] closed"));
         forceRecover("ws closed", interrupted);
+        s_event_reply = s_drop_event_reply = false;
+        s_pending_event.store(0);
     } else if (e == websockets::WebsocketsEvent::GotPing) {
         wsClient.pong();
     }
@@ -1172,6 +1212,28 @@ static void wsTask(void*) {
             continue;
         }
         backoff = 0;
+        const uint32_t pendingEvent = s_pending_event.load();
+        if (pendingEvent && (pttHeld || s_ptt_armed || convState != ST_IDLE ||
+                             uint32_t(millis() - s_pending_event_ms.load()) > 4000u)) {
+            s_pending_event.store(0);
+        } else if (pendingEvent && (!bender_event_radio_allows_voice(
+                                       static_cast<BenderEvent>(pendingEvent & 0xff), radioState.state) ||
+                                   radioState.vol <= 0 || !s_event_voice_enabled.load() ||
+                                   strcmp(g_audio_source, "wifi") != 0 || airplay_owns_speaker())) {
+            s_pending_event.store(0);
+        } else if (pendingEvent && sessionReady && !bender_ai_busy()) {
+            s_pending_event.store(0);
+            JsonDocument event;
+            event["type"] = "device.event";
+            event["name"] = bender_event_name(static_cast<BenderEvent>(pendingEvent & 0xff));
+            event["station"] = int(pendingEvent >> 8) - 1;
+            s_event_reply = true;
+            responsePending = true;
+            convState = ST_WAIT_RESP;
+            stateSinceMs = millis();
+            noteProgress();
+            wsSend(event);
+        }
         const bool capturing = s_ptt_armed || (convState == ST_RECORDING && pttHeld);
         if (!capturing) {
             wsClient.poll();
@@ -1309,8 +1371,29 @@ static bool initMic() {
 }
 
 bool bender_ai_busy() {
-    return s_demo || s_owns_spk || convState != ST_IDLE || speaking || waitingACK || responsePending ||
+    return s_demo || s_ptt_armed || s_taking || s_owns_spk || convState != ST_IDLE || speaking || waitingACK || responsePending ||
            (respPlaybackPending && rbUsed() > 0) || pttHeld || s_dbg_play;
+}
+
+bool bender_ai_favorite_station(int station) {
+    if (station < 0 || station >= 64) return false;
+    return station < 32 ? (s_favorites_lo.load() & (uint32_t(1) << station)) != 0
+                        : (s_favorites_hi.load() & (uint32_t(1) << (station - 32))) != 0;
+}
+
+bool bender_ai_event_voice_enabled() { return s_event_voice_enabled.load(); }
+
+bool bender_ai_event(BenderEvent event, int station) {
+    AirPlayAudioGuard guard;
+    if (!providerIsLocal() || !s_started || !s_event_voice_enabled.load() ||
+        bender_ai_busy() || airplay_owns_speaker() || s_ptt_armed || WiFi.status() != WL_CONNECTED ||
+        s_drop_event_reply || event == BenderEvent::None || event == BenderEvent::NetworkLost) return false;
+    // Prepare the socket without turning on the microphone or taking I2S.
+    s_pending_event_ms.store(millis());
+    s_pending_event.store(uint32_t(event) | (uint32_t(station + 1) << 8));
+    s_ai_awake = wantOnline = true;
+    s_ai_last_live_ms = millis();
+    return true;
 }
 
 bool bender_ai_recording() {
@@ -1340,8 +1423,8 @@ BenderFaceState bender_ai_face_state() {
         convState == ST_RECORDING,
         !pttHeld || s_need_commit,
         output_recent,
-        convState == ST_WAIT_RESP || waitingACK || responsePending || s_need_speaker ||
-            (respPlaybackPending && rbUsed() > 0),
+        !s_event_reply && (convState == ST_WAIT_RESP || waitingACK || responsePending || s_need_speaker ||
+            (respPlaybackPending && rbUsed() > 0)),
     });
 }
 
@@ -1374,6 +1457,12 @@ bool bender_ai_awake() {
 }
 
 void bender_ai_ptt_arm() {
+    s_pending_event.store(0);
+    if (s_event_reply) {
+        s_event_reply = false;
+        s_drop_event_reply = true;
+        forceRecover("user interrupts event");
+    }
     if (s_demo || convState == ST_WAIT_RESP || waitingACK || responsePending || convState == ST_RECORDING) {
         return;
     }
@@ -1397,6 +1486,11 @@ void bender_ai_ptt_cancel() {
 }
 
 void bender_ai_yield_radio() {
+    s_pending_event.store(0);
+    if (s_event_reply) {
+        s_event_reply = false;
+        s_drop_event_reply = true;
+    }
     if (s_owns_spk || s_taking || convState != ST_IDLE) {
         forceRecover("radio play");
     }
@@ -1476,7 +1570,7 @@ void bender_ai_tick() {
         s_need_speaker = false;
         if (!takeSpeaker()) {
             ALOGLN(F("[AI] take speaker fail"));
-            showFaceError();
+            forceRecover("speaker busy/unavailable", true);
         }
     }
     const bool pcm_fresh = s_last_pcm_ms && (millis() - s_last_pcm_ms < 800);

@@ -41,7 +41,9 @@ def main() -> int:
     f0 = os.environ.get("RVC_F0_METHOD", "rmvpe")
     # 0 = динаміка Piper, 1 = конверт RVC. Занадто низьке + овертрейн = «п'яний» голос.
     volume_envelope = float(os.environ.get("RVC_RMS", "0.75"))
-    protect = float(os.environ.get("RVC_PROTECT", "0.5"))
+    # Applio only blends unvoiced features with the source when protect < 0.5.
+    # 0.5 disables that branch and can smear consonants in fast speech.
+    protect = float(os.environ.get("RVC_PROTECT", "0.33"))
     emit({"ok": True, "event": "ready"})
 
     for raw in sys.stdin:

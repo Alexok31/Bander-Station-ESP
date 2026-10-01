@@ -1,0 +1,11 @@
+{
+  "text": "Картинку. Подивись на цю картинку. Покажи картинку, а потім хатинку.",
+  "prepared": "карти́нку. подиви́сь на цю карти́нку. покажи́ карти́нку, а по́тім хати́нку.",
+  "sample_rate": 24000,
+  "length_scale": 0.7,
+  "protect": [
+    0.5,
+    0.33
+  ],
+  "note": "Same Piper PCM used for both RVC renders; no live server changes. RVC renders can vary. Requires listening, not an ASR quality verdict."
+}

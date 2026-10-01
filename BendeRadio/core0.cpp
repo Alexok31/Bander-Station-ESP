@@ -1,6 +1,7 @@
 #include "core0.h"
 
 #include <cstring>
+#include <atomic>
 #include <math.h>
 #include <ESP.h>
 #include <WiFi.h>
@@ -32,6 +33,24 @@ static inline uint8_t mouth_gfx_off(bool invert) {
 }
 
 static uint32_t s_face_last_live_ms = 0;
+static BenderLife s_life;
+static BenderEvent s_life_face = BenderEvent::None;
+static uint32_t s_life_face_since = 0;
+
+static void react_to_life(BenderEvent event) {
+    if (event == BenderEvent::None || bender_ai_busy() || pong_active()) return;
+    const uint32_t now = millis();
+    s_life_face = event;
+    s_life_face_since = now;
+    s_face_last_live_ms = now;
+    Serial.printf("[Life] %s\n", bender_event_name(event));
+    // Direct physical interactions can speak while radio playback is paused.
+    if (!bender_event_radio_allows_voice(event, radioState.state) ||
+        strcmp(g_audio_source, "wifi") != 0 || airplay_owns_speaker() ||
+        radioState.vol <= 0 || WiFi.status() != WL_CONNECTED || !bender_ai_event_voice_enabled()) return;
+    if (s_life.allowVoice(event, now, false) && bender_ai_event(event, (int)radioState.station))
+        s_life.allowVoice(event, now);
+}
 
 static bool matrix_face_awake() {
     if (radioState.state || bender_ai_busy() || airplay_playing()) {
@@ -219,10 +238,7 @@ static int matrix_base_max() {
 }
 
 void upd_bright() {
-    if (!radioState.state && !bender_ai_busy() && !airplay_playing()) {
-        matrix_apply_brightness((int)RadioConfig::matrixBrightnessIdleBase);
-        return;
-    }
+    // One selected level in every state, including idle and AI waiting/speech.
     int v = max((int)radioState.bright_mouth, (int)radioState.bright_eyes);
     v = constrain(v, 0, matrix_base_max());
     if (RadioConfig::matrixBrightnessWhenPlayingCap < 15) {
@@ -319,8 +335,7 @@ void matrix_show_play_mode() {
 static void pong_sync_matrix_brightness() {
     upd_bright();
 }
-static volatile bool s_ui_vol_req = false;
-static volatile uint8_t s_ui_vol_val = 0;
+static std::atomic<int> s_ui_vol_pending{-1};
 
 void matrix_show_volume(int8_t vol) {
     if (vol < 0) {
@@ -329,8 +344,7 @@ void matrix_show_volume(int8_t vol) {
     if (vol > 99) {
         vol = 99;
     }
-    s_ui_vol_val = (uint8_t)vol;
-    s_ui_vol_req = true;
+    s_ui_vol_pending.store(vol);
 }
 
 void print_val(char c, uint8_t v) {
@@ -437,6 +451,27 @@ static void draw_ai_eyes(BenderFaceState state, uint32_t elapsed) {
             // Asymmetric lids and a small sideways glance: puzzled/annoyed.
             mtrx.rect(x, 0, x + 7, i == 0 ? 2 : 1, GFX_CLEAR);
             draw_eyeb(i, elapsed < 700u ? 2 : 4, 4);
+        } else if (state == BenderFaceState::Annoyed) {
+            // Symmetric frown, without the asymmetric error/drunk expression.
+            draw_eyeb(i, 3, 4);
+            mtrx.lineH(0, x, x + 7, GFX_CLEAR);
+            if (i == 0) {
+                mtrx.lineH(1, x + 3, x + 7, GFX_CLEAR);
+                mtrx.lineH(2, x + 5, x + 7, GFX_CLEAR);
+            } else {
+                mtrx.lineH(1, x, x + 4, GFX_CLEAR);
+                mtrx.lineH(2, x, x + 2, GFX_CLEAR);
+            }
+        } else if (state == BenderFaceState::Pleased) {
+            draw_eyeb(i, 3, 3);
+            mtrx.lineH(7, x, x + 7, GFX_CLEAR);
+            mtrx.lineH(6, x, x + 1, GFX_CLEAR);
+            mtrx.lineH(6, x + 6, x + 7, GFX_CLEAR);
+        } else if (state == BenderFaceState::Curious) {
+            draw_eyeb(i, elapsed < 900 ? 2 : 4, 2);
+        } else if (state == BenderFaceState::Tired) {
+            mtrx.rect(x, 0, x + 7, 2, GFX_CLEAR);
+            draw_eyeb(i, 3, 5);
         } else {
             draw_eyeb(i, ((elapsed / 1100u) % 2u) ? 3 : 2, 3);
         }
@@ -1611,6 +1646,7 @@ void core0(void* p) {
         if (nvsTakePendingBrightnessOverride(b)) {
             radioState.bright_eyes = (int8_t)b;
             radioState.bright_mouth = (int8_t)b;
+            memory.update();
         }
     }
     nvsLoadCustomStations(s_custom_stations, RadioConfig::customStationMaxCount, s_custom_station_count);
@@ -1696,8 +1732,8 @@ void core0(void* p) {
     }
     syncWifiWithAudioSilence();
 
-    Serial.printf("Matrix CLK=%u CS=%u DAT=%u, idle bright=%u\n", RadioConfig::mtrxClk,
-                  RadioConfig::mtrxCs, RadioConfig::mtrxDat, RadioConfig::matrixBrightnessIdleBase);
+    Serial.printf("Matrix CLK=%u CS=%u DAT=%u, base bright=%u\n", RadioConfig::mtrxClk,
+                  RadioConfig::mtrxCs, RadioConfig::mtrxDat, matrix_get_base_brightness());
 
     // ========================= LOOP =========================
     for (;;) {
@@ -1745,10 +1781,10 @@ void core0(void* p) {
             battery_shutdown_guard_on_sample();
         }
         matrix_tmr.tick();
-        if (s_ui_vol_req) {
-            s_ui_vol_req = false;
+        const int requested_volume = s_ui_vol_pending.exchange(-1);
+        if (requested_volume >= 0) {
             s_batt_matrix_overlay = false;
-            print_val('v', s_ui_vol_val);
+            print_val('v', (uint8_t)requested_volume);
             matrix_tmr.start(RadioConfig::matrixOverlayDigitsMs);
         }
         if (s_mode_flash_req) {
@@ -1785,7 +1821,14 @@ void core0(void* p) {
             angry_tmr.start();
             wifi_touch_activity();
             Serial.println(F("[MPU] → angry eyes (shake OK)"));
+            react_to_life(BenderEvent::Shake);
         }
+        react_to_life(mpu6050_motion_event());
+        react_to_life(s_life.update(millis(), battery_gauge_ready() && battery_sense_present(),
+                                   battery_percent(), battery_is_charging(), WiFi.status() == WL_CONNECTED,
+                                   strcmp(g_audio_source, "wifi") == 0 && radioState.state,
+                                   radioState.state && strcmp(g_audio_source, "wifi") == 0,
+                                   (int)radioState.station, bender_ai_favorite_station((int)radioState.station)));
 
         if (s_pending_change_state_after_wake) {
             if ((int32_t)(millis() - s_wake_after_sleep_anim_until_ms) >= 0) {
@@ -1928,8 +1971,11 @@ void core0(void* p) {
                 memory.update();
             }
         } else {
-            const BenderFaceState ai_face = bender_ai_face_state();
+            BenderFaceState ai_face = bender_ai_face_state();
             const uint32_t face_now = millis();
+            if (ai_face == BenderFaceState::Idle && bender_face_recent(face_now, s_life_face_since, 2200)) {
+                ai_face = bender_event_face(s_life_face);
+            }
             const bool ai_face_changed = ai_face != previous_ai_face;
             if (ai_face_changed) {
                 previous_ai_face = ai_face;
@@ -1937,7 +1983,11 @@ void core0(void* p) {
                 Serial.printf("[Face] %s\n", ai_face == BenderFaceState::Listening ? "listening" :
                               ai_face == BenderFaceState::Thinking ? "thinking" :
                               ai_face == BenderFaceState::Speaking ? "speaking" :
-                              ai_face == BenderFaceState::Error ? "error" : "idle");
+                              ai_face == BenderFaceState::Error ? "error" :
+                              ai_face == BenderFaceState::Annoyed ? "annoyed" :
+                              ai_face == BenderFaceState::Pleased ? "pleased" :
+                              ai_face == BenderFaceState::Curious ? "curious" :
+                              ai_face == BenderFaceState::Tired ? "tired" : "idle");
             }
             if (ai_face != BenderFaceState::Idle && !s_mode_pick_active) {
                 s_face_last_live_ms = face_now;
@@ -1962,7 +2012,9 @@ void core0(void* p) {
                             } else {
                                 draw_mouth_anim_rest(invert);
                             }
-                        } else if (ai_face == BenderFaceState::Listening) {
+                        } else if (ai_face == BenderFaceState::Listening || ai_face == BenderFaceState::Pleased ||
+                                   ai_face == BenderFaceState::Curious || ai_face == BenderFaceState::Tired ||
+                                   ai_face == BenderFaceState::Annoyed) {
                             const uint8_t mode = mouth_anim_mode();
                             const bool invert = mode == 1 || mode == 4;
                             mtrx.rect(0, 0, RadioConfig::analyzWidth - 1, 7, mouth_gfx_off(invert));

@@ -71,9 +71,9 @@ class RadioConfig {
     static constexpr uint8_t mtrxCs = 15;
     static constexpr uint8_t mtrxDat = 17;
     static constexpr uint8_t matrixModuleCount = 5;
-    static constexpr uint8_t matrixBrightnessIdleBase = 8;
-    // Пока играет радио — яркость матриц не выше этого (общий 5 V с MAX98357; иначе «хрип при тихом»).
-    static constexpr uint8_t matrixBrightnessWhenPlayingCap = 4;
+    static constexpr uint8_t matrixBrightnessDefaultBase = 8;
+    // Единый предел для покоя, радио и AI: без переключения яркости 8 -> 4.
+    static constexpr uint8_t matrixBrightnessWhenPlayingCap = 8;
     // Период кадра рта/EQ (мс). Было ~42; 56–80 снижает нагрузку SPI MAX7219.
     static constexpr uint16_t matrixVizRefreshMs = 56;
     // Під TTS рот малюємо частіше за радіо; 16 мс — як радіо-колбек по часу кадру.
@@ -339,8 +339,9 @@ class RadioConfig {
     static constexpr uint8_t mpu6050I2cAddr = 0x68;
     static constexpr uint32_t mpu6050PollMs = 40;
     // Сумма |Δax|+|Δay|+|Δaz| (сырые ±2g). 4000–8000 — тряска руками; выше — менее чувствительно.
-    static constexpr uint16_t mpu6050ShakeDeltaSum = 5500;
-    static constexpr uint16_t mpu6050ShakeCooldownMs = 800;
+    // Two strong samples within 240 ms confirm a shake; one bump is ignored.
+    static constexpr uint16_t mpu6050ShakeDeltaSum = 8000;
+    static constexpr uint16_t mpu6050ShakeCooldownMs = 1500;
     static constexpr uint16_t mpu6050AngryEyesMs = 900;
 
     // Отладка PCM в audio_process_extern: редкие строки в Serial (не на каждый буфер — иначе глотает аудио/Wi‑Fi).
