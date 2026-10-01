@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 SERVER_DIR = Path(__file__).resolve().parents[1] / "BendeRadio/examples/BenderRealtime/local_server"
 sys.path.insert(0, str(SERVER_DIR))
-from speech_pipeline import TurnTiming, stream_speech
+from speech_pipeline import PcmPacer, TurnTiming, stream_speech
 
 
 async def sentences(*items):
@@ -179,7 +179,8 @@ def load_server_functions():
     logs = []
     ns = {
         "asyncio": asyncio, "aclosing": aclosing, "base64": base64, "re": re,
-        "TurnTiming": TurnTiming, "stream_speech": stream_speech,
+        "TurnTiming": TurnTiming, "stream_speech": stream_speech, "PcmPacer": PcmPacer,
+        "OUT_RATE": 24000,
         "LLM_MAX_SENTS": 3, "LLM_STORY_SENTS": 5, "_LLM_RETRY_NUDGE": "try again",
         "_is_story": lambda text: False, "_is_greet": lambda text: False,
         "_story_fallback": lambda history: "story fallback",
@@ -320,6 +321,67 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         await self.ns["run_turn"](SimpleNamespace(send=send), b"input", "", history)
         self.assertEqual(history, [])
         self.assertEqual(wire[-1], "response.done")
+
+    async def test_minute_of_pcm_across_sentences_keeps_bounded_lead_and_byte_order(self):
+        now = 0.0
+        received = bytearray()
+
+        async def sleep(delay):
+            nonlocal now
+            now += delay
+
+        pacer = PcmPacer(clock=lambda: now, sleep=sleep)
+
+        async def send(raw):
+            received.extend(base64.b64decode(json.loads(raw)["delta"]))
+            self.assertLessEqual(len(received) / 48000 - now, 0.500001)
+
+        # Three 20-second sentences; the media clock must not restart per phrase.
+        pcm = bytes(range(256)) * 3750
+        for _ in range(3):
+            await self.ns["send_pcm_deltas"](SimpleNamespace(send=send), pcm, pacer=pacer)
+        self.assertEqual(received, pcm * 3)
+        self.assertAlmostEqual(now, 59.5, places=6)
+
+    async def test_malformed_pcm_is_rejected_before_transport(self):
+        async def send(raw):
+            self.fail("Malformed PCM should not be sent")
+
+        with self.assertRaises(ValueError):
+            await self.ns["send_pcm_deltas"](SimpleNamespace(send=send), b"\x01")
+
+
+class PacerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_initial_audio_has_no_added_wait(self):
+        waits = []
+
+        async def sleep(delay):
+            waits.append(delay)
+
+        pacer = PcmPacer(clock=lambda: 100.0, sleep=sleep)
+        for _ in range(4):
+            await pacer.wait(4800)
+        self.assertEqual(waits, [])
+
+    async def test_synthesis_gap_does_not_accumulate_catchup_burst(self):
+        now = 0.0
+
+        async def sleep(delay):
+            nonlocal now
+            now += delay
+
+        pacer = PcmPacer(clock=lambda: now, sleep=sleep)
+        for _ in range(30):
+            await pacer.wait(4800)
+        now += 10
+        before = now
+        for _ in range(10):
+            await pacer.wait(4800)
+        self.assertAlmostEqual(now - before, 0.5)
+
+    async def test_partial_sample_is_rejected(self):
+        with self.assertRaises(ValueError):
+            await PcmPacer().wait(3)
 
 
 if __name__ == "__main__":

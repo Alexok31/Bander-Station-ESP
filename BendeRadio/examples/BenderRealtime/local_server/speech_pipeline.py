@@ -23,6 +23,33 @@ class TurnTiming:
             self.log(f"[Latency] {name}={ms:.0f}ms from response.create")
 
 
+class PcmPacer:
+    """PCM16 mono media clock, shared across all sentences in a response.
+
+    Keep at most half a second of scheduled audio ahead of wall time. Reset
+    the clock after synthesis gaps so later sentences don't inherit old debt.
+    """
+
+    def __init__(self, sample_rate: int = 24000, lead_seconds: float = 0.5,
+                 clock=perf_counter, sleep=asyncio.sleep):
+        if sample_rate <= 0 or lead_seconds < 0:
+            raise ValueError("Invalid PCM pacing configuration")
+        self.bytes_per_second = sample_rate * 2
+        self.lead_seconds = lead_seconds
+        self.clock = clock
+        self.sleep = sleep
+        self.scheduled_end = 0.0
+
+    async def wait(self, byte_count: int) -> None:
+        if byte_count < 0 or byte_count % 2:
+            raise ValueError("PCM16 data must contain whole two-byte samples")
+        now = self.clock()
+        self.scheduled_end = max(self.scheduled_end, now) + byte_count / self.bytes_per_second
+        delay = self.scheduled_end - now - self.lead_seconds
+        if delay > 0:
+            await self.sleep(delay)
+
+
 async def stream_speech(
     sentences: AsyncIterator[str],
     synthesize: Callable[[str], Awaitable[bytes]],

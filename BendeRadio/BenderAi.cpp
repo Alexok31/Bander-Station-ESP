@@ -15,6 +15,7 @@
 #include "RadioConfig.h"
 #include "core0.h"
 #include "pcm_analyzer.h"
+#include "Pcm16.h"
 #include "secrets.h"
 
 #ifndef BENDER_AI_LOG
@@ -173,6 +174,7 @@ constexpr uint32_t RATE = 24000;
 constexpr size_t CHUNK = 240;
 constexpr size_t CHUNK_BYTES = CHUNK * 2;
 constexpr size_t RING_BYTES = 512 * 1024;
+static_assert(RING_BYTES % 2 == 0 && CHUNK_BYTES % 2 == 0, "PCM16 ring and chunks must be sample-aligned");
 constexpr uint16_t PREBUF_N = 1700;
 constexpr uint16_t PRE_IDLE_N = 80;
 constexpr size_t PREBUF_BYTES = (size_t)PREBUF_N * CHUNK_BYTES;
@@ -793,6 +795,11 @@ static void pushPcmBytes(const uint8_t* pcm, size_t n) {
     if (!pcm || !n || !ring) {
         return;
     }
+    if (n != pcm16_whole_bytes(n)) {
+        forceRecover("partial PCM16 sample", true);
+        requestHangup();
+        return;
+    }
     if (!s_owns_spk) {
         s_need_speaker = true;
     }
@@ -806,7 +813,7 @@ static void pushPcmBytes(const uint8_t* pcm, size_t n) {
     while (idx < n) {
         portENTER_CRITICAL(&mux);
         size_t freeb = rbFree();
-        size_t chunk = minOf(freeb, n - idx);
+        size_t chunk = pcm16_whole_bytes(minOf(freeb, n - idx));
         if (chunk) {
             size_t first = minOf(chunk, RING_BYTES - head);
             memcpy(ring + head, pcm + idx, first);
@@ -817,7 +824,7 @@ static void pushPcmBytes(const uint8_t* pcm, size_t n) {
         portEXIT_CRITICAL(&mux);
         if (idx < n) {
             if (++waits > 40) {
-                ALOGLN(F("[AI] ring full — drop pcm"));
+                ALOG("[AI] ring full — drop %u whole-sample bytes\n", (unsigned)(n - idx));
                 break;
             }
             vTaskDelay(1);
@@ -998,9 +1005,11 @@ static void speakerTask(void*) {
             vTaskDelay(5 / portTICK_PERIOD_MS);
             continue;
         }
+        portENTER_CRITICAL(&mux);
         size_t avail = rbUsed();
+        portEXIT_CRITICAL(&mux);
         if (!primed) {
-            const bool gotWholeReply = respPlaybackPending && avail >= CHUNK_BYTES;
+            const bool gotWholeReply = respPlaybackPending && avail >= 2;
             const size_t minStart = CHUNK_BYTES * 16;
             if (avail < minStart && !gotWholeReply) {
                 ampMuteHw(true);
@@ -1013,9 +1022,9 @@ static void speakerTask(void*) {
             quietSince = 0;
         }
         if (avail < CHUNK_BYTES) {
-            if (avail >= 4) {
+            if (avail >= 2) {
                 portENTER_CRITICAL(&mux);
-                size_t take = avail & ~3u;
+                size_t take = pcm16_whole_bytes(minOf(rbUsed(), (size_t)CHUNK_BYTES));
                 size_t first = minOf(take, RING_BYTES - tail);
                 memcpy(buf, ring + tail, first);
                 if (first < take) {
@@ -1023,6 +1032,10 @@ static void speakerTask(void*) {
                 }
                 tail = (tail + take) % RING_BYTES;
                 portEXIT_CRITICAL(&mux);
+                if (!take) {
+                    vTaskDelay(1);
+                    continue;
+                }
                 memset(buf + take, 0, CHUNK_BYTES - take);
                 spkWrite(buf, CHUNK_BYTES, true);
                 continue;
@@ -1060,6 +1073,14 @@ static void speakerTask(void*) {
         quietSince = 0;
         starve = 0;
         portENTER_CRITICAL(&mux);
+        // A recovery/new recording may have reset the ring after the snapshot.
+        // Advancing tail on an empty ring would manufacture almost a full ring
+        // of stale audio and keep playing noise on subsequent responses.
+        if (rbUsed() < CHUNK_BYTES) {
+            portEXIT_CRITICAL(&mux);
+            vTaskDelay(1);
+            continue;
+        }
         size_t first = minOf((size_t)CHUNK_BYTES, RING_BYTES - tail);
         memcpy(buf, ring + tail, first);
         if (first < CHUNK_BYTES) {
@@ -1426,13 +1447,15 @@ void bender_ai_ptt_down() {
         JsonDocument c;
         c["type"] = "response.cancel";
         wsSend(c);
-        speaking = false;
-        ampMuteHw(true);
-        s_tts_out_ms = 0;
-        portENTER_CRITICAL(&mux);
-        head = tail = 0;
-        portEXIT_CRITICAL(&mux);
     }
+    // Start every recording on an empty, sample-aligned buffer, also when the
+    // previous response already sent response.done but left a partial tail.
+    speaking = false;
+    ampMuteHw(true);
+    s_tts_out_ms = 0;
+    portENTER_CRITICAL(&mux);
+    head = tail = 0;
+    portEXIT_CRITICAL(&mux);
     respPlaybackPending = false;
     pcm_analyzer_reset();
     pttStartCapture();

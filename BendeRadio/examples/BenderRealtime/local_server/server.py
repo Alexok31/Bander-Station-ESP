@@ -43,7 +43,7 @@ except ImportError:
 import rvc_convert
 import stress_convert
 import voice_commands
-from speech_pipeline import TurnTiming, stream_speech
+from speech_pipeline import PcmPacer, TurnTiming, stream_speech
 
 HERE = Path(__file__).resolve().parent
 TUNNEL_URL_PATH = HERE / "tunnel_url.txt"
@@ -2261,21 +2261,22 @@ async def send_asr_debug_replay(ws, pcm_in: bytes) -> None:
     await send_pcm_deltas(ws, replay)
 
 
-async def send_pcm_deltas(ws, pcm: bytes, timing: TurnTiming | None = None) -> None:
+async def send_pcm_deltas(ws, pcm: bytes, timing: TurnTiming | None = None,
+                          pacer: PcmPacer | None = None) -> None:
     step = 2400 * 2  # 100 ms @ 24 kHz
     if not pcm:
         return
-    burst = 5  # ~500 мс одразу в кільце ESP — менше заїкань
-    n = 0
+    if len(pcm) % 2:
+        raise ValueError("PCM16 payload ends in a partial sample")
+    if pacer is None:
+        pacer = PcmPacer(OUT_RATE)
     for i in range(0, len(pcm), step):
         piece = pcm[i : i + step]
+        await pacer.wait(len(piece))
         b64 = base64.b64encode(piece).decode("ascii")
         await ws.send(dumps({"type": "response.output_audio.delta", "delta": b64}))
         if timing is not None:
             timing.mark("first_pcm_sent")
-        n += 1
-        if n > burst:
-            await asyncio.sleep(0.055)
 
 
 async def send_audio(ws, pcm: bytes, *, emit_created: bool = True) -> None:
@@ -2345,6 +2346,7 @@ async def _iter_checked_reply(text: str, lang: str, asr_p: float, history: list,
 
 async def run_turn(ws, pcm_in: bytes, prompt: str, history: list) -> None:
     timing = TurnTiming(log)
+    pacer = PcmPacer(OUT_RATE)
     delivered: list[str] = []
     reply_recorded = False
 
@@ -2354,7 +2356,7 @@ async def run_turn(ws, pcm_in: bytes, prompt: str, history: list) -> None:
         return pcm
 
     async def send_sentence(pcm: bytes) -> None:
-        await send_pcm_deltas(ws, pcm, timing)
+        await send_pcm_deltas(ws, pcm, timing, pacer)
 
     await ws.send(dumps({"type": "response.created"}))
     stop = asyncio.Event()
