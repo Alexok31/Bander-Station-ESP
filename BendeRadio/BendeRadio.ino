@@ -218,7 +218,7 @@ void setup() {
     bender_ai_begin();
     airplay_begin();
     airplay_set_accept(play_mode_is_airplay());
-    Serial.println(F("Bender AI: hold=talk; 8 clicks=sleep; 9=restart; idle 5 min=calm, 30 min=sleep"));
+    Serial.println(F("Bender AI: hold=talk; 8 clicks=sleep; 9=restart; idle behavior: WebUI"));
     Serial.println(F("Mode: 4 clicks = FM / AIR"));
     Serial.println(F("FM: 2 clicks=next station, 3=prev"));
     Serial.println(F("AirPlay: 1 click=pause, 2=next, 3=prev"));

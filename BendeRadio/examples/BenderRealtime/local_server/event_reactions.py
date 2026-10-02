@@ -1,13 +1,15 @@
 """Short event replies with monotonic, session-independent cooldowns. No LLM."""
 import time
+import random
 
 
 class EventReactions:
     REPLIES = {
         "battery_low": ("Енергія закінчується. Підключи зарядку, поки я ще ввічливий.",
                         "Час мене підзарядити. На самому сарказмі далеко не поїдеш."),
-        "charging": ("О, струм. Нарешті нормальне обслуговування.",
-                     "Зарядка пішла. Ще трохи, і я знову нестерпний."),
+        "charging": ("О-о-о, стру-у-ум!",
+                     "Нарешті, а то я вже зголоднів!",
+                     "Не пиво, але теж смачно."),
         "network_back": ("Зв'язок повернувся. Можете знову захоплюватися мною.",),
         "favorite_station": ("О, улюблена станція. Смак у тебе іноді буває.",),
         "shake": ("Гей, обережніше! Я робот, а не шейкер.",
@@ -23,6 +25,7 @@ class EventReactions:
         self.last = {}
         self.last_any = None
         self.counts = {}
+        self.last_charging_reply = None
 
     def choose(self, event: dict, profile: dict) -> str | None:
         name = event.get("name")
@@ -37,6 +40,11 @@ class EventReactions:
             return None
         self.last_any = now
         self.last[name] = now
+        if name == "charging":
+            choices = [reply for reply in self.REPLIES[name] if reply != self.last_charging_reply]
+            reply = random.choice(choices or self.REPLIES[name])
+            self.last_charging_reply = reply
+            return reply
         n = self.counts.get(name, 0)
         self.counts[name] = n + 1
         return self.REPLIES[name][n % len(self.REPLIES[name])]

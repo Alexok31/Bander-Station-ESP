@@ -46,6 +46,7 @@ import stress_convert
 import voice_commands
 from personal_memory import PersonalMemory
 from event_reactions import EventReactions
+from character import validate_character, character_rules, validate_preview_question, DEFAULT_QUESTION
 from speech_pipeline import PcmPacer, TurnTiming, stream_speech
 
 HERE = Path(__file__).resolve().parent
@@ -165,7 +166,7 @@ CHAT: list[dict] = []
 CHAT_CONV_ID = ""
 CHAT_SUMMARY = ""
 CHAT_GROK_RESP_ID = ""
-GROK_PROMPT_REV = 7
+GROK_PROMPT_REV = 8
 DEVICE_STATIONS: list[dict] = []
 
 VOICE_ONNX = MODELS / "uk_UA-ukrainian_tts-medium.onnx"
@@ -213,6 +214,7 @@ _GREET_WORDS = r"бендер|bender|привіт|привет|вітаю|здр
 
 PROMPT_TEMPLATE = (HERE / "bender_prompt.txt").read_text(encoding="utf-8").strip()
 BENDER_LEVEL = int(CFG.get("bender_level") or 5)
+DEVICE_CHARACTER = None  # Legacy clients keep bender_level; new firmware sends five traits.
 
 LEVEL_RULES = {
     1: (
@@ -281,11 +283,12 @@ def _history_user_asst_nudge(history: list[dict] | None) -> tuple[str, str, str]
 
 
 def grok_turn_text(user_text: str, last_assistant: str = "", nudge: str = "") -> str:
-    bits = [f"[BENDER_LEVEL {BENDER_LEVEL}/10]", _TURN_GUIDANCE]
+    mode = "[Еквалайзер характеру з системних інструкцій]" if DEVICE_CHARACTER is not None else f"[BENDER_LEVEL {BENDER_LEVEL}/10]"
+    bits = [mode, _TURN_GUIDANCE]
     memory_context = MEMORY.context(user_text, DEVICE_STATIONS)
     if memory_context:
         bits.append(memory_context)
-    if BENDER_LEVEL >= 8:
+    if DEVICE_CHARACTER is None and BENDER_LEVEL >= 8:
         bits.append(
             "Різкість і мат за обраним рівнем вплітай у відповідь по суті. Не шаблон образи. "
             "Без ехо + «бля?!» + «найкращий робот» + «йди нахуй, м'ясний мішок»."
@@ -327,11 +330,41 @@ def grok_break_chain(reason: str) -> None:
     CHAT_GROK_RESP_ID = ""
 
 
-def bender_prompt() -> str:
+def set_device_character(raw) -> bool:
+    global DEVICE_CHARACTER
+    profile = validate_character(raw)
+    if profile is None:
+        log("[Character] invalid profile ignored")
+        return False
+    if profile != DEVICE_CHARACTER:
+        DEVICE_CHARACTER = profile
+        # Also invalidate a chain restored from disk on the first device connection:
+        # its system instructions may belong to a different personality.
+        grok_break_chain("character changed")
+        log("[Character] " + " ".join(f"{key}={value}" for key, value in profile.items()))
+    return True
+
+
+def bender_prompt(character=None) -> str:
+    profile = DEVICE_CHARACTER if character is None else character
+    eq = profile is not None
     return (
         PROMPT_TEMPLATE
         .replace("{BENDER_LEVEL}", str(BENDER_LEVEL))
-        .replace("{BENDER_LEVEL_RULES}", bender_level_rules())
+        .replace("{BENDER_LEVEL_RULES}", character_rules(profile) if eq else bender_level_rules())
+        .replace("{CHARACTER_IDENTITY}",
+                 "Самовпевнений робот із власним его та історіями про Planet Express. "
+                 "Силу сарказму, буркотіння і доброзичливості визначає еквалайзер нижче." if eq else
+                 "Нахабний, егоїстичний, цинічний, з величезним его. Пиво, гроші, злодійство, власна велич.")
+        .replace("{CHARACTER_STYLE}",
+                 "Виявляй сарказм, цікавість, упертість і теплоту відповідно до еквалайзера. "
+                 "При низькому значенні не нав'язуй цю рису заради образу Бендера." if eq else
+                 "Сарказм і его — зсередини, не наліпкою. Можеш похвалитися, поторгуватися за уявну винагороду, "
+                 "вдати небажання допомагати — і все ж допомогти в тій самій репліці. Іноді визнай чужий успіх, ніби неохоче.")
+        .replace("{CHARACTER_MODE}", "ЕКВАЛАЙЗЕР ХАРАКТЕРУ" if eq else f"РЕЖИМ: {BENDER_LEVEL}/10")
+        .replace("{CHARACTER_END}",
+                 "Еквалайзер визначає манеру; зміст розмови та доречна допомога завжди важливіші." if eq else
+                 f"Працюй у режимі {BENDER_LEVEL}/10: він визначає різкість і лексику. Інших рівнів немає. Не згладжуй.")
     )
 
 whisper_model = None
@@ -1747,7 +1780,7 @@ def _llm_payload(
         last_user = (history[-1].get("content") or "").strip()
     greet = _is_greet(last_user)
     story = _is_story(last_user)
-    n_temp = 0.62 + (BENDER_LEVEL - 5) * 0.06
+    n_temp = 0.68 if DEVICE_CHARACTER is not None else 0.62 + (BENDER_LEVEL - 5) * 0.06
     n_temp = max(0.45, min(0.98, n_temp))
     if greet and not story and len(last_user.split()) <= 4:
         n_pred = 90
@@ -1964,6 +1997,14 @@ async def _grok_pieces(history: list[dict], n_pred: int, n_temp: float):
         log(f"Grok {GROK_MODEL} continue {prev[:12]}… level={BENDER_LEVEL} temp={n_temp:.2f}")
     else:
         body["instructions"] = bender_prompt()
+        if DEVICE_CHARACTER is not None:
+            # A personality change needs new instructions, not amnesia. Reuse the
+            # bounded local dialogue when starting the replacement remote chain.
+            context = []
+            if CHAT_SUMMARY:
+                context.append({"role": "user", "content": "Контекст попередньої розмови:\n" + CHAT_SUMMARY})
+            context.extend(history[-HISTORY_SEND:-1])
+            body["input"] = context + body["input"]
         log(f"Grok {GROK_MODEL} new chain level={BENDER_LEVEL} temp={n_temp:.2f}")
     headers = {
         "Authorization": f"Bearer {XAI_API_KEY}",
@@ -2633,6 +2674,80 @@ async def process_request(*args):
     return None
 
 
+async def character_preview_text(profile, question=DEFAULT_QUESTION) -> str:
+    """One isolated model request: no conversation ID, memory or persisted state."""
+    prompt = bender_prompt(profile) + (
+        "\nЦе короткий приклад твого характеру. Відповідай природно на питання нижче, "
+        "1–3 короткими реченнями, не більше 45 слів. Не згадуй тест, налаштування чи еквалайзер."
+    )
+    question = validate_preview_question(question)
+    if question is None:
+        raise ValueError("Invalid preview question")
+    pieces = []
+    if LLM_PROVIDER == "grok":
+        if not XAI_API_KEY:
+            raise RuntimeError("Grok key missing")
+        body = {"model": GROK_MODEL, "instructions": prompt,
+                "input": [{"role": "user", "content": question}], "stream": True,
+                "store": False, "temperature": 0.68, "max_output_tokens": 180}
+        if re.search(r"grok-4\.3", GROK_MODEL):
+            body["reasoning"] = {"effort": "none"}
+        elif re.search(r"grok-4\.[56]", GROK_MODEL):
+            body["reasoning"] = {"effort": "low"}
+        async with _httpx_async(timeout=25.0) as client:
+            async with client.stream("POST", XAI_RESP_URL,
+                                     headers={"Authorization": f"Bearer {XAI_API_KEY}"}, json=body) as response:
+                response.raise_for_status()
+                async for event in _iter_sse(response):
+                    if event.get("error"):
+                        raise RuntimeError("Preview model error")
+                    piece = _grok_delta_text(event)
+                    if piece:
+                        pieces.append(piece)
+    else:
+        payload = {"model": OLLAMA_MODEL, "stream": True, "keep_alive": -1,
+                   "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": question}],
+                   "options": {"temperature": 0.68, "num_predict": 180}}
+        async with aclosing(_ollama_pieces(payload)) as stream:
+            async for piece in stream:
+                pieces.append(piece)
+    text = _clean_llm("".join(pieces))
+    sentences, remainder = _pop_sentences(text)
+    text = " ".join(sentences[:3]) if sentences else remainder
+    if not text or len(text) > 600:
+        raise RuntimeError("Empty or overlong preview")
+    return text
+
+
+async def run_character_preview(ws, event) -> None:
+    profile = validate_character(event.get("character"))
+    question = validate_preview_question(event.get("question", DEFAULT_QUESTION))
+    ok = False
+    try:
+        if profile is None:
+            raise ValueError("Invalid preview character")
+        if question is None:
+            raise ValueError("Invalid preview question")
+        await ws.send(dumps({"type": "response.created"}))
+        # Bound the silent generation/TTS period below the device's 45 s timeout.
+        async def prepare():
+            text = await character_preview_text(profile, question)
+            log(f"[Character preview] {text}")
+            pcm = await asyncio.to_thread(synth, text)
+            if not pcm:
+                raise RuntimeError("Preview TTS returned no audio")
+            return pcm
+        pcm = await asyncio.wait_for(prepare(), timeout=38.0)
+        await send_pcm_deltas(ws, pcm)
+        ok = True
+    except Exception as error:
+        log(f"[Character preview] failed: {error}")
+    finally:
+        await ws.send(dumps({"type": "character.preview.result", "request_id": event.get("request_id"), "ok": ok}))
+        await ws.send(dumps({"type": "response.output_audio.done"}))
+        await ws.send(dumps({"type": "response.done"}))
+
+
 async def handle(ws) -> None:
     global DEVICE_CURRENT_STATION
     log(f"client {ws.remote_address}")
@@ -2655,6 +2770,9 @@ async def handle(ws) -> None:
                 raw_lv = ev.get("bender_level", sess.get("bender_level"))
                 if raw_lv is not None:
                     log(f"BENDER_LEVEL {BENDER_LEVEL} → {set_bender_level(raw_lv)}")
+                if "character" in sess:
+                    set_device_character(sess["character"])
+                prompt = bender_prompt()
                 raw_st = sess.get("stations") or ev.get("stations")
                 if isinstance(raw_st, list):
                     DEVICE_STATIONS.clear()
@@ -2694,6 +2812,8 @@ async def handle(ws) -> None:
                 await run_turn(ws, pcm_in, prompt, CHAT)
             elif t == "response.cancel":
                 buf.clear()
+            elif t == "character.preview":
+                await run_character_preview(ws, ev)
             elif t == "device.event":
                 # Firmware sends only fresh, idle-time events. Events don't enter
                 # conversation history and never require an LLM round trip.

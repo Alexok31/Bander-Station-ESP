@@ -10,6 +10,13 @@ constexpr bool bender_event_radio_allows_voice(BenderEvent event, bool radioOn) 
     return radioOn || event == BenderEvent::Shake || event == BenderEvent::Charging;
 }
 
+constexpr bool bender_event_allows_motion_wake(BenderEvent event, bool awake, bool wakeOnShake) {
+    // Carry/set-down edges from the same movement must not bypass the switch.
+    const bool motion = event == BenderEvent::Shake || event == BenderEvent::Carried ||
+                        event == BenderEvent::SetDown;
+    return !motion || awake || wakeOnShake;
+}
+
 constexpr BenderFaceState bender_event_face(BenderEvent event) {
     switch (event) {
         case BenderEvent::Charging:

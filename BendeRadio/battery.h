@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include "BatteryProtection.h"
 
 void battery_init();
 // true, если в этом вызове выполнен новый замер (по интервалу).
@@ -11,6 +12,9 @@ void battery_force_sample();
 bool battery_gauge_ready();
 uint8_t battery_percent();
 uint16_t battery_millivolts();
+// Последнее усреднение ADC без медленного фильтра индикатора.
+uint16_t battery_protection_millivolts();
+BatteryShutdownReason battery_shutdown_reason();
 // Делитель с линии LED зарядки на chargingDetectPin: true, пока идёт активная зарядка.
 bool battery_is_charging();
 
@@ -19,5 +23,5 @@ uint8_t battery_eye_mood();
 
 // true — делитель на GPIO1 похож на живую 2S (не «обрыв»).
 bool battery_sense_present();
-// true — можно уводить в deep sleep по критическому % (АЦП + зарядка + sense).
+// true — защита по свежему напряжению активна (не зависит от детектора зарядки).
 bool battery_low_power_sleep_active();

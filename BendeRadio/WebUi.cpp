@@ -8,6 +8,9 @@
 #include "NvsConfig.h"
 #include "RadioConfig.h"
 #include "core0.h"
+#include "WebUiPage.h"
+#include "WebUiSaveScope.h"
+#include "BenderAi.h"
 
 static WebServer server(80);
 static DNSServer dnsServer;
@@ -77,233 +80,246 @@ static void htmlAppendEscaped(String& html, const String& s) {
     }
 }
 
+static String htmlEscaped(const String& value) {
+    String out;
+    out.reserve(value.length() + 16);
+    htmlAppendEscaped(out, value);
+    return out;
+}
+
+struct WebUiToken { const char* name; String value; };
+
+static String matrixControls() {
+    int8_t trim[RadioConfig::matrixModuleCount] = {};
+    matrix_get_brightness_trim(trim, RadioConfig::matrixModuleCount);
+    String html;
+    html.reserve(3500);
+    html += F("<div class=\"head-wrap\"><div class=\"head-row\">");
+    const uint8_t order[] = {3, 4, 0, 1, 2};
+    const char* names[] = {"Рот 1", "Рот 2", "Рот 3", "Левый глаз", "Правый глаз"};
+    for (uint8_t n = 0; n < 5; ++n) {
+        if (n == 2) html += F("</div><div class=\"head-row\">");
+        const uint8_t i = order[n];
+        html += F("<div class=\"mx\"><div class=\"mx-title\">");
+        html += names[i];
+        html += F("</div><input type=\"hidden\" name=\"mbr"); html += String(i);
+        html += F("\" id=\"mbr"); html += String(i);
+        html += F("\" value=\""); html += String(trim[i]);
+        html += F("\"><div class=\"mx-value\" id=\"v"); html += String(i);
+        html += F("\">"); html += String(trim[i]);
+        html += F("</div><div class=\"mx-buttons\">");
+        for (int delta : {-1, 1}) {
+            html += F("<button type=\"button\" data-matrix=\""); html += String(i);
+            html += F("\" data-delta=\""); html += String(delta);
+            html += F("\" aria-label=\""); html += names[i];
+            html += delta < 0 ? F(": темнее\">−</button>") : F(": ярче\">+</button>");
+        }
+        html += F("</div></div>");
+    }
+    html += F("</div></div>");
+    return html;
+}
+
 static void sendPage() {
     wifi_touch_activity();
-    const bool staOk = (WiFi.status() == WL_CONNECTED);
-    String ipSta = staOk ? WiFi.localIP().toString() : String("offline");
-
     WifiStored w;
     nvsLoadWifi(w);
-    String staSsidShow;
-    if (staOk) {
-        staSsidShow = WiFi.SSID();
-    } else if (w.staSsid.length()) {
-        staSsidShow = w.staSsid;
-    } else {
-        staSsidShow = RadioConfig::wifiSsid;
-    }
-
-    String html;
-    html.reserve(4200);
-    html += F("<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
-              "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-              "<title>Bender Station</title>"
-              "<style>"
-              ":root{--bg:#008EA0;--panel:#1A5354;--text:#ffffff;--accent:#FF6F00;--field:#d9e2ea;--fieldText:#12202a;}"
-              "body{font-family:system-ui,sans-serif;max-width:560px;margin:0 auto;padding:20px 14px;background:linear-gradient(180deg,#42A9B6 0%,var(--bg) 56%,#1A5354 100%);color:var(--text);}"
-              ".hero{display:flex;align-items:center;gap:10px;margin-bottom:10px;}"
-              ".icon{font-size:28px;line-height:1;filter:drop-shadow(0 1px 0 #22313b);}"
-              "h1,h2{margin:0 0 10px 0;text-transform:uppercase;color:#111111;letter-spacing:0.8px;}"
-              "h2{margin-top:18px;font-size:18px;}"
-              "label{display:block;margin:10px 0 4px;color:var(--text);font-size:14px;}"
-              "input,textarea{width:100%;box-sizing:border-box;padding:10px;font-size:15px;border-radius:8px;border:1px solid #4c6170;background:var(--field);color:var(--fieldText);}"
-              ".btn{margin-top:16px;padding:11px 16px;font-size:16px;font-weight:600;cursor:pointer;border:none;border-radius:10px;background:var(--accent);color:#1e1e1e;}"
-              ".panel{background:rgba(24,38,49,0.28);padding:12px;border-radius:10px;border:1px solid rgba(255,255,255,0.15);}"
-              ".muted{margin-top:8px;font-size:13px;opacity:.92;}"
-              ".headWrap{display:flex;flex-direction:column;gap:8px;margin-top:6px;}"
-              ".headRow{display:flex;justify-content:center;gap:8px;}"
-              ".mx{width:92px;min-height:82px;background:rgba(8,20,28,.34);border:1px solid rgba(255,255,255,.22);border-radius:10px;padding:6px;display:flex;flex-direction:column;align-items:center;justify-content:space-between;cursor:pointer;}"
-              ".mxTitle{font-size:11px;text-align:center;line-height:1.15;color:#111111;}"
-              ".mxVal{font-weight:700;color:var(--accent);}"
-              ".mxBtns{display:flex;gap:8px;}"
-              ".mxBtn{border:none;border-radius:8px;min-width:46px;min-height:40px;padding:6px 12px;background:#d8e4eb;color:#13232b;font-weight:700;font-size:22px;line-height:1;touch-action:manipulation;}"
-              "</style></head><body>");
-    String apSsidShow = nvsEffectiveApSsid(w);
-
-    html += F("<div class=\"hero\"><div class=\"icon\">🤖</div><h1>Bender Station</h1></div>");
-    html += F("<div class=\"panel\">");
-    html += F("СТАТУС WIFI: ");
-    html += ipSta;
-    if (staOk) {
-        html += F(" / ");
-        html += WiFi.SSID();
-    }
-    html += F("</div>");
-
-    html += F("<form method=\"POST\" action=\"/save\">");
-    html += F("<h2>Wi-Fi Дом</h2>");
-    html += F("<label>Имя сети</label>");
-    html += F("<input name=\"sta_ssid\" maxlength=\"32\" value=\"");
-    html += staSsidShow;
-    html += F("\" autocomplete=\"off\">");
-    html += F("<label>Пароль</label>");
-    html += F("<input name=\"sta_pass\" type=\"password\" maxlength=\"64\" placeholder=\"новый пароль\" autocomplete=\"new-password\">");
-    html += F("<p class=\"muted\">Колонка только 2.4 ГГц. Раздача с iPhone: Настройки → Режим модема → "
-              "Максимальная совместимость (иначе часто только 5 ГГц и ESP не видит сеть). "
-              "Имя сети — как у iPhone, без опечаток.</p>");
-
-    html += F("<h2>Wi-Fi Bender</h2>");
-    html += F("<label>Имя точки доступа</label>");
-    html += F("<input name=\"ap_ssid\" maxlength=\"32\" value=\"");
-    html += w.apSsid.length() ? w.apSsid : apSsidShow;
-    html += F("\" autocomplete=\"off\">");
-    html += F("<label>Пароль точки доступа</label>");
-    html += F("<input name=\"ap_pass\" type=\"password\" maxlength=\"64\" placeholder=\"если нужно изменить\" autocomplete=\"new-password\">");
-
-    String custom[RadioConfig::customStationMaxCount];
-    uint8_t customCount = 0;
-    nvsLoadCustomStations(custom, RadioConfig::customStationMaxCount, customCount);
-    String stationsText;
-    for (uint8_t i = 0; i < customCount; i++) {
-        stationsText += custom[i];
-        stationsText += '\n';
-    }
-    html += F("<h2>Интернет Радио</h2>");
-    html += F("<label>Ссылки (одна строка = одна станция)</label>");
-    html += F("<textarea name=\"stations\" rows=\"8\" style=\"width:100%;box-sizing:border-box;padding:8px;font-size:14px;\">");
-    html += stationsText;
-    html += F("</textarea>");
-    html += F("<p class=\"muted\">Можно сохранить до ");
-    html += String((int)RadioConfig::customStationMaxCount);
-    html += F(" ссылок.</p>");
-
+    const bool online = WiFi.status() == WL_CONNECTED;
+    String ssid = online ? WiFi.SSID() : (w.staSsid.length() ? w.staSsid : String(RadioConfig::wifiSsid));
     String aiUrl;
     nvsLoadAiWsUrl(aiUrl);
-    html += F("<h2>AI сервер</h2>");
-    html += F("<label>WebSocket (пусто = домашний ПК в той же Wi‑Fi)</label>");
-    html += F("<input name=\"ai_ws\" maxlength=\"160\" placeholder=\"ws://192.168.0.173:8765/v1/realtime\" value=\"");
-    htmlAppendEscaped(html, aiUrl);
-    html += F("\" autocomplete=\"off\">");
-    html += F("<p class=\"muted\">Пусто = дома LAN, иначе постоянный Tailscale Funnel "
-              "из прошивки. ПК: start.bat + один раз enable_funnel.bat. "
-              "Колонке в другом городе нужна любая Wi‑Fi с интернетом.</p>");
-
-    int8_t trim[RadioConfig::matrixModuleCount] = {0, 0, 0, 0, 0};
-    matrix_get_brightness_trim(trim, RadioConfig::matrixModuleCount);
-    html += F("<h2>КАЛИБРОВКА МАТРИЦ</h2>");
-    html += F("<div class=\"muted\">Клик по модулю: ярче. Кнопки -/+ : темнее/ярче.</div>");
-    for (uint8_t i = 0; i < RadioConfig::matrixModuleCount; i++) {
-        html += F("<input type=\"hidden\" id=\"mbr");
-        html += String((int)i);
-        html += F("\" name=\"mbr");
-        html += String((int)i);
-        html += F("\" value=\"");
-        html += String((int)trim[i]);
-        html += F("\">");
+    String custom[RadioConfig::customStationMaxCount];
+    uint8_t count = 0;
+    nvsLoadCustomStations(custom, RadioConfig::customStationMaxCount, count);
+    String stations;
+    for (uint8_t i = 0; i < count; ++i) { stations += custom[i]; stations += '\n'; }
+    String options;
+    const uint8_t calm = nvsLoadCalmMinutes();
+    for (auto minutes : BenderBehavior::calmOptions) {
+        options += F("<option value=\""); options += String(minutes); options += '"';
+        if (minutes == calm) options += F(" selected");
+        options += '>';
+        options += minutes ? String(minutes) + F(" мин") : String(F("Не засыпать"));
+        options += F("</option>");
     }
-    html += F("<div class=\"headWrap\">");
-    html += F("<div class=\"headRow\">");
-    html += F("<div class=\"mx\" onclick=\"adj(3,1)\"><div class=\"mxTitle\">ГЛАЗ ЛЕВЫЙ</div><div class=\"mxVal\" id=\"v3\"></div><div class=\"mxBtns\"><button class=\"mxBtn\" type=\"button\" onclick=\"evtAdj(event,3,-1)\">-</button><button class=\"mxBtn\" type=\"button\" onclick=\"evtAdj(event,3,1)\">+</button></div></div>");
-    html += F("<div class=\"mx\" onclick=\"adj(4,1)\"><div class=\"mxTitle\">ГЛАЗ ПРАВЫЙ</div><div class=\"mxVal\" id=\"v4\"></div><div class=\"mxBtns\"><button class=\"mxBtn\" type=\"button\" onclick=\"evtAdj(event,4,-1)\">-</button><button class=\"mxBtn\" type=\"button\" onclick=\"evtAdj(event,4,1)\">+</button></div></div>");
-    html += F("</div>");
-    html += F("<div class=\"headRow\">");
-    html += F("<div class=\"mx\" onclick=\"adj(0,1)\"><div class=\"mxTitle\">РОТ 1</div><div class=\"mxVal\" id=\"v0\"></div><div class=\"mxBtns\"><button class=\"mxBtn\" type=\"button\" onclick=\"evtAdj(event,0,-1)\">-</button><button class=\"mxBtn\" type=\"button\" onclick=\"evtAdj(event,0,1)\">+</button></div></div>");
-    html += F("<div class=\"mx\" onclick=\"adj(1,1)\"><div class=\"mxTitle\">РОТ 2</div><div class=\"mxVal\" id=\"v1\"></div><div class=\"mxBtns\"><button class=\"mxBtn\" type=\"button\" onclick=\"evtAdj(event,1,-1)\">-</button><button class=\"mxBtn\" type=\"button\" onclick=\"evtAdj(event,1,1)\">+</button></div></div>");
-    html += F("<div class=\"mx\" onclick=\"adj(2,1)\"><div class=\"mxTitle\">РОТ 3</div><div class=\"mxVal\" id=\"v2\"></div><div class=\"mxBtns\"><button class=\"mxBtn\" type=\"button\" onclick=\"evtAdj(event,2,-1)\">-</button><button class=\"mxBtn\" type=\"button\" onclick=\"evtAdj(event,2,1)\">+</button></div></div>");
-    html += F("</div>");
-    html += F("</div>");
-    html += F("<div class=\"mxBtns\" style=\"margin-top:8px;justify-content:flex-start;\">"
-              "<button class=\"mxBtn\" type=\"button\" onclick=\"startCalib()\">НАЧАТЬ КАЛИБРОВКУ</button>"
-              "</div>");
-
-    html += F("<button class=\"btn\" type=\"submit\">СОХРАНИТЬ</button>");
-    html += F("</form>"
-              "<script>"
-              "const MIN_B=0,MAX_B=15,CALIB_START=0;"
-              "let calibTimer=0;"
-              "function getV(i){const e=document.getElementById('mbr'+i);return parseInt(e.value||'0',10)||0;}"
-              "function postCalib(){const b=[];for(let i=0;i<5;i++){b.push('mbr'+i+'='+encodeURIComponent(getV(i)));}fetch('/calib',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b.join('&')}).catch(()=>{});}"
-              "function queueCalib(){if(calibTimer)clearTimeout(calibTimer);calibTimer=setTimeout(postCalib,120);}"
-              "function setV(i,v,notify=true){if(v<MIN_B)v=MIN_B;if(v>MAX_B)v=MAX_B;document.getElementById('mbr'+i).value=v;const t=document.getElementById('v'+i);if(t)t.textContent=''+v;if(notify)queueCalib();}"
-              "function adj(i,d){setV(i,getV(i)+d,true);}"
-              "function evtAdj(ev,i,d){ev.stopPropagation();adj(i,d);}"
-              "function startCalib(){for(let i=0;i<5;i++){setV(i,CALIB_START,false);}queueCalib();}"
-              "for(let i=0;i<5;i++){setV(i,getV(i),false);}"
-              "</script>"
-              "</body></html>");
-
+    const auto character = nvsLoadCharacter();
+    // Template values are escaped before insertion. Only our own controls contain markup.
+    const WebUiToken tokens[] = {
+        {"CONNECTION_CLASS", online ? "" : "offline"},
+        {"CONNECTION_TEXT", online ? String(F("Wi-Fi подключён")) : String(F("Wi-Fi не подключён"))},
+        {"IP", htmlEscaped(online ? WiFi.localIP().toString() : WiFi.softAPIP().toString())},
+        {"CURRENT_STATION", htmlEscaped(radio_station_name((uint8_t)radioState.station))},
+        {"RADIO_STATUS", play_mode_is_airplay() ? String(F("Сейчас выбран режим AirPlay")) :
+            (radioState.state ? String(F("FM / Интернет-радио · включено")) : String(F("FM / Интернет-радио · на паузе")))},
+        {"CUSTOM_COUNT", String(count)}, {"STATION_MAX", String(RadioConfig::customStationMaxCount)},
+        {"STATIONS", htmlEscaped(stations)}, {"SSID", htmlEscaped(ssid)},
+        {"AP_SSID", htmlEscaped(nvsEffectiveApSsid(w))}, {"AI_URL", htmlEscaped(aiUrl)},
+        {"WAKE_CHECKED", nvsLoadWakeOnShake() ? "checked" : ""},
+        {"SHAKE", String(nvsLoadShakeThreshold())}, {"SHAKE_MIN", String(BenderBehavior::shakeMin)},
+        {"SHAKE_MAX", String(BenderBehavior::shakeMax)}, {"SHAKE_STEP", String(BenderBehavior::shakeStep)},
+        {"SHAKE_DEFAULT", String(BenderBehavior::shakeDefault)},
+        {"CALM_OPTIONS", options}, {"MATRIX_CONTROLS", matrixControls()},
+        {"SARCASM", String(character.values[0])}, {"SOCIABILITY", String(character.values[1])},
+        {"CURIOSITY", String(character.values[2])}, {"STUBBORNNESS", String(character.values[3])},
+        {"WARMTH", String(character.values[4])}
+    };
     web_send_close_connection();
-    server.send(200, "text/html; charset=utf-8", html);
+    server.sendHeader("Cache-Control", "no-store");
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/html; charset=utf-8", "");
+    // Stream from flash instead of allocating another full page on the ESP heap.
+    // Scan the original template only: user text cannot introduce template tokens.
+    const char* cursor = kWebUiPage;
+    while (const char* start = strstr(cursor, "{{")) {
+        if (start != cursor) server.sendContent_P(cursor, size_t(start - cursor));
+        const char* end = strstr(start + 2, "}}");
+        if (!end) break;
+        for (const auto& token : tokens) {
+            if (strlen(token.name) == size_t(end - start - 2) &&
+                strncmp(start + 2, token.name, size_t(end - start - 2)) == 0) {
+                // Empty content is the HTTP chunked terminator, not an empty field.
+                if (token.value.length()) server.sendContent(token.value);
+                break;
+            }
+        }
+        cursor = end + 2;
+    }
+    if (*cursor) server.sendContent_P(cursor);
+    server.sendContent("");
+}
+
+static void saveError(const char* message) {
+    web_send_close_connection();
+    server.send(400, "text/plain; charset=utf-8", message);
 }
 
 static void handleSave() {
     wifi_touch_activity();
-    if (server.method() != HTTP_POST) {
-        web_send_close_connection();
-        server.send(405, "text/plain", "Method Not Allowed");
-        return;
-    }
+    const String section = server.arg("section");
+    const WebUiSaveScope scope(section.c_str());
+    if (!scope.valid) { saveError("Неизвестный раздел настроек"); return; }
 
-    String staSsid = server.arg("sta_ssid");
-    staSsid.trim();
-    if (staSsid.length() == 0) {
-        web_send_close_connection();
-        server.send(400, "text/plain", "SSID required");
-        return;
-    }
-    String staPassIn = server.arg("sta_pass");
-    String apSsidIn = server.arg("ap_ssid");
-    apSsidIn.trim();
-    String apPassIn = server.arg("ap_pass");
-    String stationsIn = server.arg("stations");
-    String aiWsIn = server.arg("ai_ws");
-    if (!nvsNormalizeAiWsUrl(aiWsIn)) {
-        web_send_close_connection();
-        server.send(400, "text/plain", "AI URL: ws:// или wss://");
-        return;
-    }
-    int8_t trim[RadioConfig::matrixModuleCount] = {0, 0, 0, 0, 0};
-    for (uint8_t i = 0; i < RadioConfig::matrixModuleCount; i++) {
-        String v = server.arg(String("mbr") + String((int)i));
-        v.trim();
-        trim[i] = (int8_t)constrain(v.toInt(), (int)RadioConfig::matrixBrightnessTrimMin,
-                                     (int)RadioConfig::matrixBrightnessTrimMax);
-    }
-
-    WifiStored cur;
-    nvsLoadWifi(cur);
-
-    String staPassToStore = staPassIn.length() ? staPassIn : cur.staPass;
-
-    String apSsidToStore = apSsidIn.length() ? apSsidIn : nvsEffectiveApSsid(cur);
-    if (apSsidToStore.length() == 0) {
-        apSsidToStore = RadioConfig::apSsid;
-    }
-
-    String apPassToStore = cur.apPass;
-    if (apPassIn.length() >= 8) {
-        apPassToStore = apPassIn;
-    }
-
-    nvsSaveWifi(staSsid, staPassToStore, apSsidToStore, apPassToStore);
+    // Validate every requested field before any NVS write. Other sections stay untouched.
+    WifiStored current;
+    String staSsid, staPass, apSsid, apPass, aiUrl;
+    uint16_t shake = 0, calm = 0;
+    int8_t trim[RadioConfig::matrixModuleCount] = {};
     String parsed[RadioConfig::customStationMaxCount];
-    uint8_t parsedCount = 0;
-    int from = 0;
-    while (from < stationsIn.length() && parsedCount < RadioConfig::customStationMaxCount) {
-        int nl = stationsIn.indexOf('\n', from);
-        String line = (nl >= 0) ? stationsIn.substring(from, nl) : stationsIn.substring(from);
-        line.replace("\r", "");
-        line.trim();
-        if (line.length() > 0) {
-            parsed[parsedCount++] = line;
+    uint8_t count = 0;
+    BenderCharacter::Settings character;
+    if (scope.character) {
+        for (uint8_t i = 0; i < BenderCharacter::count; ++i) {
+            uint16_t value;
+            const char* key = BenderCharacter::keys[i];
+            if (!server.hasArg(key) || !BenderBehavior::parseUnsigned(server.arg(key).c_str(), value) || value > 100) {
+                saveError("Каждая черта характера должна быть от 0 до 100"); return;
+            }
+            character.values[i] = uint8_t(value);
         }
-        if (nl < 0) {
-            break;
-        }
-        from = nl + 1;
     }
-    nvsSaveCustomStations(parsed, parsedCount);
-    nvsSaveAiWsUrl(aiWsIn);
-    matrix_set_brightness_trim(trim, RadioConfig::matrixModuleCount, true);
-
+    if (scope.wifi) {
+        nvsLoadWifi(current);
+        staSsid = server.arg("sta_ssid"); staSsid.trim();
+        if (!staSsid.length() || staSsid.length() > 32) { saveError("Укажи имя Wi-Fi сети (до 32 байт)"); return; }
+        staPass = server.arg("sta_pass");
+        if (!staPass.length()) staPass = current.staPass;
+        apSsid = server.arg("ap_ssid"); apSsid.trim();
+        if (!apSsid.length()) apSsid = nvsEffectiveApSsid(current);
+        apPass = server.arg("ap_pass");
+        if ((apPass.length() && apPass.length() < 8) || apPass.length() > 64 ||
+            apSsid.length() > 32 || staPass.length() > 64) { saveError("Проверь длину имени сети и паролей. Пароль точки доступа: 8–64 символа."); return; }
+        if (!apPass.length()) apPass = current.apPass;
+    }
+    if (scope.ai) {
+        if (!server.hasArg("ai_ws")) { saveError("Не передан адрес AI сервера"); return; }
+        aiUrl = server.arg("ai_ws");
+        if (!nvsNormalizeAiWsUrl(aiUrl)) { saveError("Адрес AI сервера должен начинаться с ws:// или wss://"); return; }
+    }
+    if (scope.behavior) {
+        if (!scope.legacy && (!server.hasArg("motion_settings") || !server.hasArg("shake_delta") || !server.hasArg("calm_minutes"))) {
+            saveError("Не переданы настройки поведения"); return;
+        }
+        if ((server.hasArg("shake_delta") && (!BenderBehavior::parseUnsigned(server.arg("shake_delta").c_str(), shake) || !BenderBehavior::validShake(shake))) ||
+            (server.hasArg("calm_minutes") && (!BenderBehavior::parseUnsigned(server.arg("calm_minutes").c_str(), calm) || !BenderBehavior::validCalm(calm)))) {
+            saveError("Недопустимая чувствительность или время до покоя"); return;
+        }
+    }
+    if (scope.display) {
+        for (uint8_t i = 0; i < RadioConfig::matrixModuleCount; ++i) {
+            const String name = String("mbr") + String(i);
+            uint16_t value;
+            if (!server.hasArg(name) || !BenderBehavior::parseUnsigned(server.arg(name).c_str(), value) || value > RadioConfig::matrixBrightnessTrimMax) {
+                saveError("Яркость каждого модуля должна быть от 0 до 15"); return;
+            }
+            trim[i] = int8_t(value);
+        }
+    }
+    if (scope.radio) {
+        if (!server.hasArg("stations")) { saveError("Не передан список станций"); return; }
+        const String list = server.arg("stations");
+        int from = 0;
+        while (from < list.length()) {
+            const int nl = list.indexOf('\n', from);
+            String line = nl < 0 ? list.substring(from) : list.substring(from, nl);
+            line.trim();
+            if (line.length()) {
+                if (count >= RadioConfig::customStationMaxCount) { saveError("Слишком много станций"); return; }
+                if (!line.startsWith("http://") && !line.startsWith("https://")) { saveError("Каждая станция должна быть ссылкой http:// или https://"); return; }
+                parsed[count++] = line;
+            }
+            if (nl < 0) break;
+            from = nl + 1;
+        }
+    }
+    if (scope.character && !nvsSaveCharacter(character)) {
+        server.send(500, "text/plain; charset=utf-8", "Не удалось сохранить характер. Попробуй ещё раз."); return;
+    }
+    if (scope.wifi) nvsSaveWifi(staSsid, staPass, apSsid, apPass);
+    if (scope.radio) nvsSaveCustomStations(parsed, count);
+    if (scope.ai) nvsSaveAiWsUrl(aiUrl);
+    if (scope.behavior) {
+        if (server.hasArg("motion_settings")) nvsSaveWakeOnShake(server.arg("wake_on_shake") == "1");
+        if (server.hasArg("shake_delta")) nvsSaveShakeThreshold(shake);
+        if (server.hasArg("calm_minutes")) nvsSaveCalmMinutes(uint8_t(calm));
+    }
+    if (scope.display) matrix_set_brightness_trim(trim, RadioConfig::matrixModuleCount, true);
     web_send_close_connection();
-    server.send(200, "text/html; charset=utf-8",
-                 "<!DOCTYPE html><html><head><meta charset=utf-8></head><body>"
-                 "<p>Сохранено. Перезагрузка…</p>"
-                 "<script>setTimeout(function(){location.href='/';},3000);</script>"
-                 "</body></html>");
+    String response = F("<!doctype html><html lang=ru><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Сохранено — Bender</title><body style='margin:0;background:#111a1b;color:#f1f4ed;font:16px system-ui;padding:10vh 24px'><main style='max-width:440px;margin:auto'><p style='color:#b6efd5;letter-spacing:2px'>BENDER STATION</p><h1>Запомнил.</h1><p>Настройки сохранены. Бендер перезапускается.</p><p>Если менял Wi-Fi, подключись к новой сети.</p><a style='color:#b6efd5' href='/#");
+    response += scope.radio ? "radio" : (scope.character ? "character" : "settings");
+    response += F("'>Вернуться к панели →</a></main><script>setTimeout(()=>location.href='/#");
+    response += scope.radio ? "radio" : (scope.character ? "character" : "settings");
+    response += F("',8000)</script></body></html>");
+    server.send(200, "text/html; charset=utf-8", response);
     delay(300);
     ESP.restart();
+}
+
+static void handleCharacterPreview() {
+    wifi_touch_activity();
+    web_send_close_connection();
+    server.sendHeader("Cache-Control", "no-store");
+    if (server.method() == HTTP_GET) {
+        server.send(200, "application/json", String("{\"state\":") + String(bender_ai_preview_status()) + "}");
+        return;
+    }
+    BenderCharacter::Settings traits;
+    for (uint8_t i = 0; i < BenderCharacter::count; ++i) {
+        uint16_t value;
+        const char* key = BenderCharacter::keys[i];
+        if (!server.hasArg(key) || !BenderBehavior::parseUnsigned(server.arg(key).c_str(), value) || value > 100) {
+            server.send(400, "text/plain; charset=utf-8", "Каждая черта должна быть от 0 до 100."); return;
+        }
+        traits.values[i] = uint8_t(value);
+    }
+    String question = server.hasArg("question") ? server.arg("question") : String(BenderCharacter::defaultQuestion);
+    question.trim();
+    if (question.length() != strlen(question.c_str()) || !BenderCharacter::validQuestion(question.c_str())) {
+        server.send(400, "text/plain; charset=utf-8", "Напиши тестовый вопрос: от 1 до 200 символов."); return;
+    }
+    if (const char* error = bender_ai_preview_character(traits, question.c_str())) {
+        server.send(409, "text/plain; charset=utf-8", error); return;
+    }
+    server.send(202, "application/json", "{\"state\":1}");
 }
 
 static void handleCalib() {
@@ -342,6 +358,8 @@ void webUiBegin() {
         server.on("/ncsi.txt", HTTP_ANY, captiveProbeOk);              // Windows fallback
         server.on("/", HTTP_GET, sendPage);
         server.on("/calib", HTTP_POST, handleCalib);
+        server.on("/character/preview", HTTP_POST, handleCharacterPreview);
+        server.on("/character/preview", HTTP_GET, handleCharacterPreview);
         server.on("/save", HTTP_POST, handleSave);
         server.onNotFound([]() {
             web_send_close_connection();

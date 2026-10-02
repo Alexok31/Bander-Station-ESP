@@ -1,0 +1,134 @@
+[
+  {
+    "name": "settings navigation",
+    "ok": true
+  },
+  {
+    "name": "slider value",
+    "ok": true
+  },
+  {
+    "name": "reset to 11000",
+    "ok": true
+  },
+  {
+    "name": "unchecked wake omitted",
+    "ok": true
+  },
+  {
+    "name": "behavior independent",
+    "ok": true
+  },
+  {
+    "name": "never sleep submitted",
+    "ok": true
+  },
+  {
+    "name": "brightness max",
+    "ok": true
+  },
+  {
+    "name": "brightness reset",
+    "ok": true
+  },
+  {
+    "name": "character navigation",
+    "ok": true
+  },
+  {
+    "name": "saved preset restored",
+    "ok": true
+  },
+  {
+    "name": "preset classic",
+    "ok": true
+  },
+  {
+    "name": "preset kind",
+    "ok": true
+  },
+  {
+    "name": "preset grumpy",
+    "ok": true
+  },
+  {
+    "name": "preset explorer",
+    "ok": true
+  },
+  {
+    "name": "preset calm",
+    "ok": true
+  },
+  {
+    "name": "custom mix",
+    "ok": true
+  },
+  {
+    "name": "personality independent",
+    "ok": true
+  },
+  {
+    "name": "character reset",
+    "ok": true
+  },
+  {
+    "name": "radio navigation",
+    "ok": true
+  },
+  {
+    "name": "preview label classic",
+    "ok": true
+  },
+  {
+    "name": "preview label kind",
+    "ok": true
+  },
+  {
+    "name": "preview label grumpy",
+    "ok": true
+  },
+  {
+    "name": "preview label explorer",
+    "ok": true
+  },
+  {
+    "name": "preview label calm",
+    "ok": true
+  },
+  {
+    "name": "question scenario selection",
+    "ok": true
+  },
+  {
+    "name": "custom question selection",
+    "ok": true
+  },
+  {
+    "name": "preview uses unsaved sliders",
+    "ok": true
+  },
+  {
+    "name": "custom question sent verbatim",
+    "ok": true
+  },
+  {
+    "name": "preview finishes and keeps dirty values",
+    "ok": true
+  },
+  {
+    "name": "preview busy error",
+    "ok": true
+  },
+  {
+    "name": "empty question stays local",
+    "ok": true
+  },
+  {
+    "name": "duplicate click blocked",
+    "ok": true
+  },
+  {
+    "name": "preview failure releases button",
+    "ok": true
+  }
+]

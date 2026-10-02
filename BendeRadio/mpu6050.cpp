@@ -4,10 +4,12 @@
 #include <Wire.h>
 
 #include "RadioConfig.h"
+#include "NvsConfig.h"
 
 static bool s_ok = false;
 static uint32_t s_last_poll_ms = 0;
 static BenderShake s_shake;
+static uint16_t s_shake_threshold = RadioConfig::mpu6050ShakeDeltaSum;
 static int16_t s_prev_ax = 0;
 static int16_t s_prev_ay = 0;
 static int16_t s_prev_az = 0;
@@ -51,6 +53,7 @@ void mpu6050_init() {
     s_have_prev = false;
     s_last_poll_ms = 0;
     s_shake = BenderShake{};
+    s_shake_threshold = nvsLoadShakeThreshold();
     if (!RadioConfig::mpu6050Enable) {
         return;
     }
@@ -82,7 +85,7 @@ void mpu6050_init() {
     s_ok = true;
     Serial.printf("[MPU] OK WHO=0x%02X SDA=%u SCL=%u shakeΔ≥%u\n", (unsigned)who,
                   (unsigned)RadioConfig::mpu6050SdaPin, (unsigned)RadioConfig::mpu6050SclPin,
-                  (unsigned)RadioConfig::mpu6050ShakeDeltaSum);
+                  (unsigned)s_shake_threshold);
 }
 
 bool mpu6050_ok() {
@@ -126,7 +129,7 @@ bool mpu6050_poll_shake() {
         (uint32_t)((dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy) + (dz < 0 ? -dz : dz));
     const auto motion = s_motion.sample(sum, now);
     if (motion != BenderEvent::None) s_motion_event = motion;
-    if (!s_shake.sample(sum, now, RadioConfig::mpu6050ShakeDeltaSum, RadioConfig::mpu6050ShakeCooldownMs)) {
+    if (!s_shake.sample(sum, now, s_shake_threshold, RadioConfig::mpu6050ShakeCooldownMs)) {
         return false;
     }
     Serial.printf("[MPU] SHAKE Δ=%lu ax=%d ay=%d az=%d\n", (unsigned long)sum, (int)ax, (int)ay,

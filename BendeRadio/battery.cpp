@@ -1,6 +1,10 @@
 #include "battery.h"
+#include "BatteryGauge.h"
+#include "BatteryAdc.h"
 
 #include <Arduino.h>
+#include <esp_adc/adc_oneshot.h>
+#include <esp_adc/adc_cali_scheme.h>
 
 #include "RadioConfig.h"
 #include "core0.h"
@@ -9,7 +13,16 @@ extern Data radioState;
 
 static uint32_t s_last_sample_ms;
 static uint16_t s_smooth_mv;
+static uint16_t s_protection_mv;
+static uint16_t s_adc_mv;
+static uint16_t s_adc_spread;
+static uint16_t s_adc_raw_spread;
+static BatteryVoltageGuard s_voltage_guard;
+static BatteryShutdownReason s_shutdown_reason = BatteryShutdownReason::None;
 static uint8_t s_percent;
+static BatteryGauge s_gauge;
+static BatteryChargeDebounce s_charge_filter;
+static uint32_t s_last_display_sample_ms;
 static bool s_gauge_ready;
 static bool s_sense_present;  // latched: делитель реально бачили
 static uint8_t s_sense_latch_streak;
@@ -17,34 +30,46 @@ static uint8_t s_sense_latch_streak;
 static uint32_t s_charging_read_ms;
 static bool s_charging_cached;
 
-// Таблиця: мВ пакета (2S, після BMS) → %; обидва рядки по зростанню U. Без інтерполяції:
-// береться останній %, для якого U ≥ порога (ступінчасто).
-static const uint16_t batterySocTableMv[] = {
-    6000, 6150, 6300, 6500, 6700, 6900, 7100, 7300, 7500, 7700, 7900, 8050, 8200, 8350, 8500,
-};
-static const uint8_t batterySocTablePct[] = {
-    0, 3, 7, 12, 18, 25, 33, 42, 50, 58, 68, 76, 84, 92, 99,
-};
-static constexpr uint8_t batterySocTableN =
-    (uint8_t)(sizeof(batterySocTableMv) / sizeof(batterySocTableMv[0]));
-static_assert(sizeof(batterySocTableMv) / sizeof(batterySocTableMv[0]) ==
-                  sizeof(batterySocTablePct) / sizeof(batterySocTablePct[0]),
-              "batterySocTable mv/pct count mismatch");
+// Own ADC2 explicitly: Arduino's analogReadMilliVolts hides read errors as 0 mV.
+// The battery divider stays on Arduino's ADC1; never create a second ADC1 owner.
+static adc_oneshot_unit_handle_t s_charge_adc;
+static adc_cali_handle_t s_charge_cali;
+static adc_channel_t s_charge_channel;
+static esp_err_t s_charge_init_error = ESP_ERR_INVALID_STATE;
+static esp_err_t s_charge_last_error = ESP_OK;
+static uint32_t s_charge_ok_reads, s_charge_error_reads, s_charge_high_reads;
+static uint16_t s_charge_last_mv, s_charge_peak_mv, s_charge_peak_raw;
 
-static uint8_t percent_from_pack_mv(uint16_t pack_mv) {
-    if (batterySocTableN == 0u) {
-        return 0u;
+static esp_err_t charging_adc_init() {
+    if (s_charge_adc && s_charge_cali) return ESP_OK;
+    adc_unit_t unit;
+    esp_err_t err = adc_oneshot_io_to_channel(RadioConfig::chargingDetectPin, &unit, &s_charge_channel);
+    if (err != ESP_OK) return err;
+    if (unit != ADC_UNIT_2) return ESP_ERR_NOT_SUPPORTED;
+    adc_oneshot_unit_init_cfg_t config = {};
+    config.unit_id = unit;
+    err = adc_oneshot_new_unit(&config, &s_charge_adc);
+    if (err != ESP_OK) return err;
+    adc_oneshot_chan_cfg_t channel = {};
+    channel.atten = ADC_ATTEN_DB_12;
+    channel.bitwidth = ADC_BITWIDTH_12;
+    err = adc_oneshot_config_channel(s_charge_adc, s_charge_channel, &channel);
+    if (err == ESP_OK) {
+        adc_cali_curve_fitting_config_t calibration = {};
+        calibration.unit_id = unit;
+        calibration.chan = s_charge_channel;
+        calibration.atten = channel.atten;
+        calibration.bitwidth = channel.bitwidth;
+        err = adc_cali_create_scheme_curve_fitting(&calibration, &s_charge_cali);
     }
-    uint8_t out = batterySocTablePct[0];
-    for (uint8_t i = 0; i < batterySocTableN; i++) {
-        if (pack_mv >= batterySocTableMv[i]) {
-            out = batterySocTablePct[i];
-        } else {
-            break;
-        }
+    if (err != ESP_OK) {
+        adc_oneshot_del_unit(s_charge_adc);
+        s_charge_adc = nullptr;
     }
-    return out;
+    return err;
 }
+
+static_assert(RadioConfig::batterySocFullMv > 8200, "SOC profile full voltage must exceed 8.2 V");
 
 static uint32_t adc_pin_millivolts() {
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 2)
@@ -60,13 +85,37 @@ static bool charging_detect_uses_usb_phy_pin() {
     return p == 19u || p == 20u;
 }
 
-static uint16_t charging_pin_millivolts() {
-#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 2)
-    return (uint16_t)analogReadMilliVolts(RadioConfig::chargingDetectPin);
-#else
-    const uint32_t raw = analogRead(RadioConfig::chargingDetectPin);
-    return (uint16_t)((uint64_t)raw * 3300u / 4095u);
-#endif
+static bool charging_pin_millivolts(uint16_t &mv) {
+    int raw = 0, voltage = 0;
+    esp_err_t err = s_charge_init_error;
+    if (err == ESP_OK) err = adc_oneshot_read(s_charge_adc, s_charge_channel, &raw);
+    if (err == ESP_OK) {
+        if (raw > s_charge_peak_raw) s_charge_peak_raw = raw;
+        err = adc_cali_raw_to_voltage(s_charge_cali, raw, &voltage);
+    }
+    if (err != ESP_OK) {
+        ++s_charge_error_reads;
+        s_charge_last_error = err;
+        return false;
+    }
+    mv = voltage > 0 ? voltage : 0;
+    s_charge_last_mv = mv;
+    if (mv > s_charge_peak_mv) s_charge_peak_mv = mv;
+    ++s_charge_ok_reads;
+    if (mv >= RadioConfig::chargingDetectMinMv) ++s_charge_high_reads;
+    return true;
+}
+
+static void charging_debug() {
+    if (!RadioConfig::chargingDetectUseAdc) return;
+    Serial.printf("[Charge] GPIO%u last_mv=%u peak_mv=%u raw_peak=%u ok=%lu errors=%lu high=%lu last_err=%s\n",
+        (unsigned)RadioConfig::chargingDetectPin, (unsigned)s_charge_last_mv,
+        (unsigned)s_charge_peak_mv, (unsigned)s_charge_peak_raw,
+        (unsigned long)s_charge_ok_reads, (unsigned long)s_charge_error_reads,
+        (unsigned long)s_charge_high_reads, esp_err_to_name(s_charge_last_error));
+    s_charge_ok_reads = s_charge_error_reads = s_charge_high_reads = 0;
+    s_charge_peak_mv = s_charge_peak_raw = 0;
+    s_charge_last_error = ESP_OK;
 }
 
 static bool charging_pin_majority_high() {
@@ -80,7 +129,12 @@ static bool charging_pin_majority_high() {
     for (uint8_t i = 0; i < kSamples; i++) {
         uint16_t mv = 0;
         if (RadioConfig::chargingDetectUseAdc) {
-            mv = charging_pin_millivolts();
+            if (!charging_pin_millivolts(mv)) {
+                // A failed conversion is not a measurement. Try the remaining
+                // conversions with the same bounded delay, without blocking Wi-Fi.
+                delayMicroseconds(200);
+                continue;
+            }
         } else if (digitalRead(RadioConfig::chargingDetectPin) == HIGH) {
             mv = 3300u;
         }
@@ -103,7 +157,14 @@ static bool charging_pin_majority_high() {
 void battery_init() {
     s_last_sample_ms = 0;
     s_smooth_mv = 0;
+    s_protection_mv = 0;
+    s_adc_mv = s_adc_spread = s_adc_raw_spread = 0;
+    s_voltage_guard = {};
+    s_shutdown_reason = BatteryShutdownReason::None;
     s_percent = 0;
+    s_gauge = {};
+    s_charge_filter = {};
+    s_last_display_sample_ms = 0;
     s_gauge_ready = false;
     s_sense_present = false;
     s_sense_latch_streak = 0;
@@ -117,15 +178,11 @@ void battery_init() {
         } else {
             pinMode(RadioConfig::chargingDetectPin, INPUT_PULLDOWN);
             if (RadioConfig::chargingDetectUseAdc) {
-                analogSetPinAttenuation(RadioConfig::chargingDetectPin, ADC_11db);
-                uint32_t acc = 0;
-                for (uint8_t i = 0; i < 8u; i++) {
-                    acc += charging_pin_millivolts();
-                    delayMicroseconds(120);
-                }
-                Serial.printf("[Batt] charge ADC GPIO%u thresh=%umV boot_avg=%umV\n",
+                s_charge_init_error = charging_adc_init();
+                Serial.printf("[Batt] charge ADC2 GPIO%u thresh=%umV init=%s\n",
                               (unsigned)RadioConfig::chargingDetectPin,
-                              (unsigned)RadioConfig::chargingDetectMinMv, (unsigned)(acc / 8u));
+                              (unsigned)RadioConfig::chargingDetectMinMv,
+                              esp_err_to_name(s_charge_init_error));
             } else {
                 Serial.printf("[Batt] charge DIGITAL GPIO%u (pull-down)\n",
                               (unsigned)RadioConfig::chargingDetectPin);
@@ -142,61 +199,49 @@ void battery_init() {
 }
 
 static void battery_sample_apply() {
-    const bool chg = charging_pin_majority_high();
+    const bool chg = battery_is_charging();
 
-    uint32_t acc = 0;
-    uint16_t pin_min = 0xFFFF;
-    uint16_t pin_max = 0;
-    constexpr uint8_t kSamples = 12;
+    constexpr uint8_t kSamples = 64;
+    uint16_t samples[kSamples];
     for (uint8_t i = 0; i < kSamples; i++) {
-        const uint32_t pmv = adc_pin_millivolts();
-        acc += pmv;
-        if (pmv < pin_min) {
-            pin_min = (uint16_t)pmv;
-        }
-        if (pmv > pin_max) {
-            pin_max = (uint16_t)pmv;
-        }
+        samples[i] = (uint16_t)adc_pin_millivolts();
     }
-    const uint32_t pin_mv = acc / kSamples;
-    const uint16_t pin_spread = (uint16_t)(pin_max - pin_min);
+    const auto reading = battery_adc_reading(samples);
+    const uint32_t pin_mv = reading.mv;
+    const uint16_t pin_spread = reading.spread;
+    s_adc_mv = (uint16_t)pin_mv;
+    s_adc_spread = pin_spread;
+    s_adc_raw_spread = reading.raw_spread;
     const float ratio = RadioConfig::batteryDividerRatio;
     uint32_t pack_mv = (uint32_t)((float)pin_mv * ratio + 0.5f);
     if (pack_mv > 20000u) {
         pack_mv = 20000u;
     }
+    s_protection_mv = (uint16_t)pack_mv;
 
-    if (s_smooth_mv == 0) {
-        s_smooth_mv = (uint16_t)pack_mv;
-    } else {
-        const uint32_t ema = (uint32_t)s_smooth_mv * 7u + pack_mv;
-        s_smooth_mv = (uint16_t)(ema / 8u);
+    const uint32_t now = millis();
+    const bool display_valid = battery_sense_candidate(s_protection_mv, pin_spread,
+        RadioConfig::batterySensePresentMinMv, RadioConfig::batterySensePresentMaxMv,
+        RadioConfig::batterySenseStablePinSpreadMv);
+    if (display_valid && (!s_gauge_ready || uint32_t(now-s_last_display_sample_ms) >= 1000u)) {
+        s_last_display_sample_ms = now;
+        s_smooth_mv = s_gauge_ready ? battery_display_filter(s_smooth_mv, s_protection_mv) : s_protection_mv;
+        const uint8_t target = battery_voltage_percent(s_smooth_mv, RadioConfig::batterySocFullMv);
+        s_percent = s_gauge.sample(now, target, chg);
+        s_gauge_ready = true;
     }
-
-    int32_t p = (int32_t)percent_from_pack_mv(s_smooth_mv);
-    if (p < 0) {
-        p = 0;
-    }
-    if (p > 99) {
-        p = 99;
-    }
-    s_percent = (uint8_t)p;
-    s_charging_cached = chg;
-    s_charging_read_ms = millis();
-    s_gauge_ready = true;
 
     // Обрив GPIO1: шумний/середній АЦП. Реальний 2S у вікні + стабільний pin → latch.
-    const bool candidate =
-        !s_sense_present && pack_mv >= RadioConfig::batterySensePresentMinMv &&
-        pack_mv <= RadioConfig::batterySensePresentMaxMv &&
-        pin_spread <= RadioConfig::batterySenseStablePinSpreadMv;
+    const bool candidate = battery_sense_candidate(s_protection_mv, pin_spread,
+        RadioConfig::batterySensePresentMinMv, RadioConfig::batterySensePresentMaxMv,
+        RadioConfig::batterySenseStablePinSpreadMv);
     if (s_sense_present) {
-        // вже підтвердили делитель — не скидаємо (розряд до 5.6 В має будити sleep)
+        // Keep confirmation through discharge; a subsequent zero is also a low-voltage fault.
     } else if (candidate) {
         if (++s_sense_latch_streak >= RadioConfig::batterySenseLatchSamples) {
             s_sense_present = true;
-            Serial.printf("[Batt] sense OK mv=%u pin_spread=%u — %% sleep armed\n",
-                          (unsigned)s_smooth_mv, (unsigned)pin_spread);
+            Serial.printf("[Batt] sense OK mv=%u pin_spread=%u — voltage protection armed\n",
+                          (unsigned)s_protection_mv, (unsigned)pin_spread);
         }
     } else {
         if (s_sense_latch_streak > 0) {
@@ -206,10 +251,19 @@ static void battery_sample_apply() {
         const uint32_t now = millis();
         if (s_sense_warn_ms == 0 || (uint32_t)(now - s_sense_warn_ms) > 15000u) {
             s_sense_warn_ms = now;
-            Serial.printf("[Batt] no pack sense (mv=%u spread=%u) — skip %% sleep\n",
-                          (unsigned)s_smooth_mv, (unsigned)pin_spread);
+            Serial.printf("[Batt] no pack sense (mv=%u spread=%u) — voltage protection unarmed\n",
+                          (unsigned)s_protection_mv, (unsigned)pin_spread);
         }
     }
+    // Do not let display smoothing, the SOC table or a CHG pin mask undervoltage.
+    const bool valid = battery_low_power_sleep_active() &&
+                       s_protection_mv <= RadioConfig::batterySensePresentMaxMv &&
+                       pin_spread <= RadioConfig::batterySenseStablePinSpreadMv;
+    const auto reason = s_voltage_guard.sample(millis(), s_protection_mv, valid, chg,
+        RadioConfig::batteryShutdownBelowMv, RadioConfig::batteryCriticalMv,
+        RadioConfig::batteryShutdownHysteresisMv, RadioConfig::batteryShutdownHoldMs,
+        RadioConfig::batteryCriticalHoldMs, RadioConfig::batteryChargingRecoveryMs);
+    if (s_shutdown_reason == BatteryShutdownReason::None) s_shutdown_reason = reason;
 }
 
 void battery_force_sample() {
@@ -217,7 +271,7 @@ void battery_force_sample() {
         return;
     }
     battery_sample_apply();
-    s_last_sample_ms = millis();
+    // A manual gauge request must not postpone the scheduled protection sample.
 }
 
 bool battery_gauge_ready() {
@@ -233,7 +287,8 @@ bool battery_update() {
                 s_batt_dbg_ms = now;
                 const bool chg = battery_is_charging();
                 Serial.printf("[Batt] chg=%d pin_mv=%u (gauge off)\n", (int)chg,
-                              (unsigned)(RadioConfig::chargingDetectUseAdc ? charging_pin_millivolts() : 0u));
+                              (unsigned)s_charge_last_mv);
+                charging_debug();
             }
         }
         return false;
@@ -244,10 +299,13 @@ bool battery_update() {
         if ((uint32_t)(now - s_batt_dbg_ms) >= RadioConfig::chargingDebugSerialMs) {
             s_batt_dbg_ms = now;
             (void)battery_is_charging();
-            Serial.printf("[Batt] chg=%d pin_mv=%u thresh=%u pct=%u mv=%u\n", (int)s_charging_cached,
-                          (unsigned)(RadioConfig::chargingDetectUseAdc ? charging_pin_millivolts() : 0u),
+            Serial.printf("[Batt] chg=%d chg_pin_mv=%u thresh=%u pct=%u mv=%u raw_mv=%u sense=%d ready=%d adc_mv=%u spread=%u raw_spread=%u\n", (int)s_charging_cached,
+                          (unsigned)s_charge_last_mv,
                           (unsigned)RadioConfig::chargingDetectMinMv, (unsigned)s_percent,
-                          (unsigned)s_smooth_mv);
+                          (unsigned)s_smooth_mv, (unsigned)s_protection_mv, (int)s_sense_present,
+                          (int)s_gauge_ready, (unsigned)s_adc_mv, (unsigned)s_adc_spread,
+                          (unsigned)s_adc_raw_spread);
+            charging_debug();
         }
     }
     uint32_t interval = (!radioState.state && RadioConfig::batterySampleIntervalIdleMs > 0)
@@ -275,6 +333,9 @@ uint16_t battery_millivolts() {
     return s_smooth_mv;
 }
 
+uint16_t battery_protection_millivolts() { return s_protection_mv; }
+BatteryShutdownReason battery_shutdown_reason() { return s_shutdown_reason; }
+
 bool battery_is_charging() {
     if (!RadioConfig::chargingDetectEnable) {
         return false;
@@ -282,7 +343,11 @@ bool battery_is_charging() {
     const uint32_t now = millis();
     if (s_charging_read_ms == 0u || (uint32_t)(now - s_charging_read_ms) >= 80u) {
         s_charging_read_ms = now;
-        s_charging_cached = charging_pin_majority_high();
+        const bool previous = s_charging_cached;
+        s_charging_cached = s_charge_filter.sample(now, charging_pin_majority_high());
+        if (previous != s_charging_cached) {
+            Serial.printf("[Charge] %s\n", s_charging_cached ? "connected" : "signal lost");
+        }
     }
     return s_charging_cached;
 }
@@ -292,10 +357,9 @@ bool battery_sense_present() {
 }
 
 bool battery_low_power_sleep_active() {
-    // Без линии зарядки с IP2326 нельзя отличить «идёт зарядка» от «сел АКБ» — не уходим в вечный deep sleep.
-    // Без нормального делителя на GPIO1 (обрыв → mv≈0) тоже не спим по %.
+    // Charge detection can be absent or faulty; it must not disable voltage protection.
     return RadioConfig::batteryShutdownEnable && RadioConfig::batteryMonitorEnable &&
-           RadioConfig::chargingDetectEnable && battery_sense_present();
+           battery_sense_present();
 }
 
 uint8_t battery_eye_mood() {

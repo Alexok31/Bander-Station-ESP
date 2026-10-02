@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#111a1b">
+<title>Bender — панель управления</title>
+<style>
+:root{color-scheme:dark;--bg:#111a1b;--panel:#1a2527;--line:#334345;--ink:#f1f4ed;--muted:#abbab9;--mint:#b6efd5;--orange:#ffc18e;--field:#111d1f;--radius:22px}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}button,input,textarea,select{font:inherit}button,a,input,select,textarea{-webkit-tap-highlight-color:transparent}button,a{touch-action:manipulation}a{color:inherit}button{cursor:pointer}button:disabled,input:disabled{cursor:not-allowed}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,summary:focus-visible{outline:3px solid var(--orange);outline-offset:4px}[hidden]{display:none!important}
+.shell{max-width:1440px;margin:auto;display:grid;grid-template-columns:238px minmax(0,1fr);min-height:100vh}.sidebar{padding:38px 24px;border-right:1px solid var(--line);display:flex;flex-direction:column;position:sticky;top:0;height:100vh}.brand{text-decoration:none;display:flex;align-items:center;gap:12px}.brand-icon{width:42px;height:48px;color:var(--mint)}.brand strong{font-size:21px;letter-spacing:2px;display:block;line-height:1.15}.brand small{font-size:10px;letter-spacing:2px;color:var(--muted)}.nav{display:grid;gap:8px;margin-top:58px}.nav a{padding:14px;border-radius:12px;display:flex;align-items:center;gap:13px;text-decoration:none;font-weight:600;color:var(--muted);min-height:48px}.nav svg{width:21px;height:21px;flex-shrink:0}.nav a:hover{background:#213032;color:var(--ink)}.nav a[aria-current=page]{background:var(--mint);color:#122c25}.nav .soon{font:10px system-ui;margin-left:auto;opacity:.7}.sidebar-foot{margin-top:auto;color:var(--muted);font-size:12px;padding-top:24px}.sidebar-foot b{display:block;font-weight:500;color:var(--ink);margin-top:7px}.status-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--mint);margin-right:7px}.offline .status-dot{background:var(--orange)}
+main{padding:35px 48px 70px;min-width:0}.topline{display:flex;align-items:center;justify-content:space-between;gap:16px;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);margin-bottom:42px}.connection{letter-spacing:0;text-transform:none;padding:7px 12px;border:1px solid var(--line);border-radius:30px;font-size:12px;max-width:65%;overflow-wrap:anywhere}.eyebrow{color:var(--mint);font-size:11px;letter-spacing:2px;text-transform:uppercase;font-weight:650;margin:0 0 12px}h1{font-size:clamp(30px,4vw,46px);font-weight:650;letter-spacing:-1.7px;line-height:1.1;margin:0 0 15px}h2{font-size:20px;letter-spacing:-.4px;line-height:1.3;margin:0}h3{font-size:16px;margin:0}.intro{color:var(--muted);margin:0;max-width:530px}.page-title{margin-bottom:32px}.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:26px}.section-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:22px}.tag{border:1px solid var(--line);border-radius:30px;padding:5px 10px;font-size:11px;white-space:nowrap;color:var(--muted)}.tag.warm{color:var(--orange);border-color:#685240}.muted,.hint{color:var(--muted);font-size:13px}.hint{margin:8px 0 0}.grid{display:grid;grid-template-columns:minmax(0,1fr) 265px;gap:22px;align-items:start}.stack{display:grid;gap:22px}.rule{border:0;border-top:1px solid var(--line);margin:24px 0}.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:46px;border:1px solid transparent;border-radius:10px;padding:11px 19px;background:var(--mint);color:#112e25;font-weight:650;text-decoration:none}.btn:hover{filter:brightness(1.07)}.btn.secondary{background:transparent;border-color:var(--line);color:var(--ink)}.btn.small{font-size:12px;padding:7px 12px;min-height:40px}.actions{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-top:25px;padding-top:20px;border-top:1px solid var(--line)}.actions p{font-size:12px;color:var(--muted);margin:0;max-width:260px}.field{margin-top:20px}.field:first-child{margin-top:0}label{display:block;font-size:13px;font-weight:550;margin-bottom:8px}.field-heading{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px}.field-heading label{margin:0}input:not([type=checkbox]):not([type=range]),select,textarea{width:100%;border:1px solid var(--line);border-radius:10px;background:var(--field);color:var(--ink);padding:12px 14px;min-height:46px}textarea{resize:vertical;line-height:1.7}input::placeholder,textarea::placeholder{color:#839594}input[type=range]{width:100%;margin:10px 0;accent-color:var(--mint);min-height:30px}output{color:var(--mint);font-variant-numeric:tabular-nums;font-size:17px}.range-labels{display:flex;justify-content:space-between;color:var(--muted);font-size:11px;gap:12px}.switch-row{display:flex;align-items:center;justify-content:space-between;gap:24px}.switch-copy label{font-size:15px;margin:0}.switch-copy p{margin:4px 0 0}.switch{appearance:none;-webkit-appearance:none;width:48px;height:28px;min-width:48px;margin:0;border-radius:20px;background:#485657;border:1px solid var(--line);position:relative;cursor:pointer}.switch:before{content:"";width:20px;height:20px;position:absolute;top:3px;left:3px;border-radius:50%;background:#e5ece8;transition:transform .16s}.switch:checked{background:var(--mint)}.switch:checked:before{background:#16352b;transform:translateX(20px)}
+.station-hero{background:var(--mint);color:#17382e;padding:28px;border-radius:var(--radius);position:relative;overflow:hidden;min-height:204px;display:flex;flex-direction:column;justify-content:space-between}.station-hero .eyebrow{color:#345d50}.station-hero h2{font-size:28px;max-width:75%;position:relative}.station-meta{display:flex;align-items:center;gap:9px;font-size:12px;margin-top:20px}.record{position:absolute;right:-44px;top:33px;width:173px;height:173px;border:1px solid #538b7460;border-radius:50%;box-shadow:0 0 0 18px #538b7412,0 0 0 36px #538b7412,0 0 0 54px #538b7412}.record:after{content:"";position:absolute;inset:58px;border:1px solid #538b7490;border-radius:50%}.station-row{display:flex;align-items:center;gap:15px;padding:18px 0;border-bottom:1px solid var(--line)}.station-row:last-child{border-bottom:0;padding-bottom:0}.station-number{font:12px ui-monospace,monospace;color:var(--muted);width:24px}.station-name{font-size:14px;font-weight:550}.station-type{font-size:11px;color:var(--muted);margin-top:2px}.station-row svg{width:18px;height:18px;margin-left:auto;color:var(--mint)}.aside-note{padding:23px 3px}.aside-note h3{font-size:14px;margin-bottom:10px}.steps{padding:0;margin:12px 0 0;list-style:none;color:var(--muted);font-size:12px}.steps li{padding:9px 0;display:flex;justify-content:space-between;gap:10px;border-top:1px solid var(--line)}.steps b{color:var(--ink);font-weight:500}.section-count{font:11px ui-monospace,monospace;color:var(--muted)}
+details{border:1px solid var(--line);border-radius:16px;background:var(--panel);overflow:hidden}details+details{margin-top:14px}summary{list-style:none;cursor:pointer;padding:22px 25px;display:flex;align-items:center;gap:15px}summary::-webkit-details-marker{display:none}.group-number{font:11px ui-monospace,monospace;color:var(--mint)}summary .sub{font-size:12px;color:var(--muted);font-weight:400;margin-top:3px}summary .chevron{margin-left:auto;transition:transform .15s;color:var(--muted)}details[open] .chevron{transform:rotate(180deg)}.details-body{padding:0 25px 25px}.settings-note{font-size:12px;color:var(--muted);margin:18px 2px}.field-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field-grid .field{margin-top:0}.head-wrap{max-width:430px;margin:24px auto}.head-row{display:flex;justify-content:center;gap:12px;margin-top:12px}.mx{flex:1;max-width:128px;border:1px solid #43605a;border-radius:14px;padding:12px 8px;background:var(--field);text-align:center}.mx-title{font-size:10px;color:var(--muted);letter-spacing:.5px}.mx-value{color:var(--mint);font:26px/1.3 ui-monospace,monospace;margin:10px 0}.mx-buttons{display:flex;justify-content:center;gap:5px}.mx-buttons button{background:#2a3f3c;border:0;border-radius:7px;color:var(--ink);font-size:20px;min-height:40px;min-width:40px}.calib-status{min-height:22px;font-size:12px;color:var(--muted);margin-top:12px}.eq-wrap{padding:34px 28px 26px}.eq-title{display:flex;align-items:flex-start;justify-content:space-between;gap:20px}.eq-title p{max-width:500px}.eq-board{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin:34px 0 16px;padding:26px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}.eq-channel{text-align:center}.eq-channel input[type=range]{writing-mode:vertical-lr;direction:rtl;width:44px;height:180px;display:block;margin:14px auto;cursor:ns-resize}.eq-channel label{font-size:12px;overflow-wrap:anywhere;margin:0}.eq-channel output{font:24px ui-monospace,monospace}.preset-grid{display:flex;flex-wrap:wrap;gap:8px;margin:24px 0 12px}.preset{background:var(--field);color:var(--muted);border:1px solid var(--line);border-radius:10px;padding:10px 14px;min-height:44px}.preset[aria-pressed=true]{background:var(--mint);border-color:var(--mint);color:#17382e}.eq-help{display:grid;grid-template-columns:1fr 1fr;gap:14px 24px;margin-top:24px}.eq-help p{margin:0;font-size:12px;color:var(--muted)}.eq-help b{display:block;color:var(--ink);font-weight:500;margin-bottom:3px}#character-status{min-height:22px}.preview-box{margin-top:24px;padding:20px;border:1px solid #526454;border-radius:14px;background:#20332d}.preview-box .btn{margin-top:16px;max-width:100%;white-space:normal}.preview-box p{margin:6px 0 0}.preview-box .preview-question{font-size:16px;color:var(--ink)}#preview-status{min-height:20px;margin-top:12px}.eq-current{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.eq-current .tag{white-space:normal}.character-quote{font-size:clamp(20px,3vw,30px);font-weight:500;letter-spacing:-.6px;line-height:1.4;margin:26px 0 8px;max-width:620px}.character-foot{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-top:22px}.character-foot p{font-size:12px;color:var(--muted);max-width:450px}.preview-label{color:var(--orange);font:11px ui-monospace,monospace;letter-spacing:1px}.save-message{color:var(--orange);font-size:13px;margin-top:14px}.footer{margin-top:38px;padding-top:18px;border-top:1px solid var(--line);font-size:11px;color:var(--muted);display:flex;justify-content:space-between;gap:16px}
+@media(min-width:1200px){main{padding:40px 58px 70px}.grid{grid-template-columns:minmax(0,1fr) 290px}}
+@media(max-width:1000px){.shell{grid-template-columns:190px 1fr}.sidebar{padding:28px 15px}main{padding:28px}.grid{grid-template-columns:1fr}.radio-aside{display:grid;grid-template-columns:1fr 1fr;gap:22px}.aside-note{padding:12px 0}.topline{margin-bottom:30px}}
+@media(max-width:700px){.shell{display:block}.sidebar{height:auto;position:static;padding:20px 18px 0;border:0}.brand-icon{width:32px;height:37px}.brand strong{font-size:18px}.brand small{font-size:9px}.sidebar-foot{display:none}.nav{display:flex;gap:6px;margin-top:22px;border-bottom:1px solid var(--line);padding-bottom:13px}.nav a{flex:1;padding:11px 8px;justify-content:center;gap:8px;font-size:12px;min-height:44px}.nav svg{width:17px;height:17px}.nav .soon{display:none}main{padding:22px 18px 35px}.topline{margin-bottom:26px;font-size:9px;gap:9px}.connection{font-size:10px;max-width:67%;padding:6px 9px}.page-title{margin-bottom:25px}h1{font-size:34px}.intro{font-size:13px}.card{padding:21px;border-radius:17px}.station-hero{min-height:183px;padding:23px}.station-hero h2{font-size:25px}.radio-aside{display:block}.aside-note{padding:25px 2px 0}.actions{align-items:stretch;flex-direction:column;gap:12px}.actions .btn{width:100%}.actions p{max-width:none}.field-grid{grid-template-columns:1fr;gap:20px}summary{padding:19px 18px;gap:12px}.details-body{padding:0 18px 21px}summary h2{font-size:17px}summary .sub{font-size:11px}.head-row{gap:8px}.mx{padding:12px 4px;min-width:0}.mx-buttons{gap:4px;flex-direction:column}.mx-buttons button{min-width:32px;min-height:40px}.eq-wrap{padding:23px 17px}.eq-title{display:block}.eq-title .tag{display:inline-block;margin-bottom:17px}.eq-board{gap:5px}.eq-channel label{font-size:10px}.eq-channel input[type=range]{height:155px;width:36px}.eq-help{grid-template-columns:1fr}.preset{font-size:12px;padding:10px 12px}.character-foot{align-items:flex-start;flex-direction:column;gap:2px}.footer{font-size:10px}.section-head{gap:10px}.section-head h2{font-size:18px}}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="shell">
+<aside class="sidebar">
+<a class="brand" href="#radio" aria-label="Bender Station — радио"><svg class="brand-icon" viewBox="0 0 44 52" fill="none" aria-hidden="true"><path d="M22 10V4m-3 0h6M10 21v-7a12 12 0 0 1 24 0v7M5 24h34v13H5zM9 39v9h26v-9" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/><path d="M14 29h5m6 0h5M14 43h16M19 39v9m6-9v9" stroke="currentColor" stroke-width="2.2"/></svg><span><strong>BENDER</strong><small>STATION / CONTROL</small></span></a>
+<nav class="nav" aria-label="Разделы">
+<a href="#radio" data-nav="radio" aria-current="page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="8" width="18" height="13" rx="3"/><path d="M6 8l12-5M6 12h12m-2 5h2"/><circle cx="8" cy="17" r="2"/></svg>FM / Радио</a>
+<a href="#settings" data-nav="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 3v18M12 3v18M19 3v18"/><path d="M2 8h6m1 8h6m1-10h6" stroke-width="4"/></svg>Настройки</a>
+<a href="#character" data-nav="character"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="6" width="18" height="15" rx="5"/><path d="M12 2v4M7 11h3m4 0h3m-9 5h8"/></svg>Характер</a>
+</nav>
+<div class="sidebar-foot"><span class="status-dot"></span>Твой робот. Твои правила.<b>Bender Station</b>Локальная панель управления</div>
+</aside>
+<main>
+<header class="topline"><span>Личный пульт Бендера</span><span class="connection "><span class="status-dot"></span>Wi-Fi подключён · 192.168.4.1</span></header>
+<section id="panel-radio" data-panel="radio" aria-labelledby="radio-title">
+<div class="page-title"><p class="eyebrow">01 / На твоей волне</p><h1 id="radio-title">Музыку сюда.</h1><p class="intro">Твои интернет-станции в одном месте. Всё остальное подождёт.</p></div>
+<div class="grid">
+<div class="stack">
+<div class="station-hero"><div class="record" aria-hidden="true"></div><div><p class="eyebrow">Выбранная станция</p><h2>Majestic Jukebox</h2></div><div class="station-meta">FM / Интернет-радио · на паузе</div></div>
+<form class="card" method="post" action="/save" data-save-form>
+<input type="hidden" name="section" value="radio">
+<div class="section-head"><h2>Мои станции</h2><span class="section-count">0 / 16</span></div>
+<label for="stations">Ссылки на аудиопотоки</label>
+<textarea id="stations" name="stations" rows="6" spellcheck="false" placeholder="https://example.com/radio.mp3"></textarea>
+<p class="hint">Одна ссылка — одна станция. Они появятся после двух встроенных. До 16 своих станций.</p>
+<div class="actions"><p>Сохранение перезапустит колонку.</p><button class="btn" type="submit">Сохранить станции <span aria-hidden="true">↗</span></button></div>
+</form>
+</div>
+<aside class="radio-aside">
+<div class="card"><div class="section-head"><h3>Всегда под рукой</h3><span class="tag">Встроенные</span></div>
+<div class="station-row"><span class="station-number">01</span><div><div class="station-name">Majestic Jukebox</div><div class="station-type">Интернет-радио</div></div></div>
+<div class="station-row"><span class="station-number">02</span><div><div class="station-name">Radio1 Rock</div><div class="station-type">Интернет-радио</div></div></div></div>
+<div class="aside-note"><p class="eyebrow">Управление на колонке</p><h3>Без лишних движений.</h3><ul class="steps"><li><span>Пауза / воспроизведение</span><b>1 клик</b></li><li><span>Следующая станция</span><b>2 клика</b></li><li><span>Предыдущая станция</span><b>3 клика</b></li><li><span>Режим FM / AirPlay</span><b>4 клика</b></li></ul><p class="hint">Переключение станций работает в режиме FM.</p></div>
+</aside>
+</div>
+</section>
+<section id="panel-settings" data-panel="settings" aria-labelledby="settings-title" hidden>
+<div class="page-title"><p class="eyebrow">02 / Всё под контролем</p><h1 id="settings-title">Как тебе удобно.</h1><p class="intro">Пробуждение, свет и подключения. У каждой группы — своё сохранение.</p></div>
+<details open><summary><span class="group-number">01</span><div><h2>Поведение и покой</h2><div class="sub">Тряска, пробуждение и время до сна</div></div><span class="chevron" aria-hidden="true">⌄</span></summary>
+<form class="details-body" method="post" action="/save" data-save-form><input type="hidden" name="section" value="behavior"><input type="hidden" name="motion_settings" value="1">
+<div class="switch-row"><div class="switch-copy"><label for="wake_on_shake">Будить тряской</label><p class="hint">Встряхни — и Бендер откроет глаза.</p></div><input class="switch" id="wake_on_shake" name="wake_on_shake" type="checkbox" value="1" checked></div>
+<hr class="rule"><div class="field"><div class="field-heading"><label for="shake_delta">Чувствительность тряски</label><output id="shake_value" for="shake_delta">11000</output></div><input type="range" id="shake_delta" name="shake_delta" min="4000" max="24000" step="500" value="11000"><div class="range-labels"><span>Чувствительнее</span><span>Сильнее встряхнуть</span></div><p class="hint">Меньше число — выше чувствительность. Если реагирует на басы, увеличь порог.</p><button class="btn secondary small" id="reset-shake" data-default="11000" type="button" style="margin-top:14px">Вернуть 11000</button></div>
+<div class="field"><label for="calm_minutes">Время до покоя</label><select id="calm_minutes" name="calm_minutes"><option value="2">2 мин</option><option value="5" selected>5 мин</option><option value="10">10 мин</option><option value="15">15 мин</option><option value="0">Не засыпать</option></select><p class="hint">«Не засыпать» отключает автоматический покой и выключение по бездействию.</p></div>
+<div class="actions"><p>Сохранение перезапустит колонку.</p><button class="btn" type="submit">Сохранить поведение</button></div></form></details>
+<details><summary><span class="group-number">02</span><div><h2>Глаза и рот</h2><div class="sub">Яркость каждого модуля</div></div><span class="chevron" aria-hidden="true">⌄</span></summary>
+<form class="details-body" method="post" action="/save" data-save-form id="display-form"><input type="hidden" name="section" value="display"><p class="hint">Подстрой модули кнопками −/+. Яркость меняется сразу; «Сохранить» оставит её после перезапуска.</p>
+<div class="head-wrap"><div class="head-row"><div class="mx"><div class="mx-title">Левый глаз</div><input type="hidden" name="mbr3" id="mbr3" value="3"><div class="mx-value" id="v3">3</div><div class="mx-buttons"><button type="button" data-matrix="3" data-delta="-1" aria-label="Левый глаз: темнее">−</button><button type="button" data-matrix="3" data-delta="1" aria-label="Левый глаз: ярче">+</button></div></div><div class="mx"><div class="mx-title">Правый глаз</div><input type="hidden" name="mbr4" id="mbr4" value="3"><div class="mx-value" id="v4">3</div><div class="mx-buttons"><button type="button" data-matrix="4" data-delta="-1" aria-label="Правый глаз: темнее">−</button><button type="button" data-matrix="4" data-delta="1" aria-label="Правый глаз: ярче">+</button></div></div></div><div class="head-row"><div class="mx"><div class="mx-title">Рот 1</div><input type="hidden" name="mbr0" id="mbr0" value="3"><div class="mx-value" id="v0">3</div><div class="mx-buttons"><button type="button" data-matrix="0" data-delta="-1" aria-label="Рот 1: темнее">−</button><button type="button" data-matrix="0" data-delta="1" aria-label="Рот 1: ярче">+</button></div></div><div class="mx"><div class="mx-title">Рот 2</div><input type="hidden" name="mbr1" id="mbr1" value="3"><div class="mx-value" id="v1">3</div><div class="mx-buttons"><button type="button" data-matrix="1" data-delta="-1" aria-label="Рот 2: темнее">−</button><button type="button" data-matrix="1" data-delta="1" aria-label="Рот 2: ярче">+</button></div></div><div class="mx"><div class="mx-title">Рот 3</div><input type="hidden" name="mbr2" id="mbr2" value="3"><div class="mx-value" id="v2">3</div><div class="mx-buttons"><button type="button" data-matrix="2" data-delta="-1" aria-label="Рот 3: темнее">−</button><button type="button" data-matrix="2" data-delta="1" aria-label="Рот 3: ярче">+</button></div></div></div></div>
+<button class="btn secondary small" type="button" id="start-calib">Начать с минимальной яркости</button><p class="calib-status" id="calib-status" role="status" aria-live="polite"></p>
+<div class="actions"><p>Сохранение перезапустит колонку.</p><button class="btn" type="submit">Сохранить яркость</button></div></form></details>
+<details><summary><span class="group-number">03</span><div><h2>Wi-Fi и подключение</h2><div class="sub">Домашняя сеть и точка доступа Бендера</div></div><span class="chevron" aria-hidden="true">⌄</span></summary>
+<form class="details-body" method="post" action="/save" data-save-form><input type="hidden" name="section" value="wifi"><div class="field-grid"><div class="field"><label for="sta_ssid">Домашняя сеть</label><input id="sta_ssid" name="sta_ssid" maxlength="32" value="Домашняя сеть" autocomplete="off" required></div><div class="field"><label for="sta_pass">Новый пароль сети</label><input id="sta_pass" name="sta_pass" type="password" maxlength="64" placeholder="Оставь пустым, чтобы сохранить" autocomplete="new-password"></div></div><p class="hint">Поддерживается Wi-Fi 2,4 ГГц. Для раздачи с iPhone включи «Максимальную совместимость».</p><hr class="rule"><div class="field-grid"><div class="field"><label for="ap_ssid">Точка доступа Бендера</label><input id="ap_ssid" name="ap_ssid" maxlength="32" value="Bender Station" autocomplete="off"></div><div class="field"><label for="ap_pass">Новый пароль точки доступа</label><input id="ap_pass" name="ap_pass" type="password" minlength="8" maxlength="64" placeholder="Не менее 8 символов" autocomplete="new-password"></div></div><p class="hint">Пустые поля паролей сохраняют текущие пароли.</p><div class="actions"><p>После перезапуска может понадобиться подключиться к новой сети.</p><button class="btn" type="submit">Сохранить Wi-Fi</button></div></form></details>
+<details><summary><span class="group-number">04</span><div><h2>AI и голос</h2><div class="sub">Адрес сервера Бендера</div></div><span class="chevron" aria-hidden="true">⌄</span></summary>
+<form class="details-body" method="post" action="/save" data-save-form><input type="hidden" name="section" value="ai"><div class="field"><label for="ai_ws">Адрес сервера</label><input id="ai_ws" name="ai_ws" maxlength="160" value="" placeholder="ws://192.168.0.173:8765/v1/realtime" autocomplete="off" spellcheck="false"><p class="hint">Оставь пустым для домашнего ПК в той же сети. Для удалённого подключения укажи адрес ws:// или wss://.</p></div><div class="actions"><p>Сохранение перезапустит колонку.</p><button class="btn" type="submit">Сохранить сервер</button></div></form></details>
+<p class="settings-note">Сохраняется только выбранная группа. Изменения в других открытых группах останутся несохранёнными.</p>
+</section>
+<section id="panel-character" data-panel="character" aria-labelledby="character-title" hidden>
+<div class="page-title"><p class="eyebrow">03 / С характером</p><h1 id="character-title">Твой Бендер.</h1><p class="intro">Чуть больше тепла. Или побольше занозы.<br>Настрой того, с кем хочется разговаривать.</p></div>
+<form id="character-form" method="post" action="/save" data-save-form class="card eq-wrap">
+<input type="hidden" name="section" value="character">
+<div class="eq-title"><div><h2>Эквалайзер характера</h2><p class="hint">Выбери настроение и подстрой пять черт под себя. Они меняют манеру ответов, сохраняя Бендера Бендером.</p></div><span class="tag warm">5 черт · 100 оттенков</span></div>
+<div class="preset-grid" role="group" aria-label="Готовые характеры">
+<button class="preset" type="button" data-preset="classic" data-values="80,55,40,70,35" aria-pressed="false">Классический</button>
+<button class="preset" type="button" data-preset="kind" data-values="20,65,55,15,90" aria-pressed="false">Добряк</button>
+<button class="preset" type="button" data-preset="grumpy" data-values="90,25,15,90,15" aria-pressed="false">Ворчун</button>
+<button class="preset" type="button" data-preset="explorer" data-values="35,75,95,25,65" aria-pressed="false">Исследователь</button>
+<button class="preset" type="button" data-preset="calm" data-values="15,20,20,10,60" aria-pressed="false">Спокойный</button>
+</div><div class="eq-current"><span class="hint">Текущий характер: <strong id="character-preset">Свой микс</strong></span><button class="btn secondary small" type="button" id="reset-character">Вернуть классику</button></div>
+<div class="eq-board" role="group" aria-label="Черты характера от 0 до 100">
+<div class="eq-channel"><output id="sarcasm-value" for="sarcasm">80</output><input type="range" id="sarcasm" name="sarcasm" data-trait min="0" max="100" step="1" value="80" aria-describedby="sarcasm-help"><label for="sarcasm">Сарказм</label></div>
+<div class="eq-channel"><output id="sociability-value" for="sociability">55</output><input type="range" id="sociability" name="sociability" data-trait min="0" max="100" step="1" value="55" aria-describedby="sociability-help"><label for="sociability">Общение</label></div>
+<div class="eq-channel"><output id="curiosity-value" for="curiosity">40</output><input type="range" id="curiosity" name="curiosity" data-trait min="0" max="100" step="1" value="40" aria-describedby="curiosity-help"><label for="curiosity">Любопытство</label></div>
+<div class="eq-channel"><output id="stubbornness-value" for="stubbornness">70</output><input type="range" id="stubbornness" name="stubbornness" data-trait min="0" max="100" step="1" value="70" aria-describedby="stubbornness-help"><label for="stubbornness">Упрямство</label></div>
+<div class="eq-channel"><output id="warmth-value" for="warmth">35</output><input type="range" id="warmth" name="warmth" data-trait min="0" max="100" step="1" value="35" aria-describedby="warmth-help"><label for="warmth">Теплота</label></div>
+</div>
+<div class="eq-help">
+<p id="sarcasm-help"><b>Сарказм</b>От прямых ответов до колких шуток.</p>
+<p id="sociability-help"><b>Общение</b>От пары слов до развёрнутой реплики.</p>
+<p id="curiosity-help"><b>Любопытство</b>Как часто он задаёт уместные вопросы.</p>
+<p id="stubbornness-help"><b>Упрямство</b>Больше ворчания и шуточных торгов. Помогает в любом случае.</p>
+<p id="warmth-help"><b>Теплота</b>От сдержанного тона до дружеской поддержки.</p>
+</div>
+<div class="preview-box"><span class="preview-label">ПРОБА ХАРАКТЕРА</span><div class="field"><label for="preview-scenario">Ситуация для пробы</label><select id="preview-scenario">
+<option value="evening" data-question="Бендере, як проведемо цей вечір?">Планы на вечер</option>
+<option value="support" data-question="У мене сьогодні нічого не виходить. Підтримаєш мене?">Нужна поддержка</option>
+<option value="tease" data-question="Бендере, ти сьогодні якийсь занадто серйозний. Де твої жарти?">Дружеский подкол</option>
+<option value="advice" data-question="Я постійно відкладаю справи. З чого мені почати?">Попросить совет</option>
+<option value="disagree" data-question="Мені здається, люди кращі за роботів. Що скажеш?">Поспорить с Бендером</option>
+<option value="success" data-question="Я нарешті закінчив свій проєкт! Як тобі така новина?">Поделиться успехом</option>
+<option value="custom">Свой вопрос</option>
+</select></div><div class="field"><label for="preview-question">Что сказать Бендеру?</label><textarea id="preview-question" rows="3" maxlength="200" aria-describedby="preview-question-count">Бендере, як проведемо цей вечір?</textarea><p class="hint" id="preview-question-count">До 200 символов</p></div><p class="hint">Выбери готовую ситуацию или напиши свой вопрос. Бендер ответит вслух с текущими положениями ползунков. Сохранять их для пробы не нужно.</p><button class="btn" type="button" id="preview-character" aria-label="Послушать тестовую реплику Бендера" aria-describedby="preview-status">Послушать характер</button><p class="hint" id="preview-status" role="status">Звук прозвучит на колонке.</p></div>
+<p class="save-message" id="character-status" role="status">Настройки загружены.</p>
+<div class="actions"><p>После сохранения Бендер перезапустится и заговорит с новым характером.</p><button class="btn" type="submit">Сохранить характер</button></div>
+<p class="hint">Для разговоров через локальный AI сервер. Голос и готовые реплики на зарядку и тряску остаются прежними.</p>
+</form>
+</section>
+<footer class="footer"><span>BENDER STATION</span><span>Сделан, чтобы быть рядом.</span></footer>
+</main>
+</div>
+<noscript><style>[data-panel][hidden]{display:block!important;margin-top:35px}</style><p>Для переключения разделов и предпросмотра яркости включи JavaScript. Формы сохранения доступны без него.</p></noscript>
+<script>
+const panels=['radio','settings','character'];
+function showPanel(){const key=location.hash.slice(1);const active=panels.includes(key)?key:'radio';document.querySelectorAll('[data-panel]').forEach(p=>p.hidden=p.dataset.panel!==active);document.querySelectorAll('[data-nav]').forEach(a=>{if(a.dataset.nav===active)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current');});}
+window.addEventListener('hashchange',()=>{showPanel();window.scrollTo(0,0);});showPanel();
+const shake=document.getElementById('shake_delta');const shakeValue=document.getElementById('shake_value');shake.addEventListener('input',()=>shakeValue.value=shake.value);document.getElementById('reset-shake').addEventListener('click',e=>{shake.value=e.currentTarget.dataset.default;shakeValue.value=shake.value;shake.dispatchEvent(new Event('input',{bubbles:true}));});
+const traitInputs=Array.from(document.querySelectorAll('[data-trait]'));
+const characterPresets=Array.from(document.querySelectorAll('[data-preset]'));
+const savedCharacter=traitInputs.map(i=>i.value).join(',');
+let previewBusy=false;
+const previewButton=document.getElementById('preview-character');
+const previewQuestion=document.getElementById('preview-question');
+const previewScenario=document.getElementById('preview-scenario');
+function updatePreviewQuestion(){
+ const option=Array.from(previewScenario.options).find(o=>o.dataset.question===previewQuestion.value);
+ previewScenario.value=option?option.value:'custom';
+ document.getElementById('preview-question-count').textContent=previewQuestion.value.length+' / 200';
+}
+previewScenario.addEventListener('change',()=>{const option=previewScenario.selectedOptions[0];if(option.dataset.question)previewQuestion.value=option.dataset.question;document.getElementById('preview-question-count').textContent=previewQuestion.value.length+' / 200';});
+previewQuestion.addEventListener('input',updatePreviewQuestion);updatePreviewQuestion();
+function characterTestLabel(){
+ const [sarcasm,sociability,curiosity,stubbornness,warmth]=traitInputs.map(i=>Number(i.value));
+ const top=Math.max(sarcasm,sociability,curiosity,stubbornness,warmth);
+ if(sarcasm>=80&&stubbornness>=80&&warmth<35)return 'Ну, сука, тестируй';
+ if(top<35)return 'Послушать';
+ if(warmth===top)return 'Давай поболтаем';
+ if(curiosity===top)return 'А что, если нажать?';
+ if(stubbornness===top)return 'Ну попробуй';
+ if(sarcasm===top)return 'Вжарить';
+ return 'Дай сказать';
+}
+function updateCharacter(){
+ const values=traitInputs.map(i=>i.value).join(',');
+ traitInputs.forEach(i=>document.getElementById(i.id+'-value').value=i.value);
+ const preset=characterPresets.find(p=>p.dataset.values===values);
+ characterPresets.forEach(p=>p.setAttribute('aria-pressed',String(p===preset)));
+ document.getElementById('character-preset').textContent=preset?preset.textContent:'Свой микс';
+ if(!previewBusy)previewButton.textContent=characterTestLabel();
+ document.getElementById('character-status').textContent=values===savedCharacter?'Сохранённый характер.':'Есть изменения — сохрани, чтобы Бендер их запомнил.';
+}
+characterPresets.forEach(p=>p.addEventListener('click',()=>{p.dataset.values.split(',').forEach((v,i)=>traitInputs[i].value=v);updateCharacter();}));
+traitInputs.forEach(i=>i.addEventListener('input',updateCharacter));
+document.getElementById('reset-character').addEventListener('click',()=>characterPresets[0].click());
+updateCharacter();
+async function previewFetch(options){
+ const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),8000);
+ try{return await fetch('/character/preview',{...options,signal:controller.signal,cache:'no-store'});}finally{clearTimeout(timer);}
+}
+async function previewCharacter(){
+ if(previewBusy)return;
+ const question=previewQuestion.value.trim();
+ if(!question||question.length>200){document.getElementById('preview-status').textContent='Напиши вопрос: от 1 до 200 символов.';previewQuestion.focus();return;}
+ previewBusy=true;previewButton.disabled=true;previewButton.textContent='Готовлю реплику…';
+ const message=document.getElementById('preview-status');
+ const save=document.querySelector('#character-form button[type=submit]');save.disabled=true;
+ message.textContent='Подключаюсь к Бендеру…';
+ const body=new URLSearchParams();traitInputs.forEach(i=>body.set(i.name,i.value));body.set('question',question);
+ try{
+  const response=await previewFetch({method:'POST',body});
+  if(!response.ok)throw Error(await response.text()||'Не удалось запустить пробу.');
+  const deadline=Date.now()+75000;
+  while(Date.now()<deadline){
+   const poll=await previewFetch({method:'GET'});
+   if(!poll.ok)throw Error('Потеряна связь с Бендером.');
+   const result=await poll.json();
+   if(result.state===4){message.textContent='Вот так он звучит. Меняй ползунки и сравнивай.';return;}
+   if(result.state===5)throw Error('Проба прервана или AI сервер не ответил. Проверь сервер и попробуй ещё раз.');
+   if(![1,2,3].includes(result.state))throw Error('Проба не запущена. Обнови прошивку и локальный сервер.');
+   previewButton.textContent=result.state===3?'Бендер говорит…':'Готовлю реплику…';
+   message.textContent=result.state===1?'Подключаюсь к AI серверу…':'Пробуем вопрос и настройки, которые были при нажатии. Звук — на колонке.';
+   await new Promise(resolve=>setTimeout(resolve,900));
+  }
+  throw Error('Бендер не успел ответить. Проверь локальный сервер.');
+ }catch(error){message.textContent=error.name==='AbortError'?'Бендер не отвечает по сети. Проверь соединение.':error.message;}
+ finally{previewBusy=false;previewButton.disabled=false;save.disabled=false;previewButton.textContent=characterTestLabel();}
+}
+previewButton.addEventListener('click',previewCharacter);
+let calibTimer=0,calibBusy=false,calibPending=false,leaving=false;
+const status=document.getElementById('calib-status');
+function getV(i){return Number(document.getElementById('mbr'+i).value);}
+function setV(i,v){v=Math.max(0,Math.min(15,v));document.getElementById('mbr'+i).value=v;document.getElementById('v'+i).textContent=v;}
+async function postCalib(){if(leaving)return;if(calibBusy){calibPending=true;return;}calibBusy=true;status.textContent='Применяю яркость…';try{const b=new URLSearchParams();for(let i=0;i<5;i++)b.set('mbr'+i,getV(i));const response=await fetch('/calib',{method:'POST',body:b});if(!response.ok)throw Error();status.textContent='Предпросмотр применён. Сохрани, чтобы запомнить.';}catch(e){status.textContent='Не удалось применить яркость. Проверь соединение и попробуй ещё раз.';}finally{calibBusy=false;if(calibPending&&!leaving){calibPending=false;postCalib();}}}
+function queueCalib(){clearTimeout(calibTimer);calibTimer=setTimeout(postCalib,150);}
+document.querySelectorAll('[data-matrix]').forEach(b=>b.addEventListener('click',()=>{const i=Number(b.dataset.matrix);setV(i,getV(i)+Number(b.dataset.delta));queueCalib();}));
+document.getElementById('start-calib').addEventListener('click',()=>{for(let i=0;i<5;i++)setV(i,0);queueCalib();});
+document.querySelectorAll('[data-save-form]').forEach(f=>f.addEventListener('submit',()=>{leaving=true;clearTimeout(calibTimer);f.querySelector('button[type=submit]').textContent='Сохраняю…';}));
+</script>
+<script>document.getElementById("preview-character").addEventListener("click",e=>{e.stopImmediatePropagation();alert("Локальный макет: прослушивание работает на колонке.");},true);document.querySelectorAll("form").forEach(f=>f.addEventListener("submit",e=>{e.preventDefault();alert("Локальный предпросмотр: настройки не отправлены.");}));</script></body>
+</html>

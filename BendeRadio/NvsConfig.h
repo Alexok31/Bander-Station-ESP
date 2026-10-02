@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include "CharacterSettings.h"
 
 struct WifiStored {
     String staSsid;
@@ -29,3 +30,12 @@ bool nvsNormalizeAiWsUrl(String& url);
 
 bool nvsLoadAiDebug();
 void nvsSaveAiDebug(bool on);
+
+bool nvsLoadWakeOnShake();
+void nvsSaveWakeOnShake(bool on);
+uint16_t nvsLoadShakeThreshold();
+void nvsSaveShakeThreshold(uint16_t value);
+uint8_t nvsLoadCalmMinutes();
+void nvsSaveCalmMinutes(uint8_t value);
+BenderCharacter::Settings nvsLoadCharacter();
+bool nvsSaveCharacter(const BenderCharacter::Settings& settings);

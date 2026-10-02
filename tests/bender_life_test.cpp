@@ -12,6 +12,18 @@ static_assert(bender_event_radio_allows_voice(E::Charging, false));
 static_assert(!bender_event_radio_allows_voice(E::Carried, false));
 static_assert(bender_event_radio_allows_voice(E::Carried, true));
 
+constexpr bool motion_wake_setting() {
+    constexpr E events[] = {E::Shake, E::Carried, E::SetDown};
+    for (const auto event : events) {
+        if (bender_event_allows_motion_wake(event, false, false)) return false;
+        if (!bender_event_allows_motion_wake(event, false, true)) return false;
+        if (!bender_event_allows_motion_wake(event, true, false)) return false;
+    }
+    return bender_event_allows_motion_wake(E::Charging, false, false) &&
+           bender_event_allows_motion_wake(E::BatteryLow, false, false);
+}
+static_assert(motion_wake_setting(), "Disabled motion wake blocks shake/carry/set-down, not awake reactions or battery events");
+
 constexpr bool less_sensitive_shake() {
     BenderShake s;
     if (s.sample(6500, 1000, 8000, 1500) || s.sample(6500, 1040, 8000, 1500)) return false;

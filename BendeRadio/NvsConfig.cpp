@@ -251,3 +251,70 @@ void nvsSaveAiDebug(bool on) {
     p.putBool("ai_debug", on);
     p.end();
 }
+
+bool nvsLoadWakeOnShake() {
+    Preferences p;
+    if (!p.begin(kNs, true)) return true;
+    const bool on = p.getBool("shake_wake", true);
+    p.end();
+    return on;
+}
+
+void nvsSaveWakeOnShake(bool on) {
+    Preferences p;
+    if (!p.begin(kNs, false)) return;
+    p.putBool("shake_wake", on);
+    p.end();
+}
+
+uint16_t nvsLoadShakeThreshold() {
+    Preferences p;
+    if (!p.begin(kNs, true)) return BenderBehavior::shakeDefault;
+    const uint16_t value = p.getUShort("shake_delta", BenderBehavior::shakeDefault);
+    p.end();
+    return BenderBehavior::validShake(value) ? value : BenderBehavior::shakeDefault;
+}
+
+void nvsSaveShakeThreshold(uint16_t value) {
+    if (!BenderBehavior::validShake(value)) return;
+    Preferences p;
+    if (!p.begin(kNs, false)) return;
+    p.putUShort("shake_delta", value);
+    p.end();
+}
+
+uint8_t nvsLoadCalmMinutes() {
+    Preferences p;
+    if (!p.begin(kNs, true)) return BenderBehavior::calmDefaultMinutes;
+    const uint8_t value = p.getUChar("calm_min", BenderBehavior::calmDefaultMinutes);
+    p.end();
+    return BenderBehavior::validCalm(value) ? value : BenderBehavior::calmDefaultMinutes;
+}
+
+void nvsSaveCalmMinutes(uint8_t value) {
+    if (!BenderBehavior::validCalm(value)) return;
+    Preferences p;
+    if (!p.begin(kNs, false)) return;
+    p.putUChar("calm_min", value);
+    p.end();
+}
+
+BenderCharacter::Settings nvsLoadCharacter() {
+    BenderCharacter::Settings result;
+    Preferences p;
+    if (!p.begin(kNs, true)) return result;
+    BenderCharacter::Settings stored;
+    const bool ok = p.getBytesLength("character_v1") == sizeof(stored.values) &&
+        p.getBytes("character_v1", stored.values, sizeof(stored.values)) == sizeof(stored.values);
+    p.end();
+    return ok && BenderCharacter::valid(stored) ? stored : result;
+}
+
+bool nvsSaveCharacter(const BenderCharacter::Settings& settings) {
+    if (!BenderCharacter::valid(settings)) return false;
+    Preferences p;
+    if (!p.begin(kNs, false)) return false;
+    const bool ok = p.putBytes("character_v1", settings.values, sizeof(settings.values)) == sizeof(settings.values);
+    p.end();
+    return ok;
+}

@@ -33,12 +33,16 @@ static inline uint8_t mouth_gfx_off(bool invert) {
 }
 
 static uint32_t s_face_last_live_ms = 0;
+static bool s_wake_on_shake = true;
+static uint32_t s_face_calm_after_ms = RadioConfig::benderFaceCalmAfterMs;
+static bool matrix_face_awake();
 static BenderLife s_life;
 static BenderEvent s_life_face = BenderEvent::None;
 static uint32_t s_life_face_since = 0;
 
 static void react_to_life(BenderEvent event) {
     if (event == BenderEvent::None || bender_ai_busy() || pong_active()) return;
+    if (!bender_event_allows_motion_wake(event, matrix_face_awake(), s_wake_on_shake)) return;
     const uint32_t now = millis();
     s_life_face = event;
     s_life_face_since = now;
@@ -57,8 +61,7 @@ static bool matrix_face_awake() {
         s_face_last_live_ms = millis();
         return true;
     }
-    return RadioConfig::benderFaceCalmAfterMs > 0 &&
-           (uint32_t)(millis() - s_face_last_live_ms) < RadioConfig::benderFaceCalmAfterMs;
+    return BenderBehavior::faceAwake(millis(), s_face_last_live_ms, s_face_calm_after_ms);
 }
 
 // Встроенные станции (0…1). Дополнительные — только через Web UI → NVS.
@@ -378,7 +381,6 @@ static uint8_t s_batt_matrix_overlay_pct;
 static uint32_t s_batt_icon_step_ms;
 static uint32_t s_batt_charge_frame;
 static bool s_batt_overlay_prev_chg;
-static uint8_t s_batt_shutdown_consecutive;
 
 static void print_batt_overlay(uint8_t pct) {
     if (!matrix_display_ready()) {
@@ -395,9 +397,9 @@ static void print_batt_overlay(uint8_t pct) {
     }
     draw_batt_matrix_rows(rows);
     mtrx.setCursor(8 * 1 + 2, 1);
-    mtrx.print((char)('0' + (v / 10)));
+    mtrx.print(battery_gauge_ready() ? (char)('0' + (v / 10)) : '-');
     mtrx.setCursor(8 * 2 + 2, 1);
-    mtrx.print((char)('0' + (v % 10)));
+    mtrx.print(battery_gauge_ready() ? (char)('0' + (v % 10)) : '-');
     matrix_flush();
 }
 
@@ -1513,6 +1515,8 @@ static void pololu_power_cut() {
 // Критический заряд: уводим в deep sleep без wake sources — меньше ток, чем у «живой» прошивки
 // (типичный цикл: Brownout → reset → снова нагрузка → снова Brownout).
 static void low_battery_enter_deep_sleep_forever() {
+    airplay_interrupt();
+    amp_force_mute();
     radioState.state = false;
     if (strcmp(g_audio_source, "wifi") == 0) {
         audio.setVolume(0);
@@ -1546,34 +1550,13 @@ static void low_battery_enter_deep_sleep_forever() {
 }
 
 static void battery_shutdown_guard_on_sample() {
-    if (!battery_low_power_sleep_active() || !battery_gauge_ready()) {
-        return;
-    }
-    const uint16_t mv = battery_millivolts();
-    const uint8_t pct = battery_percent();
-    const bool chg = battery_is_charging();
-    // Якщо пакет уже < ~2.8 В/банку — це не робоча зарядка, сон обов'язковий.
-    if (mv > 0 && mv < RadioConfig::batteryCriticalMv) {
-        Serial.printf("[Batt] CRITICAL %umV — sleep (chg=%d ignored)\n", (unsigned)mv, (int)chg);
-        low_battery_enter_deep_sleep_forever();
-        return;
-    }
-    const bool charger_holds = chg && mv >= RadioConfig::batteryCriticalMv;
-    if (charger_holds) {
-        s_batt_shutdown_consecutive = 0;
-        return;
-    }
-    const bool low = (pct < RadioConfig::batteryShutdownBelowPercent) ||
-                     (mv > 0 && mv < RadioConfig::batteryShutdownBelowMv);
-    if (low) {
-        if (++s_batt_shutdown_consecutive >= RadioConfig::batteryShutdownConsecutiveSamples) {
-            Serial.printf("[Batt] LOW SLEEP pct=%u mv=%u chg=%d\n", (unsigned)pct, (unsigned)mv,
-                          (int)chg);
-            low_battery_enter_deep_sleep_forever();
-        }
-        return;
-    }
-    s_batt_shutdown_consecutive = 0;
+    const auto reason = battery_shutdown_reason();
+    if (reason == BatteryShutdownReason::None) return;
+    Serial.printf("[Batt] %s SLEEP raw_mv=%u display_mv=%u pct=%u chg=%d\n",
+                  reason == BatteryShutdownReason::Critical ? "CRITICAL" : "LOW",
+                  (unsigned)battery_protection_millivolts(), (unsigned)battery_millivolts(),
+                  (unsigned)battery_percent(), (int)battery_is_charging());
+    low_battery_enter_deep_sleep_forever();
 }
 
 static void radio_enter_deep_sleep() {
@@ -1651,6 +1634,10 @@ void core0(void* p) {
     }
     nvsLoadCustomStations(s_custom_stations, RadioConfig::customStationMaxCount, s_custom_station_count);
     nvsLoadMatrixBrightnessTrim(s_matrix_brightness_trim, RadioConfig::matrixModuleCount);
+    s_wake_on_shake = nvsLoadWakeOnShake();
+    s_face_calm_after_ms = uint32_t(nvsLoadCalmMinutes()) * 60000u;
+    Serial.printf("[Motion] calm after %lu min (0=never)\n", (unsigned long)(s_face_calm_after_ms / 60000u));
+    Serial.printf("[Motion] wake on shake %s\n", s_wake_on_shake ? "ON" : "OFF");
     Serial.printf("[Radio] stations: %u built-in + %u NVS = %u total\n",
                   (unsigned)kStationBuiltInCount, (unsigned)s_custom_station_count,
                   (unsigned)station_total_count());
@@ -1776,11 +1763,22 @@ void core0(void* p) {
             s_matrix_brightness_trim_dirty = false;
             upd_bright();
         }
-        const bool batt_sampled = battery_update();
-        if (batt_sampled) {
-            battery_shutdown_guard_on_sample();
-        }
+        battery_update();
+        // Also consumes a shutdown decision from a manual gauge sample.
+        battery_shutdown_guard_on_sample();
         matrix_tmr.tick();
+        static bool charge_was_detected = false;
+        const bool charge_detected = battery_is_charging();
+        if (charge_detected && !charge_was_detected && !pong_active() && !s_mode_pick_active) {
+            s_batt_matrix_overlay = true;
+            s_batt_matrix_overlay_pct = battery_percent();
+            s_batt_charge_frame = 0;
+            s_batt_icon_step_ms = millis();
+            s_batt_overlay_prev_chg = true;
+            print_batt_overlay(s_batt_matrix_overlay_pct);
+            matrix_tmr.start(RadioConfig::batteryPercentShowDurationChargingMs);
+        }
+        charge_was_detected = charge_detected;
         const int requested_volume = s_ui_vol_pending.exchange(-1);
         if (requested_volume >= 0) {
             s_batt_matrix_overlay = false;
@@ -1800,15 +1798,16 @@ void core0(void* p) {
         }
         if (matrix_display_ready() && s_batt_matrix_overlay && matrix_tmr.state()) {
             const bool chg = RadioConfig::chargingDetectEnable && battery_is_charging();
+            const uint8_t pct = battery_percent();
+            const bool pct_changed = pct != s_batt_matrix_overlay_pct;
+            s_batt_matrix_overlay_pct = pct;
+            if (pct_changed || chg != s_batt_overlay_prev_chg)
+                print_batt_overlay(s_batt_matrix_overlay_pct);
             if (chg) {
                 const uint32_t now = millis();
                 if ((uint32_t)(now - s_batt_icon_step_ms) >= RadioConfig::batteryChargeIconAnimStepMs) {
                     s_batt_icon_step_ms = now;
                     s_batt_charge_frame++;
-                    print_batt_overlay(s_batt_matrix_overlay_pct);
-                }
-            } else {
-                if (s_batt_overlay_prev_chg && !chg) {
                     print_batt_overlay(s_batt_matrix_overlay_pct);
                 }
             }
@@ -1818,10 +1817,15 @@ void core0(void* p) {
         memory.tick();
 
         if (mpu6050_poll_shake()) {
-            angry_tmr.start();
-            wifi_touch_activity();
-            Serial.println(F("[MPU] → angry eyes (shake OK)"));
-            react_to_life(BenderEvent::Shake);
+            const bool awake = matrix_face_awake();
+            if (bender_event_allows_motion_wake(BenderEvent::Shake, awake, s_wake_on_shake)) {
+                // Wake the idle face explicitly, independently of voice/event availability.
+                s_face_last_live_ms = millis();
+                wifi_touch_activity();
+                angry_tmr.start();
+                Serial.println(awake ? F("[MPU] → angry eyes (shake OK)") : F("[Motion] shake → awake"));
+                react_to_life(BenderEvent::Shake);
+            }
         }
         react_to_life(mpu6050_motion_event());
         react_to_life(s_life.update(millis(), battery_gauge_ready() && battery_sense_present(),
@@ -2418,7 +2422,7 @@ void core0(void* p) {
                 charging || (strcmp(g_audio_source, "bt") == 0 && bt_audio_needs_pairing_ui());
             if (stay_awake) {
                 s_wifi_last_activity_ms = millis();
-            } else if (RadioConfig::benderIdleDeepSleepMs > 0 &&
+            } else if (s_face_calm_after_ms > 0 && RadioConfig::benderIdleDeepSleepMs > 0 &&
                        (uint32_t)(millis() - s_wifi_last_activity_ms) >=
                            RadioConfig::benderIdleDeepSleepMs) {
                 Serial.println(F("[Sleep] idle 30 min"));

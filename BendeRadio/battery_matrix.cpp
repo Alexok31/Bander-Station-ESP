@@ -55,7 +55,9 @@ void battery_matrix_rows_from_percent(uint8_t pct, uint8_t rows[8]) {
 }
 
 void battery_matrix_rows_charging(uint8_t pct, uint32_t frame, uint8_t rows[8]) {
-    const uint8_t base = battery_matrix_inner_steps_from_pct(pct);
+    const uint8_t level = battery_matrix_inner_steps_from_pct(pct);
+    // CHG is still active even if the voltage estimate has reached 99%.
+    const uint8_t base = level < 8u ? level : 7u;
     uint8_t inner = base;
     if (base < 8u) {
         const uint32_t span = (uint32_t)(9u - base);

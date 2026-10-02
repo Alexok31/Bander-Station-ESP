@@ -215,6 +215,12 @@ static std::atomic<uint32_t> s_favorites_lo{0}, s_favorites_hi{0};
 static std::atomic<bool> s_event_voice_enabled{true};
 static std::atomic<uint32_t> s_pending_event{0};
 static std::atomic<uint32_t> s_pending_event_ms{0};
+static std::atomic<uint8_t> s_preview_state{0};
+static std::atomic<uint32_t> s_preview_id{0};
+static uint32_t s_preview_queued_ms = 0;
+static BenderCharacter::Settings s_preview_traits;
+static char s_preview_question[BenderCharacter::questionMaxBytes + 1] = {};
+static portMUX_TYPE s_preview_mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool s_event_reply = false;
 static volatile bool s_drop_event_reply = false;
 static volatile bool s_need_mic_clear = false;
@@ -444,6 +450,8 @@ static void noteProgress() {
 static uint32_t s_sock_wait_ms;
 
 static void forceRecover(const char* why, bool show_error = false) {
+    const uint8_t previewState = s_preview_state.load();
+    if (previewState == 1 || previewState == 2 || (previewState == 3 && show_error)) s_preview_state.store(5);
     const bool background_event = s_event_reply || s_drop_event_reply || s_pending_event.load() != 0;
     const bool user_active = pttHeld || s_ptt_armed || convState == ST_RECORDING;
     if (bender_face_show_error(show_error, background_event, user_active)) {
@@ -916,11 +924,21 @@ static void onMessage(websockets::WebsocketsMessage m) {
         if (!strcmp(t, "response.done")) s_drop_event_reply = false;
         return;
     }
-    if (strcmp(t, "session.created") == 0) {
+    if (!strcmp(t, "character.preview.result")) {
+        if (s_preview_state.load() == 2 && j["request_id"].as<uint32_t>() == s_preview_id.load()) {
+            s_preview_state.store((j["ok"] | false) ? 3 : 5);
+        }
+    } else if (strcmp(t, "session.created") == 0) {
         JsonDocument u;
         u["type"] = "session.update";
         JsonObject s = u["session"].to<JsonObject>();
-        if (providerIsLocal()) s["current_station"] = (int)radioState.station;
+        if (providerIsLocal()) {
+            s["current_station"] = (int)radioState.station;
+            const auto character = nvsLoadCharacter();
+            JsonObject traits = s["character"].to<JsonObject>();
+            for (uint8_t i = 0; i < BenderCharacter::count; ++i)
+                traits[BenderCharacter::keys[i]] = character.values[i];
+        }
         s["instructions"] = SYS_PROMPT;
         s["voice"] = rtVoice();
         s["turn_detection"] = nullptr;
@@ -1177,6 +1195,8 @@ static void wsTask(void*) {
             vTaskDelay(5 / portTICK_PERIOD_MS);
             continue;
         }
+        if (s_preview_state.load() == 1 && uint32_t(millis() - s_preview_queued_ms) > 12000u)
+            s_preview_state.store(5);
         if (!s_ai_awake && !s_demo && !wantOnline) {
             backoff = 0;
             vTaskDelay(100 / portTICK_PERIOD_MS);
@@ -1212,6 +1232,32 @@ static void wsTask(void*) {
             continue;
         }
         backoff = 0;
+        if (s_preview_state.load() == 1) {
+            if (bender_ai_busy() || airplay_owns_speaker() || strcmp(g_audio_source, "wifi") != 0 || radioState.vol <= 0) {
+                s_preview_state.store(5);
+            } else if (sessionReady) {
+                JsonDocument preview;
+                preview["type"] = "character.preview";
+                preview["request_id"] = s_preview_id.load();
+                BenderCharacter::Settings traits;
+                char question[BenderCharacter::questionMaxBytes + 1];
+                portENTER_CRITICAL(&s_preview_mux);
+                traits = s_preview_traits;
+                memcpy(question, s_preview_question, sizeof(question));
+                portEXIT_CRITICAL(&s_preview_mux);
+                preview["question"] = question;
+                JsonObject values = preview["character"].to<JsonObject>();
+                for (uint8_t i = 0; i < BenderCharacter::count; ++i) values[BenderCharacter::keys[i]] = traits.values[i];
+                s_preview_state.store(2);
+                s_event_reply = true;
+                s_drop_event_reply = false;
+                responsePending = true;
+                convState = ST_WAIT_RESP;
+                stateSinceMs = millis();
+                noteProgress();
+                wsSend(preview);
+            }
+        }
         const uint32_t pendingEvent = s_pending_event.load();
         if (pendingEvent && (pttHeld || s_ptt_armed || convState != ST_IDLE ||
                              uint32_t(millis() - s_pending_event_ms.load()) > 4000u)) {
@@ -1383,9 +1429,39 @@ bool bender_ai_favorite_station(int station) {
 
 bool bender_ai_event_voice_enabled() { return s_event_voice_enabled.load(); }
 
+const char* bender_ai_preview_character(const BenderCharacter::Settings& settings, const char* question) {
+    AirPlayAudioGuard guard;
+    if (!providerIsLocal() || !s_started) return "Прослушивание доступно через локальный AI сервер.";
+    if (!BenderCharacter::valid(settings)) return "Недопустимые настройки характера.";
+    if (!BenderCharacter::validQuestion(question)) return "Напиши тестовый вопрос: от 1 до 200 символов.";
+    if (WiFi.status() != WL_CONNECTED) return "Бендер не подключён к Wi-Fi.";
+    if (radioState.vol <= 0) return "Сначала прибавь громкость Бендера.";
+    if (airplay_owns_speaker() || strcmp(g_audio_source, "wifi") != 0)
+        return "Заверши AirPlay или Bluetooth и переключи Бендера в режим FM.";
+    const uint8_t state = s_preview_state.load();
+    if ((state >= 1 && state <= 3) || bender_ai_busy() || s_drop_event_reply)
+        return "Бендер сейчас занят. Попробуй после ответа.";
+    s_pending_event.store(0);
+    portENTER_CRITICAL(&s_preview_mux);
+    s_preview_traits = settings;
+    strcpy(s_preview_question, question); // Length checked before copying into the queue.
+    s_preview_queued_ms = millis();
+    portEXIT_CRITICAL(&s_preview_mux);
+    s_preview_id.fetch_add(1);
+    s_ai_last_live_ms = millis();
+    s_ai_awake = wantOnline = true; // No microphone capture for a web preview.
+    s_preview_state.store(1);
+    return nullptr;
+}
+
+uint8_t bender_ai_preview_status() {
+    const uint8_t state = s_preview_state.load();
+    return state == 2 && bender_ai_tts_playing() ? 3 : state;
+}
+
 bool bender_ai_event(BenderEvent event, int station) {
     AirPlayAudioGuard guard;
-    if (!providerIsLocal() || !s_started || !s_event_voice_enabled.load() ||
+    if (!providerIsLocal() || !s_started || !s_event_voice_enabled.load() || s_preview_state.load() == 1 ||
         bender_ai_busy() || airplay_owns_speaker() || s_ptt_armed || WiFi.status() != WL_CONNECTED ||
         s_drop_event_reply || event == BenderEvent::None || event == BenderEvent::NetworkLost) return false;
     // Prepare the socket without turning on the microphone or taking I2S.
@@ -1436,6 +1512,7 @@ void bender_ai_wake() {
 }
 
 void bender_ai_sleep() {
+    if (s_preview_state.load() == 1) s_preview_state.store(5);
     if (pttHeld || s_demo || convState == ST_RECORDING || convState == ST_WAIT_RESP || speaking ||
         waitingACK || responsePending) {
         return;
@@ -1457,6 +1534,7 @@ bool bender_ai_awake() {
 }
 
 void bender_ai_ptt_arm() {
+    if (s_preview_state.load() >= 1 && s_preview_state.load() <= 3) s_preview_state.store(5);
     s_pending_event.store(0);
     if (s_event_reply) {
         s_event_reply = false;
@@ -1486,6 +1564,7 @@ void bender_ai_ptt_cancel() {
 }
 
 void bender_ai_yield_radio() {
+    if (s_preview_state.load() >= 1 && s_preview_state.load() <= 3) s_preview_state.store(5);
     s_pending_event.store(0);
     if (s_event_reply) {
         s_event_reply = false;
@@ -1566,6 +1645,7 @@ void bender_ai_ptt_up() {
 }
 
 void bender_ai_tick() {
+    if (s_preview_state.load() == 3 && !bender_ai_busy()) s_preview_state.store(4);
     if (s_need_speaker && !s_owns_spk && !s_giveback) {
         s_need_speaker = false;
         if (!takeSpeaker()) {
@@ -1585,7 +1665,7 @@ void bender_ai_tick() {
             radio_voice_after_speaker();
         }
     }
-    if (s_ai_awake && !bender_ai_busy() && !s_ptt_armed &&
+    if (s_ai_awake && !bender_ai_busy() && !s_ptt_armed && s_preview_state.load() != 1 &&
         (uint32_t)(millis() - s_ai_last_live_ms) > 8000u) {
         bender_ai_sleep();
     } else if (bender_ai_busy() || s_ptt_armed) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include "BehaviorSettings.h"
 
 // Все настройки пинов, Wi‑Fi и таймингов «холодного» старта в одном месте.
 class RadioConfig {
@@ -105,7 +106,7 @@ class RadioConfig {
     static constexpr uint8_t encoderSleepClicks = 8;
     static constexpr uint8_t encoderRestartClicks = 9;
     // Без музики і без розмови з Бендером — очі/рот у спокійний режим (не deep sleep).
-    static constexpr uint32_t benderFaceCalmAfterMs = 5ul * 60ul * 1000ul;
+    static constexpr uint32_t benderFaceCalmAfterMs = BenderBehavior::calmDefaultMinutes * 60000ul;
     // Далі бездіяльність (немає музики, PTT, енкодера, WebUI) — deep sleep, будить кнопка.
     // На зарядці автосон не вмикається (8 кліків — так).
     static constexpr uint32_t benderIdleDeepSleepMs = 30ul * 60ul * 1000ul;
@@ -126,29 +127,33 @@ class RadioConfig {
     static constexpr bool batteryMonitorEnable = true;
     static constexpr uint8_t batteryAdcPin = 1;
     static constexpr float batteryDividerRatio = 8200.0f / 2468.0f;
-    // % з напруги: ступінчаста таблиця U→% у battery.cpp (без інтерполяції між точками).
+    // Верхняя точка 2S Li-ion 8.4 В подтверждена владельцем; сама кривая SOC приблизительная.
+    // Это только индикатор, НЕ настройка зарядного контроллера.
+    static constexpr uint16_t batterySocFullMv = 8400;
     // Пороги для battery_eye_mood() (якщо підключиш настрій очей за АКБ).
     static constexpr uint8_t batteryMoodCheerfulMinPct = 70;
     static constexpr uint8_t batteryMoodNormalMinPct = 30;
-    static constexpr uint32_t batterySampleIntervalMs = 180000;  // 3 мин
-    // Ниже этого % опрашиваем АКБ чаще (batteryLowSampleIntervalMs) — для порога выключения и стабильности.
+    static constexpr uint32_t batterySampleIntervalMs = 1000;  // свежий замер для защиты
+    // Опрос защиты не зависит от отображаемого %, интервалы сейчас одинаковые.
     static constexpr uint8_t batteryLowAttentionPercent = 10;
-    static constexpr uint32_t batteryLowSampleIntervalMs = 60000;  // 1 мин при < batteryLowAttentionPercent
-    // Ниже порога без зарядки: глубокий сон (только если batteryMonitorEnable и chargingDetectEnable).
+    static constexpr uint32_t batteryLowSampleIntervalMs = 1000;
+    // Защита по напряжению: детектор зарядки не может отключить её.
     static constexpr bool batteryShutdownEnable = true;
-    static constexpr uint8_t batteryShutdownBelowPercent = 5;
     // 2S: нижче ~3.1 В/банку — сон. 4.8 В пакета = вже глибокий розряд, так не повинно доходити.
     static constexpr uint16_t batteryShutdownBelowMv = 6200;
     // Нижче цього зарядка НЕ рятує: робочий ЗП тримав би банку вище.
     static constexpr uint16_t batteryCriticalMv = 5600;
-    // Sleep по % тільки після «живого» делителя: пакет у вікні і стабільний АЦП.
-    // Плаваючий GPIO1 часто дає ~5–5.5 В і раніше хибно вмикав sleep.
-    static constexpr uint16_t batterySensePresentMinMv = 6000;
+    // Стабильный вход во всём диапазоне, включая сильно разряженный пакет.
+    // Стабильный плавающий вход программно неотличим от батареи: делитель должен быть подключён.
+    // Нижняя граница проверки АЦП, НЕ рабочий порог разряда. Низкая батарея тоже должна определяться.
+    static constexpr uint16_t batterySensePresentMinMv = 1000;
     static constexpr uint16_t batterySensePresentMaxMv = 9200;
-    static constexpr uint16_t batterySenseStablePinSpreadMv = 100;  // max−min pin за замір
+    static constexpr uint16_t batterySenseStablePinSpreadMv = 100;  // разброс центральных средних ADC-групп
     static constexpr uint8_t batterySenseLatchSamples = 2;
-    // Подряд столько замеров (с интервалом выше) должны быть < порога — защита от шума АЦП.
-    static constexpr uint8_t batteryShutdownConsecutiveSamples = 2;
+    static constexpr uint16_t batteryShutdownHysteresisMv = 100;
+    static constexpr uint32_t batteryShutdownHoldMs = 10000;
+    static constexpr uint32_t batteryCriticalHoldMs = 2000;
+    static constexpr uint32_t batteryChargingRecoveryMs = 30000;
     // Ниже этого % (без активной зарядки) — грустные глаза по битмапу (левый/правый — отдельные массивы в core0).
     static constexpr bool batterySadEyesEnable = true;
     static constexpr uint8_t batterySadEyesBelowPercent = 20;
@@ -326,7 +331,7 @@ class RadioConfig {
     // Пауза в конце цикла core0 — уступка CPU и лёгкий idle (0 = выкл.).
     static constexpr uint8_t core0LoopDelayMs = 1;
     // Радио выкл.: реже опрашивать делитель АКБ (0 = всегда batterySampleIntervalMs).
-    static constexpr uint32_t batterySampleIntervalIdleMs = 180000;  // 3 мин (радио выкл.)
+    static constexpr uint32_t batterySampleIntervalIdleMs = 1000;  // защита работает и в ожидании
     // loop(): при выкл. радио — короткая пауза, меньше кручение CPU в ожидании.
     static constexpr uint8_t loopDelayMsWhenRadioOff = 2;
     // После пробуждения из deep sleep (ext0): «бегающие глаза» как при поиске Wi‑Fi (0 = выкл.).
@@ -338,9 +343,10 @@ class RadioConfig {
     static constexpr uint8_t mpu6050SclPin = 13;
     static constexpr uint8_t mpu6050I2cAddr = 0x68;
     static constexpr uint32_t mpu6050PollMs = 40;
-    // Сумма |Δax|+|Δay|+|Δaz| (сырые ±2g). 4000–8000 — тряска руками; выше — менее чувствительно.
+    // Сумма |Δax|+|Δay|+|Δaz| (сырые ±2g); выше порог — ниже чувствительность.
+    // 8000 срабатывало от басов в корпусе; 11000 — промежуточная чувствительность.
     // Two strong samples within 240 ms confirm a shake; one bump is ignored.
-    static constexpr uint16_t mpu6050ShakeDeltaSum = 8000;
+    static constexpr uint16_t mpu6050ShakeDeltaSum = BenderBehavior::shakeDefault;
     static constexpr uint16_t mpu6050ShakeCooldownMs = 1500;
     static constexpr uint16_t mpu6050AngryEyesMs = 900;
 
