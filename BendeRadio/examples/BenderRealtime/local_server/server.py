@@ -166,7 +166,7 @@ CHAT: list[dict] = []
 CHAT_CONV_ID = ""
 CHAT_SUMMARY = ""
 CHAT_GROK_RESP_ID = ""
-GROK_PROMPT_REV = 8
+GROK_PROMPT_REV = 9
 DEVICE_STATIONS: list[dict] = []
 
 VOICE_ONNX = MODELS / "uk_UA-ukrainian_tts-medium.onnx"
@@ -214,7 +214,7 @@ _GREET_WORDS = r"бендер|bender|привіт|привет|вітаю|здр
 
 PROMPT_TEMPLATE = (HERE / "bender_prompt.txt").read_text(encoding="utf-8").strip()
 BENDER_LEVEL = int(CFG.get("bender_level") or 5)
-DEVICE_CHARACTER = None  # Legacy clients keep bender_level; new firmware sends five traits.
+DEVICE_CHARACTER = None  # Legacy clients keep bender_level; EQ accepts seven traits (or the older five).
 
 LEVEL_RULES = {
     1: (
@@ -357,13 +357,16 @@ def bender_prompt(character=None) -> str:
                  "Силу сарказму, буркотіння і доброзичливості визначає еквалайзер нижче." if eq else
                  "Нахабний, егоїстичний, цинічний, з величезним его. Пиво, гроші, злодійство, власна велич.")
         .replace("{CHARACTER_STYLE}",
-                 "Виявляй сарказм, цікавість, упертість і теплоту відповідно до еквалайзера. "
+                 "Виявляй усі сім рис, включно з грубістю і лихослів'ям, відповідно до еквалайзера. "
                  "При низькому значенні не нав'язуй цю рису заради образу Бендера." if eq else
                  "Сарказм і его — зсередини, не наліпкою. Можеш похвалитися, поторгуватися за уявну винагороду, "
                  "вдати небажання допомагати — і все ж допомогти в тій самій репліці. Іноді визнай чужий успіх, ніби неохоче.")
         .replace("{CHARACTER_MODE}", "ЕКВАЛАЙЗЕР ХАРАКТЕРУ" if eq else f"РЕЖИМ: {BENDER_LEVEL}/10")
         .replace("{CHARACTER_END}",
-                 "Еквалайзер визначає манеру; зміст розмови та доречна допомога завжди важливіші." if eq else
+                 "Перед відповіддю звір лексику, різкість, довжину та питання з поточним еквалайзером. "
+                 "Конкретні вимоги його крайніх значень мають пріоритет над загальними порадами стилю вище. "
+                 "Не усереднюй протилежні риси: теплий тон може містити мат, а грубий — обходитися без нього. "
+                 "Зберігай корисний зміст, застосовуючи обрану манеру." if eq else
                  f"Працюй у режимі {BENDER_LEVEL}/10: він визначає різкість і лексику. Інших рівнів немає. Не згладжуй.")
     )
 
@@ -1979,6 +1982,7 @@ async def _grok_pieces(history: list[dict], n_pred: int, n_temp: float):
         return
     body: dict = {
         "model": GROK_MODEL,
+        "instructions": bender_prompt(),
         "input": [{"role": "user", "content": grok_turn_text(last_user, last_asst, nudge)}],
         "stream": True,
         "store": True,
@@ -1996,7 +2000,6 @@ async def _grok_pieces(history: list[dict], n_pred: int, n_temp: float):
         body["previous_response_id"] = prev
         log(f"Grok {GROK_MODEL} continue {prev[:12]}… level={BENDER_LEVEL} temp={n_temp:.2f}")
     else:
-        body["instructions"] = bender_prompt()
         if DEVICE_CHARACTER is not None:
             # A personality change needs new instructions, not amnesia. Reuse the
             # bounded local dialogue when starting the replacement remote chain.
@@ -2678,7 +2681,8 @@ async def character_preview_text(profile, question=DEFAULT_QUESTION) -> str:
     """One isolated model request: no conversation ID, memory or persisted state."""
     prompt = bender_prompt(profile) + (
         "\nЦе короткий приклад твого характеру. Відповідай природно на питання нижче, "
-        "1–3 короткими реченнями, не більше 45 слів. Не згадуй тест, налаштування чи еквалайзер."
+        "Довжину, лексику й різкість визначає еквалайзер; максимум три речення й 55 слів. "
+        "Продемонструй крайні значення у самій відповіді. Не згадуй тест, налаштування чи еквалайзер."
     )
     question = validate_preview_question(question)
     if question is None:
@@ -2728,6 +2732,7 @@ async def run_character_preview(ws, event) -> None:
             raise ValueError("Invalid preview character")
         if question is None:
             raise ValueError("Invalid preview question")
+        log("[Character preview settings] " + " ".join(f"{key}={value}" for key, value in profile.items()))
         await ws.send(dumps({"type": "response.created"}))
         # Bound the silent generation/TTS period below the device's 45 s timeout.
         async def prepare():

@@ -193,7 +193,7 @@ void setup() {
 
     if (!wifi_sta_connect(staSsid, staPass, 30000u)) {
         // Стабильность WebUI выше в AP-only (без одновременного STA-трафика и стрима).
-        WiFi.mode(WIFI_AP);
+        WiFi.mode(WIFI_AP_STA);
         if (apPwd.length() >= 8) {
             WiFi.softAP(apSsid.c_str(), apPwd.c_str());
         } else {

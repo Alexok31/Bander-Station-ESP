@@ -60,6 +60,22 @@
     "ok": true
   },
   {
+    "name": "preset rude",
+    "ok": true
+  },
+  {
+    "name": "preset boor",
+    "ok": true
+  },
+  {
+    "name": "preset buddy",
+    "ok": true
+  },
+  {
+    "name": "preset snarky",
+    "ok": true
+  },
+  {
     "name": "custom mix",
     "ok": true
   },
@@ -73,6 +89,14 @@
   },
   {
     "name": "radio navigation",
+    "ok": true
+  },
+  {
+    "name": "preview directly after sliders",
+    "ok": true
+  },
+  {
+    "name": "test before question controls",
     "ok": true
   },
   {
@@ -93,6 +117,30 @@
   },
   {
     "name": "preview label calm",
+    "ok": true
+  },
+  {
+    "name": "preview label rude",
+    "ok": true
+  },
+  {
+    "name": "preview label boor",
+    "ok": true
+  },
+  {
+    "name": "preview label buddy",
+    "ok": true
+  },
+  {
+    "name": "preview label snarky",
+    "ok": true
+  },
+  {
+    "name": "rough without profanity label",
+    "ok": true
+  },
+  {
+    "name": "profanity without roughness label",
     "ok": true
   },
   {

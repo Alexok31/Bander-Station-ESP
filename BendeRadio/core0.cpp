@@ -177,6 +177,8 @@ const char* reconnect = nullptr;
 volatile bool wifiConnecting = false;
 static uint32_t s_sta_connect_started_ms = 0;
 static bool s_sta_softap_on_fail = true;
+static bool s_sta_keep_ap = false;
+static uint32_t s_ap_sta_retry_ms = 0;
 
 static uint32_t s_wake_after_sleep_anim_until_ms = 0;
 static bool s_pending_change_state_after_wake = false;
@@ -1306,7 +1308,7 @@ void syncWifiWithAudioSilence() {
     }
 }
 
-void wifi_request_sta_reconnect(bool softap_on_fail) {
+void wifi_request_sta_reconnect(bool softap_on_fail, bool keep_ap) {
     if (strcmp(g_audio_source, "bt") == 0) {
         return;
     }
@@ -1320,7 +1322,8 @@ void wifi_request_sta_reconnect(bool softap_on_fail) {
 
     const wifi_mode_t mode = WiFi.getMode();
     const bool ap_mode = (mode == WIFI_AP || mode == WIFI_AP_STA);
-    if (ap_mode) {
+    s_sta_keep_ap = keep_ap && ap_mode;
+    if (ap_mode && !s_sta_keep_ap) {
         if (audio.isRunning()) {
             audio.stopSong();
         }
@@ -1328,7 +1331,7 @@ void wifi_request_sta_reconnect(bool softap_on_fail) {
     }
 
     WiFi.persistent(false);
-    WiFi.mode(WIFI_STA);
+    WiFi.mode(s_sta_keep_ap ? WIFI_AP_STA : WIFI_STA);
     WiFi.setSleep(false);
     WiFi.setMinSecurity(WIFI_AUTH_WPA_PSK);
     WiFi.disconnect(false, false);
@@ -1339,6 +1342,7 @@ void wifi_request_sta_reconnect(bool softap_on_fail) {
     wifiConnecting = true;
     s_sta_connect_started_ms = millis();
     s_sta_softap_on_fail = softap_on_fail;
+    s_ap_sta_retry_ms = millis();
     wifi_touch_activity();
     syncWifiWithAudioSilence();
 }
@@ -1360,23 +1364,37 @@ void wifi_ap_toggle_from_core0() {
 
     // AP on -> off: к домашней сети; если не вышло — SoftAP снова.
     if (ap_mode) {
-        wifi_request_sta_reconnect(true);
+        if (WiFi.status() == WL_CONNECTED) {
+            WiFi.softAPdisconnect(true); // Disable AP only, keep the live STA connection.
+            WiFi.mode(WIFI_STA);
+            s_sta_keep_ap = false;
+            syncWifiWithAudioSilence();
+        } else {
+            wifi_request_sta_reconnect(true, false);
+        }
         print_val('A', 0);
         return;
     }
 
-    // AP off -> on: стабильный режим настройки (AP-only).
+    // Keep the upstream connection alive: the portal and AI need AP + STA together.
+    const bool staOnline = WiFi.status() == WL_CONNECTED;
+    const int channel = staOnline ? WiFi.channel() : 1;
     if (audio.isRunning()) {
         audio.stopSong();
     }
     radioState.state = false;
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_AP);
-    if (apPwd.length() >= 8) {
-        WiFi.softAP(apSsid.c_str(), apPwd.c_str());
-    } else {
-        WiFi.softAP(apSsid.c_str());
+    WiFi.persistent(false);
+    if (!WiFi.mode(WIFI_AP_STA) ||
+        !WiFi.softAP(apSsid.c_str(), apPwd.length() >= 8 ? apPwd.c_str() : nullptr, channel)) {
+        Serial.println(F("[WiFi] SoftAP start failed"));
+        WiFi.mode(WIFI_STA);
+        syncWifiWithAudioSilence();
+        print_val('A', 0);
+        return;
     }
+    Serial.printf("[WiFi] AP+STA portal=%s upstream=%s\n", WiFi.softAPIP().toString().c_str(),
+                  staOnline ? WiFi.localIP().toString().c_str() : "connecting");
+    if (!staOnline) wifi_request_sta_reconnect(false, true);
     wifi_touch_activity();
     syncWifiWithAudioSilence();
     change_state();
@@ -1737,13 +1755,17 @@ void core0(void* p) {
             } else if ((uint32_t)(millis() - s_sta_connect_started_ms) > 20000u) {
                 wifiConnecting = false;
                 s_sta_connect_started_ms = 0;
-                if (s_sta_softap_on_fail) {
+                if (s_sta_keep_ap) {
+                    // Retain the portal while the router is absent. Retry STA later.
+                    Serial.println(F("[WiFi] STA timeout — portal stays up, retry later"));
+                } else if (s_sta_softap_on_fail) {
                     Serial.println(F("[WiFi] STA timeout — SoftAP back"));
                     WifiStored wfail;
                     nvsLoadWifi(wfail);
                     const String apSsidFail = nvsEffectiveApSsid(wfail);
                     const String apPwdFail = nvsEffectiveApPass(wfail);
-                    WiFi.mode(WIFI_AP);
+                    WiFi.mode(WIFI_AP_STA);
+                    s_ap_sta_retry_ms = millis();
                     if (apPwdFail.length() >= 8) {
                         WiFi.softAP(apSsidFail.c_str(), apPwdFail.c_str());
                     } else {
@@ -1758,6 +1780,10 @@ void core0(void* p) {
                 syncWifiWithAudioSilence();
                 change_state();
             }
+        }
+        if (WiFi.getMode() == WIFI_AP_STA && !wifiConnecting && WiFi.status() != WL_CONNECTED &&
+            strcmp(g_audio_source, "wifi") == 0 && uint32_t(millis() - s_ap_sta_retry_ms) >= 30000u) {
+            wifi_request_sta_reconnect(false, true);
         }
         if (s_matrix_brightness_trim_dirty && matrix_display_ready()) {
             s_matrix_brightness_trim_dirty = false;

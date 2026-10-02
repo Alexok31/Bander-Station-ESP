@@ -9,7 +9,7 @@ def preview():
                   CUSTOM_COUNT='0', STATION_MAX='16', STATIONS='', SSID='Домашняя сеть',
                   AP_SSID='Bender Station', AI_URL='', WAKE_CHECKED='checked', SHAKE='11000',
                   SHAKE_MIN='4000', SHAKE_MAX='24000', SHAKE_STEP='500', SHAKE_DEFAULT='11000',
-                  SARCASM='80', SOCIABILITY='55', CURIOSITY='40', STUBBORNNESS='70', WARMTH='35')
+                  SARCASM='80', SOCIABILITY='55', CURIOSITY='40', STUBBORNNESS='70', WARMTH='35', ROUGHNESS='45', PROFANITY='35')
     values['CALM_OPTIONS'] = ''.join(f'<option value="{n}"{" selected" if n == 5 else ""}>{str(n)+" мин" if n else "Не засыпать"}</option>' for n in (2,5,10,15,0))
     names = ['Рот 1','Рот 2','Рот 3','Левый глаз','Правый глаз']
     controls = '<div class="head-wrap"><div class="head-row">'
@@ -40,17 +40,21 @@ def preview():
     check('saved preset restored',document.getElementById('character-preset').textContent==='Классический');
     characterPresets.forEach(p=>{p.click();check('preset '+p.dataset.preset,traitInputs.map(i=>i.value).join(',')===p.dataset.values&&p.getAttribute('aria-pressed')==='true');});
     traitInputs[0].value='43';traitInputs[0].dispatchEvent(new Event('input'));check('custom mix',document.getElementById('character-preset').textContent==='Свой микс'&&document.getElementById('sarcasm-value').value==='43');
-    const personality=new FormData(document.getElementById('character-form'));check('personality independent',personality.get('section')==='character'&&personality.get('sarcasm')==='43'&&Array.from(personality.keys()).length===6);
+    const personality=new FormData(document.getElementById('character-form'));check('personality independent',personality.get('section')==='character'&&personality.get('sarcasm')==='43'&&Array.from(personality.keys()).length===8);
     document.getElementById('reset-character').click();check('character reset',traitInputs.map(i=>i.value).join(',')===savedCharacter&&document.getElementById('character-status').textContent==='Сохранённый характер.');
     location.hash='radio';showPanel();check('radio navigation',!document.getElementById('panel-radio').hidden);
-    const labels={classic:'Вжарить',kind:'Давай поболтаем',grumpy:'Ну, сука, тестируй',explorer:'А что, если нажать?',calm:'Давай поболтаем'};
+    const labels={classic:'Вжарить',kind:'Давай поболтаем',grumpy:'Ну, сука, тестируй',explorer:'А что, если нажать?',calm:'Давай поболтаем',rude:'Проверяй уже',boor:'Ну, сука, тестируй',buddy:'Давай поболтаем',snarky:'Вжарить'};
+    check('preview directly after sliders',document.querySelector('.eq-board').nextElementSibling.classList.contains('preview-box'));
+    check('test before question controls',!!(previewButton.compareDocumentPosition(previewQuestion)&Node.DOCUMENT_POSITION_FOLLOWING));
     characterPresets.forEach(p=>{p.click();check('preview label '+p.dataset.preset,previewButton.textContent===labels[p.dataset.preset]);});
+    document.getElementById('roughness').value='100';document.getElementById('profanity').value='0';updateCharacter();check('rough without profanity label',previewButton.textContent==='Проверяй уже');
+    document.getElementById('roughness').value='0';document.getElementById('profanity').value='100';updateCharacter();check('profanity without roughness label',previewButton.textContent==='Тестировать, бля');
     document.querySelector('[data-preset="grumpy"]').click();
     previewScenario.value='support';previewScenario.dispatchEvent(new Event('change'));check('question scenario selection',previewQuestion.value.includes('Підтримаєш'));
     const customQuestion='Бендере, <що> скажеш & чому?';previewQuestion.value=customQuestion;previewQuestion.dispatchEvent(new Event('input'));check('custom question selection',previewScenario.value==='custom');
     let posted=null;
     window.fetch=async(url,options)=>{if(options.method==='POST'){posted=new URLSearchParams(options.body);return {ok:true};}return {ok:true,json:async()=>({state:4})};};
-    await previewCharacter();check('preview uses unsaved sliders',posted.get('sarcasm')==='90'&&posted.get('warmth')==='15'&&!posted.has('section'));
+    await previewCharacter();check('preview uses unsaved sliders',posted.get('sarcasm')==='90'&&posted.get('warmth')==='15'&&posted.get('roughness')==='85'&&posted.get('profanity')==='90'&&!posted.has('section'));
     check('custom question sent verbatim',posted.get('question')===customQuestion);
     check('preview finishes and keeps dirty values',!previewButton.disabled&&document.getElementById('preview-status').textContent.includes('Вот так')&&document.getElementById('sarcasm').value==='90');
     window.fetch=async()=>({ok:false,text:async()=>'Бендер сейчас занят.'});await previewCharacter();check('preview busy error',!previewButton.disabled&&document.getElementById('preview-status').textContent==='Бендер сейчас занят.');

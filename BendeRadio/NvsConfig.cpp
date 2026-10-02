@@ -303,18 +303,19 @@ BenderCharacter::Settings nvsLoadCharacter() {
     BenderCharacter::Settings result;
     Preferences p;
     if (!p.begin(kNs, true)) return result;
-    BenderCharacter::Settings stored;
-    const bool ok = p.getBytesLength("character_v1") == sizeof(stored.values) &&
-        p.getBytes("character_v1", stored.values, sizeof(stored.values)) == sizeof(stored.values);
+    const char* key = p.isKey("character_v2") ? "character_v2" : "character_v1";
+    const size_t size = p.getBytesLength(key);
+    uint8_t stored[BenderCharacter::count] = {};
+    const bool ok = (size == 5 || size == sizeof(stored)) && p.getBytes(key, stored, size) == size;
     p.end();
-    return ok && BenderCharacter::valid(stored) ? stored : result;
+    return ok ? BenderCharacter::fromStored(stored, size) : result;
 }
 
 bool nvsSaveCharacter(const BenderCharacter::Settings& settings) {
     if (!BenderCharacter::valid(settings)) return false;
     Preferences p;
     if (!p.begin(kNs, false)) return false;
-    const bool ok = p.putBytes("character_v1", settings.values, sizeof(settings.values)) == sizeof(settings.values);
+    const bool ok = p.putBytes("character_v2", settings.values, sizeof(settings.values)) == sizeof(settings.values);
     p.end();
     return ok;
 }

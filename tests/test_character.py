@@ -37,6 +37,42 @@ def server_namespace():
 
 
 class CharacterTests(unittest.TestCase):
+    def test_legacy_profile_retains_traits_and_adds_new_defaults(self):
+        old = dict(zip(KEYS[:5], (3, 7, 11, 91, 100)))
+        self.assertEqual(validate_character(old), {**old, 'roughness': 45, 'profanity': 35})
+        self.assertIsNone(validate_character({**old, 'profanity': 0}))
+
+    def test_profanity_and_roughness_are_independent(self):
+        harsh = dict.fromkeys(KEYS, 100)
+        harsh['profanity'] = 0
+        rules = character_rules(harsh)
+        self.assertIn('Грубість: 100/100. Різкий', rules)
+        self.assertIn('Без мату і лайки', rules)
+        friendly = {**harsh, 'roughness': 0, 'profanity': 100}
+        rules = character_rules(friendly)
+        self.assertIn("Грубість: 0/100. М'який", rules)
+        self.assertIn("Лихослів'я: 100/100. У КОЖНІЙ", rules)
+        self.assertIn('1–2 справжні матерні слова', rules)
+        self.assertNotIn('Без мату і лайки', rules)
+
+    def test_extremes_differ_from_merely_high_or_low_values(self):
+        for key in KEYS:
+            profiles = [{**dict.fromkeys(KEYS, 50), key: value} for value in (0, 25, 75, 100)]
+            # Compare actual instructions excluding the numeric label.
+            instructions = [character_rules(p).splitlines()[KEYS.index(key) + 1].split('/100. ', 1)[1]
+                            for p in profiles]
+            self.assertNotEqual(instructions[0], instructions[1], key)
+            self.assertNotEqual(instructions[2], instructions[3], key)
+
+    def test_maximum_profanity_is_not_satisfied_by_euphemisms(self):
+        profile = dict.fromkeys(KEYS, 0)
+        profile.update(profanity=100, warmth=100)
+        prompt = server_namespace()['bender_prompt'](profile)
+        self.assertIn('вони НЕ виконують цю настройку', prompt)
+        self.assertIn('«блядь»', prompt)
+        self.assertIn('при низькій грубості лайся на ситуацію', prompt)
+        self.assertIn('крайніх значень мають пріоритет', prompt)
+
     def test_preview_question_limits_and_unicode(self):
         for bad in (None, 42, [], '', ' \n\t', 'a' * 201, 'аб' * 101, 'hello\x00world', 'a\x7fb', '\ud800'):
             self.assertIsNone(validate_preview_question(bad))
@@ -73,12 +109,12 @@ class CharacterTests(unittest.TestCase):
     def test_eq_removes_conflicting_legacy_style_from_prompt_and_turn(self):
         ns = server_namespace()
         self.assertIn('LEGACY LEVEL TEN', ns['bender_prompt']())
-        ns['set_device_character'](dict(zip(KEYS, (20, 65, 55, 15, 90))))
+        ns['set_device_character'](dict(zip(KEYS, (20, 65, 55, 15, 90, 10, 0))))
         prompt = ns['bender_prompt']()
         self.assertNotIn('LEGACY LEVEL TEN', prompt)
         self.assertNotIn('Нахабний, егоїстичний, цинічний', prompt)
         self.assertNotRegex(prompt, r'\{[A-Z_]+\}')
-        self.assertIn('без підколів', prompt)
+        self.assertIn('без іронічного перевертання сенсу', prompt)
         self.assertIn('Теплота: 90/100', prompt)
         turn = ns['grok_turn_text']('Привіт')
         self.assertNotIn('BENDER_LEVEL', turn)
@@ -202,11 +238,12 @@ class CharacterProtocolTests(unittest.IsolatedAsyncioTestCase):
         ns['set_device_character'](profile)  # Reconnect with the same device settings.
         _ = [part async for part in ns['_grok_pieces'](history, 140, .68)]
         self.assertEqual(requests[1]['previous_response_id'], 'fresh-chain')
+        self.assertEqual(requests[1]['instructions'], ns['bender_prompt']())
         self.assertEqual(len(requests[1]['input']), 1)
 
     async def test_session_update_applies_complete_profile_and_keeps_ack(self):
         ns = server_namespace()
-        profile = dict(zip(KEYS, (80, 55, 40, 70, 35)))
+        profile = dict(zip(KEYS, (80, 55, 40, 70, 35, 45, 35)))
         wire = []
         class Socket:
             remote_address = 'test'

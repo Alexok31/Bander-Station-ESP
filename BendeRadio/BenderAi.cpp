@@ -7,6 +7,7 @@
 #include <WiFiClientSecure.h>
 #include <cstring>
 #include <atomic>
+#include <memory>
 #include <esp_wifi.h>
 #include <mbedtls/base64.h>
 
@@ -193,7 +194,11 @@ constexpr uint8_t PTT_DROP_TAIL = 4;
 enum : uint8_t { ST_IDLE = 0, ST_RECORDING, ST_WAIT_RESP };
 
 static I2SClass i2sMic;
-static websockets::WebsocketsClient wsClient;
+// Owned only by wsTask. Recreate for each connection: ArduinoWebsockets upgrades
+// ws -> wss in place but doesn't downgrade wss -> ws when the LAN comes back.
+static std::unique_ptr<websockets::WebsocketsClient> wsClient;
+static std::atomic<bool> s_ws_close_requested{false};
+static std::atomic<bool> s_ws_cancel_requested{false};
 
 static uint8_t* ring = nullptr;
 static uint8_t* pcmDecode = nullptr;
@@ -449,9 +454,10 @@ static void noteProgress() {
 
 static uint32_t s_sock_wait_ms;
 
-static void forceRecover(const char* why, bool show_error = false) {
+static void forceRecover(const char* why, bool show_error = false, bool keep_queued_preview = false) {
     const uint8_t previewState = s_preview_state.load();
-    if (previewState == 1 || previewState == 2 || (previewState == 3 && show_error)) s_preview_state.store(5);
+    if ((previewState == 1 && !keep_queued_preview) || previewState == 2 ||
+        (previewState == 3 && show_error)) s_preview_state.store(5);
     const bool background_event = s_event_reply || s_drop_event_reply || s_pending_event.load() != 0;
     const bool user_active = pttHeld || s_ptt_armed || convState == ST_RECORDING;
     if (bender_face_show_error(show_error, background_event, user_active)) {
@@ -576,7 +582,7 @@ static void doHangup() {
     sessionReady = false;
     wsReady = false;
     resetTxState();
-    wsClient.close();
+    wsClient->close();
     requestGiveback();
 }
 
@@ -652,13 +658,13 @@ static void resetRecStats() {
 }
 
 static void wsSendRaw(const char* s) {
-    wsClient.send(s);
+    wsClient->send(s);
 }
 
 static void wsSend(const JsonDocument& j) {
     String s;
     serializeJson(j, s);
-    wsClient.send(s);
+    wsClient->send(s);
 }
 
 constexpr size_t APPEND_CHUNKS = 10;
@@ -804,7 +810,7 @@ static void onSessionReadyConv() {
     if (!pttHeld || commitWhenReady) {
         while (preN) {
             drainPrebufToWs(40);
-            wsClient.poll();
+            wsClient->poll();
         }
         tryPttCommit();
     }
@@ -1033,11 +1039,12 @@ static void onEvent(websockets::WebsocketsEvent e, String) {
         wsReady = false;
         sessionReady = false;
         ALOGLN(F("[WSS] closed"));
-        forceRecover("ws closed", interrupted);
+        // A queued preview hasn't been sent yet; a failed handshake may retry.
+        forceRecover("ws closed", interrupted, true);
         s_event_reply = s_drop_event_reply = false;
         s_pending_event.store(0);
     } else if (e == websockets::WebsocketsEvent::GotPing) {
-        wsClient.pong();
+        wsClient->pong();
     }
 }
 
@@ -1156,6 +1163,13 @@ static void wsTask(void*) {
     uint32_t lastPing = millis();
     uint32_t backoff = 0;
     for (;;) {
+        if (s_ws_close_requested.exchange(false)) {
+            if (wsClient) wsClient->close();
+            wsReady = sessionReady = false;
+        }
+        if (s_ws_cancel_requested.exchange(false) && wsReady && wsClient) {
+            wsSendRaw("{\"type\":\"response.cancel\"}");
+        }
         if (s_demo == 1 && s_demo_pcm && s_demo_cap >= CHUNK_BYTES) {
             ampMuteHw(true);
             micDump();
@@ -1213,13 +1227,24 @@ static void wsTask(void*) {
             }
             ALOG("[WSS] connecting… heap=%u\n", (unsigned)ESP.getFreeHeap());
             sessionReady = false;
-            wsClient.close();
-            const String url = wsUrl();
-            if (wsUrlUsesTls(url)) {
-                wsClient.setInsecure();
+            if (wsClient) wsClient->close();
+            wsClient.reset(); // Drop TLS state, buffers and old headers before reconnecting.
+            wsClient = std::make_unique<websockets::WebsocketsClient>();
+            if (providerIsLocal()) {
+                const String basic = localBasicAuthHeader();
+                if (basic.length()) wsClient->addHeader("Authorization", basic);
+            } else {
+                wsClient->addHeader("Authorization", String("Bearer ") + apiKey());
             }
-            if (!wsClient.connect(url)) {
-                wsClient.close();
+            wsClient->onEvent(onEvent);
+            wsClient->onMessage(onMessage);
+            const String url = wsUrl();
+            ALOG("[WSS] fresh transport %s\n", wsUrlUsesTls(url) ? "TLS" : "TCP");
+            if (wsUrlUsesTls(url)) {
+                wsClient->setInsecure();
+            }
+            if (!wsClient->connect(url)) {
+                wsClient->close();
                 ALOG("[WSS] connect fail %s heap=%u\n", url.c_str(),
                      (unsigned)ESP.getFreeHeap());
                 backoff = minOfU32(backoff ? backoff * 2 : 500u, 8000u);
@@ -1282,13 +1307,13 @@ static void wsTask(void*) {
         }
         const bool capturing = s_ptt_armed || (convState == ST_RECORDING && pttHeld);
         if (!capturing) {
-            wsClient.poll();
+            wsClient->poll();
             if (millis() - lastPing > 30000) {
-                wsClient.ping();
+                wsClient->ping();
                 lastPing = millis();
             }
         } else if (recMs && (recMs % 200u) == 0) {
-            wsClient.poll();
+            wsClient->poll();
         }
 
         int32_t chunkPeak = 0;
@@ -1339,7 +1364,7 @@ static void wsTask(void*) {
             const uint32_t t0 = millis();
             while (preN) {
                 drainPrebufToWs(40);
-                wsClient.poll();
+                wsClient->poll();
             }
             ALOG("[PTT] flush %u ms audio in %u ms\n", (unsigned)queued_ms, (unsigned)(millis() - t0));
             tryPttCommit();
@@ -1521,10 +1546,8 @@ void bender_ai_sleep() {
     wantOnline = false;
     hangupPending = false;
     sessionReady = false;
-    if (wsReady) {
-        wsClient.close();
-    }
-    wsReady = false;
+    // Closing here races the network task's poll/connect. Let its owner close it.
+    s_ws_close_requested.store(true);
     micSleep();
     ALOGLN(F("[AI] sleep"));
 }
@@ -1617,9 +1640,7 @@ void bender_ai_ptt_down() {
     wantOnline = true;
     hangupPending = false;
     if (speaking) {
-        JsonDocument c;
-        c["type"] = "response.cancel";
-        wsSend(c);
+        s_ws_cancel_requested.store(true);
     }
     // Start every recording on an empty, sample-aligned buffer, also when the
     // previous response already sent response.done but left a partial tail.
@@ -1704,18 +1725,9 @@ void bender_ai_begin() {
         nvsSaveAiDebug(false);
     }
     ALOG("[DBG] mode %s\n", s_ai_debug ? "ON" : "OFF");
-    wsClient.setInsecure();
     if (providerIsLocal()) {
-        const String basic = localBasicAuthHeader();
-        if (basic.length()) {
-            wsClient.addHeader("Authorization", basic);
-        }
         ALOG("[WSS] local %s auth=basic (sleep until PTT)\n", wsUrl().c_str());
-    } else {
-        wsClient.addHeader("Authorization", String("Bearer ") + apiKey());
     }
-    wsClient.onEvent(onEvent);
-    wsClient.onMessage(onMessage);
     // WS вище за колонку: інакше I2S-write голодує poll() → сервер бачить client disconnected.
     xTaskCreatePinnedToCore(speakerTask, "ai_spk", 4096, nullptr, 2, nullptr, 1);
     xTaskCreatePinnedToCore(wsTask, "ai_ws", 16384, nullptr, 5, nullptr, 1);

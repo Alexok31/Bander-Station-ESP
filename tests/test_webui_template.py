@@ -40,7 +40,7 @@ class WebUiTemplateTests(unittest.TestCase):
         self.assertNotIn('sta_ssid', forms['display'])
     def test_character_has_independent_complete_form(self):
         form = next(f for f in self.doc.forms if f['section'] == 'character')
-        self.assertEqual(set(form), {'section', 'sarcasm', 'sociability', 'curiosity', 'stubbornness', 'warmth'})
+        self.assertEqual(set(form), {'section', 'sarcasm', 'sociability', 'curiosity', 'stubbornness', 'warmth', 'roughness', 'profanity'})
         self.assertNotIn('В разработке', PAGE)
         classic = re.search(r'data-preset="classic" data-values="([0-9,]+)"', PAGE)[1]
         header = (ROOT / 'BendeRadio/CharacterSettings.h').read_text(encoding='utf-8')

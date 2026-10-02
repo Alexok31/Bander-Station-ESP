@@ -147,7 +147,7 @@ static void sendPage() {
     const WebUiToken tokens[] = {
         {"CONNECTION_CLASS", online ? "" : "offline"},
         {"CONNECTION_TEXT", online ? String(F("Wi-Fi подключён")) : String(F("Wi-Fi не подключён"))},
-        {"IP", htmlEscaped(online ? WiFi.localIP().toString() : WiFi.softAPIP().toString())},
+        {"IP", htmlEscaped(server.client().localIP().toString())},
         {"CURRENT_STATION", htmlEscaped(radio_station_name((uint8_t)radioState.station))},
         {"RADIO_STATUS", play_mode_is_airplay() ? String(F("Сейчас выбран режим AirPlay")) :
             (radioState.state ? String(F("FM / Интернет-радио · включено")) : String(F("FM / Интернет-радио · на паузе")))},
@@ -161,7 +161,8 @@ static void sendPage() {
         {"CALM_OPTIONS", options}, {"MATRIX_CONTROLS", matrixControls()},
         {"SARCASM", String(character.values[0])}, {"SOCIABILITY", String(character.values[1])},
         {"CURIOSITY", String(character.values[2])}, {"STUBBORNNESS", String(character.values[3])},
-        {"WARMTH", String(character.values[4])}
+        {"WARMTH", String(character.values[4])}, {"ROUGHNESS", String(character.values[5])},
+        {"PROFANITY", String(character.values[6])}
     };
     web_send_close_connection();
     server.sendHeader("Cache-Control", "no-store");
