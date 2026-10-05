@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Бендер · Голосовой вызов</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#101818;color:#edf4ef}
+*{box-sizing:border-box}body{max-width:800px;margin:auto;padding:40px 22px}h1{font-size:32px;letter-spacing:-1px;margin:12px 0}p{line-height:1.55;color:#a9bcb5}small{color:#a9bcb5}.eyebrow{color:#c3ee85;font-size:12px;text-transform:uppercase;letter-spacing:2px}
+.notice{border-left:3px solid #c3ee85;padding:2px 18px;margin:28px 0}.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}label{display:block;margin:24px 0 8px;font-size:14px}select,button{font:inherit;border-radius:10px;border:1px solid #42554c;padding:13px 16px;background:#1d2b26;color:#edf4ef}select{width:100%}button{cursor:pointer}button:disabled{opacity:.4;cursor:default}button.primary{background:#c3ee85;color:#132016;border:0;font-weight:650}button:focus-visible,select:focus-visible{outline:2px solid #c3ee85;outline-offset:3px}
+.prompt{padding:28px 0;font-size:30px;font-weight:650;min-height:95px}.meter{height:5px;background:#30453b;margin:22px 0 12px;overflow:hidden;border-radius:4px}.meter>div{height:100%;background:#c3ee85;width:0;transition:width .1s linear}#status{min-height:52px;margin:12px 0;color:#c3ee85}audio{width:100%;margin:18px 0}.counts{border-top:1px solid #30453b;margin-top:28px;padding-top:18px;line-height:1.8;font-size:14px}details{margin:22px 0}summary{cursor:pointer}li{line-height:1.6;color:#a9bcb5;margin-bottom:8px}[hidden]{display:none!important}@media(max-width:500px){body{padding-top:26px}h1{font-size:27px}.prompt{font-size:25px}.row button{flex:1}}
+</style>
+<div class="eyebrow">Бендер / подготовка модели</div>
+<h1>Научи меня откликаться</h1>
+<p>Собираем примеры «Эй, Бендер», «Привет, Бендер» и «Бендер» для будущего распознавания на плате.</p>
+<div class="notice"><p>Это сбор записей, а не готовое распознавание. Звук сохраняется только на этом ПК после нажатия «Сохранить». Микрофон включается на 4 секунды по кнопке.</p></div>
+<label for="split">Набор примеров</label>
+<select id="split"><option value="train">Для обучения — первая сессия</option><option value="test">Для проверки — новая сессия позже</option></select>
+<label for="label">Что записываем</label>
+<select id="label"><option value="hey_bender">Эй, Бендер</option><option value="privet_bender">Привет, Бендер</option><option value="bender">Бендер</option><option value="negative">Обычная речь / фон — без вызова</option></select>
+<div class="prompt" id="prompt">Эй, Бендер</div>
+<small id="tip">Нажми «Записать», дождись надписи «Говори» и произнеси фразу один раз.</small>
+<div class="meter" aria-hidden="true"><div id="progress"></div></div>
+<div class="row"><button class="primary" id="record">Записать 4 секунды</button><button id="save" disabled>Сохранить</button><button id="discard" disabled>Сбросить</button></div>
+<div id="status" role="status" aria-live="polite">Готов к записи.</div>
+<audio id="playback" controls hidden></audio>
+<div class="counts" id="counts">Загрузка счётчиков…</div>
+<details><summary>Как записать полезные примеры</summary><ol>
+<li>Для начала запиши по 10 примеров каждой фразы для обучения. Меняй интонацию, скорость и расстояние. Не кричи.</li>
+<li>Позже переключи набор на «Для проверки» и запиши ещё по 10 примеров. Эти записи не будут использоваться для обучения.</li>
+<li>Добавь обычную речь и фон без фраз вызова. Например: «Привет, как дела?», «Эй, подожди», «Я смотрел мультик про Бендера». Это поможет проверять ложные срабатывания.</li>
+<li>Этого достаточно для начала работы с твоими примерами, но не для гарантии точности. Нужны также разнообразные обучающие данные и проверка на микрофоне самой колонки.</li>
+</ol></details>
+<button id="shutdown">Остановить помощник</button>
+<script>
+'use strict';
+const token='__TOKEN__';
+const el=id=>document.getElementById(id);
+let wavBlob=null,audioUrl=null,busy=false,stream=null,recorder=null,captureContext=null;
+let clipLabel='',clipSplit='',captureId=0,autoStop=null,progressTimer=null;
+function state(message){el('status').textContent=message;}
+function controls(){el('record').disabled=busy;el('save').disabled=busy||!wavBlob;el('discard').disabled=busy||!wavBlob;el('label').disabled=busy||!!wavBlob;el('split').disabled=busy||!!wavBlob;el('shutdown').disabled=busy;}
+function clearClip(){wavBlob=null;if(audioUrl)URL.revokeObjectURL(audioUrl);audioUrl=null;el('playback').removeAttribute('src');el('playback').hidden=true;controls();}
+function stopTracks(){if(stream)stream.getTracks().forEach(t=>t.stop());stream=null;}
+async function refreshCounts(){try{const r=await fetch('/counts');if(!r.ok)throw Error();showCounts(await r.json());}catch{el('counts').textContent='Не удалось получить счётчики. Проверь, что локальный помощник запущен.';}}
+function showCounts(c){const s=el('split').value;el('counts').textContent=`В этом наборе: «Эй, Бендер» — ${c[s].hey_bender}; «Привет, Бендер» — ${c[s].privet_bender}; «Бендер» — ${c[s].bender??0}; речь и фон — ${c[s].negative}.`;}
+el('label').onchange=()=>{el('prompt').textContent=el('label').value==='negative'?'Обычная речь или фон':el('label').selectedOptions[0].text;el('tip').textContent=el('label').value==='negative'?'Произнеси обычное предложение без фразы вызова или запиши окружающие звуки.':'Нажми «Записать», дождись надписи «Говори» и произнеси фразу один раз.';};
+el('split').onchange=refreshCounts;
+function encodeWav(samples){const b=new ArrayBuffer(44+samples.length*2),v=new DataView(b);const txt=(at,s)=>{for(let i=0;i<s.length;i++)v.setUint8(at+i,s.charCodeAt(i));};txt(0,'RIFF');v.setUint32(4,36+samples.length*2,true);txt(8,'WAVE');txt(12,'fmt ');v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);v.setUint32(24,16000,true);v.setUint32(28,32000,true);v.setUint16(32,2,true);v.setUint16(34,16,true);txt(36,'data');v.setUint32(40,samples.length*2,true);for(let i=0;i<samples.length;i++){const x=Math.max(-1,Math.min(1,samples[i]));v.setInt16(44+i*2,Math.round(x<0?x*32768:x*32767),true);}return new Blob([b],{type:'audio/wav'});}
+async function toWav(blob,ctx){const decoded=await ctx.decodeAudioData(await blob.arrayBuffer());const offline=new OfflineAudioContext(1,Math.ceil(decoded.duration*16000),16000);const src=offline.createBufferSource();src.buffer=decoded;src.connect(offline.destination);src.start();const converted=await offline.startRendering();return encodeWav(converted.getChannelData(0));}
+el('record').onclick=async()=>{
+ clearClip();busy=true;controls();const id=++captureId;state('Разреши доступ к микрофону…');
+ let ctx=null;
+ try{
+  if(!navigator.mediaDevices?.getUserMedia||!window.MediaRecorder)throw Error('Открой эту страницу в Chrome или Edge на этом ПК.');
+  ctx=new AudioContext();captureContext=ctx;await ctx.resume();
+  stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:false,noiseSuppression:false,autoGainControl:false},video:false});
+  if(id!==captureId){stopTracks();await ctx.close();return;}
+  const parts=[];recorder=new MediaRecorder(stream);
+  recorder.ondataavailable=e=>{if(e.data.size)parts.push(e.data);};
+  recorder.onerror=()=>{state('Ошибка записи. Попробуй ещё раз.');++captureId;stopTracks();clearTimeout(autoStop);clearInterval(progressTimer);ctx.close();busy=false;controls();};
+  recorder.onstop=async()=>{
+   clearTimeout(autoStop);clearInterval(progressTimer);stopTracks();
+   if(id!==captureId)return;
+   state('Подготавливаю запись…');
+   try{wavBlob=await toWav(new Blob(parts,{type:recorder.mimeType}),ctx);clipLabel=el('label').value;clipSplit=el('split').value;audioUrl=URL.createObjectURL(wavBlob);el('playback').src=audioUrl;el('playback').hidden=false;state('Послушай запись. Если всё хорошо — сохрани.');}
+   catch{state('Не удалось обработать звук. Попробуй записать ещё раз.');}
+   finally{await ctx.close();if(captureContext===ctx)captureContext=null;busy=false;controls();}
+  };
+  recorder.start();state('Говори. Запись идёт…');const start=performance.now();
+  progressTimer=setInterval(()=>{el('progress').style.width=Math.min(100,(performance.now()-start)/40)+'%';},100);
+  autoStop=setTimeout(()=>{if(recorder.state==='recording')recorder.stop();},4000);
+ }catch(e){stopTracks();if(ctx&&ctx.state!=='closed')await ctx.close();captureContext=null;busy=false;controls();state(e.name==='NotAllowedError'?'Доступ к микрофону не разрешён. Разреши его в браузере и повтори.':e.message);}
+};
+el('discard').onclick=()=>{clearClip();el('progress').style.width='0';state('Запись сброшена. Можно повторить.');};
+el('save').onclick=async()=>{busy=true;controls();state('Сохраняю на ПК…');try{const r=await fetch('/save',{method:'POST',headers:{'Content-Type':'audio/wav','X-Recorder-Token':token,'X-Label':clipLabel,'X-Split':clipSplit},body:wavBlob,signal:AbortSignal.timeout(15000)});const result=await r.json();if(!r.ok)throw Error(result.error);clearClip();showCounts(result.counts);state('Сохранено. Запиши следующий пример.');el('progress').style.width='0';}catch(e){state('Не удалось подтвердить сохранение: '+e.message+' При обрыве связи сначала проверь счётчик.');}finally{busy=false;controls();}};
+addEventListener('pagehide',()=>{++captureId;clearTimeout(autoStop);clearInterval(progressTimer);if(recorder?.state==='recording')recorder.stop();stopTracks();if(captureContext&&captureContext.state!=='closed')captureContext.close();});
+el('shutdown').onclick=async()=>{if(wavBlob&&!confirm('Последняя запись не сохранена. Остановить помощник?'))return;busy=true;controls();try{const r=await fetch('/shutdown',{method:'POST',headers:{'X-Recorder-Token':token},signal:AbortSignal.timeout(5000)});if(!r.ok)throw Error();clearClip();state('Помощник остановлен. Сохранённые записи остались на ПК. Эту вкладку можно закрыть.');}catch{busy=false;controls();state('Не удалось подтвердить остановку помощника.');}};
+refreshCounts();
+</script>
+</html>

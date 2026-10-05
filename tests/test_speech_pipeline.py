@@ -207,6 +207,54 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self.timing = TurnTiming(self.logs.append)
         self.history = [{"role": "user", "content": "Розкажи щось."}]
 
+    async def test_only_wake_name_requests_local_cue_without_llm_tts_or_history(self):
+        import voice_commands
+        self.ns['voice_commands'] = voice_commands
+        self.ns['transcribe'] = lambda pcm: ('Привет, Бендер!', 'ru', 1, True)
+        def forbidden(*args): self.fail('Wake name alone must not reach LLM, TTS or memory')
+        self.ns['synth'] = self.ns['handle_personal_command'] = forbidden
+        wire=[]
+        async def send(raw): wire.append(json.loads(raw))
+        history=list(self.history)
+        await self.ns['run_turn'](SimpleNamespace(send=send), b'input', '', history, wake_invocation=True)
+        self.assertEqual(history, self.history)
+        self.assertEqual(wire, [{'type':'response.created'}, {'type':'response.output_audio.done'},
+                                {'type':'response.done', 'wake_only':True}])
+
+    async def test_continuous_question_is_answered_without_greeting(self):
+        import voice_commands
+        for initial in (True, False):
+            with self.subTest(initial=initial):
+                ns,_=load_server_functions()
+                ns['voice_commands']=voice_commands
+                text='Привіт, Бендер, як справи?'
+                ns['transcribe']=lambda pcm:(text,'uk',1,True)
+                prompts=[]
+                async def model(prompt,lang,prob,history):
+                    prompts.append(history[-1]['content'])
+                    yield 'Мідний чайник кипить.'
+                ns['iter_llm_sentences']=model
+                wire=[]
+                async def send(raw):wire.append(json.loads(raw))
+                history=[]
+                await ns['run_turn'](SimpleNamespace(send=send), b'input','',history,wake_invocation=initial)
+                expected='як справи?' if initial else text
+                self.assertEqual(prompts,[expected])
+                self.assertEqual(history[0]['content'],expected)
+                self.assertFalse(any(m.get('wake_only') for m in wire))
+
+    async def test_wake_and_goodbye_in_one_utterance_still_ends_dialogue(self):
+        import voice_commands
+        self.ns['voice_commands']=voice_commands
+        self.ns['transcribe']=lambda pcm:('Привет, Бендер, пока!','ru',1,True)
+        wire=[]
+        async def send(raw):wire.append(json.loads(raw))
+        history=[]
+        await self.ns['run_turn'](SimpleNamespace(send=send),b'input','',history,wake_invocation=True)
+        self.assertEqual(history[0]['content'],'пока!')
+        self.assertTrue(any(m.get('name')=='conversation.end' for m in wire))
+        self.assertFalse(any(m.get('wake_only') for m in wire))
+
     async def collect(self):
         return [part async for part in self.ns["_iter_checked_reply"](
             "Розкажи щось.", "uk", 1.0, self.history, self.timing)]
@@ -310,6 +358,32 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(wire, ["response.created", "response.output_audio.delta",
                                "device.command", "response.output_audio.done", "response.done"])
         self.assertEqual(history[-1]["content"], "Вмикаю.")
+
+    async def test_farewell_suppresses_followup_before_audio_even_if_tts_fails(self):
+        import voice_commands
+        for fail in (False, True):
+            with self.subTest(tts_fails=fail):
+                ns, _ = load_server_functions()
+                wire, resets, spoken = [], [], []
+                ns['voice_commands'] = voice_commands
+                ns['transcribe'] = lambda pcm: ('Пока, Бендер!', 'ru', 1, True)
+                ns['grok_break_chain'] = resets.append
+                def synth(text):
+                    spoken.append(text)
+                    if fail and len(spoken) == 1:
+                        raise RuntimeError('TTS unavailable')
+                    return b'\x01\x00' * 300
+                async def send(raw): wire.append(json.loads(raw))
+                ns['synth'] = synth
+                history = []
+                await ns['run_turn'](SimpleNamespace(send=send), b'input', '', history)
+                self.assertEqual(wire[1], {'type': 'device.command', 'name': 'conversation.end', 'args': {}})
+                self.assertEqual(sum(m['type'] == 'device.command' for m in wire), 1)
+                self.assertEqual(wire[-1]['type'], 'response.done')
+                self.assertIn('response.output_audio.delta', [m['type'] for m in wire])
+                self.assertEqual(resets, ['conversation ended'])
+                if not fail:
+                    self.assertEqual(history[-1]['content'], spoken[0])
 
     async def test_asr_miss_does_not_pollute_history(self):
         self.ns["transcribe"] = lambda pcm: ("", "uk", 0, False)

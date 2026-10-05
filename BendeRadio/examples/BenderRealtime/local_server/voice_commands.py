@@ -106,6 +106,31 @@ def _norm(text: str) -> str:
     return t
 
 
+def is_farewell(text: str) -> bool:
+    # Match the whole utterance, never a substring: "пока думаю" and questions
+    # about saying goodbye must remain normal conversation.
+    t = re.sub(r"[^\w\s]", " ", _norm(text))
+    t = re.sub(r"\b(?:бендер|бендере|bender)\b", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    padding = r"(?:(?:ну|все|всё|усе|всьо|ладно|добре|гаразд|окей|ок|давай|дякую|спасибо)\s+)*"
+    goodbye = r"(?:пока(?:\s+пока)?|до\s+свидания|до\s+свиданья|до\s+побачення|до\s+зустрічі|до\s+встречи|бувай(?:те)?|прощавай|на\s+добраніч|добраніч|спокойной\s+ночи)"
+    ending = r"(?:\s+(?:дякую|спасибо|давай|пока|бувай))*"
+    return bool(re.fullmatch(padding + goodbye + ending, t))
+
+
+def wake_question(text: str) -> str:
+    """Remove an invocation only on the explicitly marked first wake turn.
+
+    Empty means the user only called Bender: request an on-device acknowledgement.
+    Never remove a name mentioned inside a question or unrelated text.
+    """
+    prefix = re.compile(
+        r"^\s*[\"«“]*(?:(?:прив[еі]т|приветик|здравствуй|эй|ей|гей|hey|hello)"
+        r"[\s,!.:;—–-]*)?(?:бендере?|блендер|дендер|bender)(?!\w)"
+        r"[\s,!.?:;—–\-\"»”]*", re.IGNORECASE)
+    return prefix.sub('', text, count=1).strip()
+
+
 def catalog(stations: list[dict] | None) -> list[dict]:
     by_id: dict[int, dict] = {}
     for s in STATIONS_DEFAULT:
@@ -156,6 +181,11 @@ def _list_stations(stations: list[dict] | None) -> str:
 
 def match(text: str, stations: list[dict] | None = None) -> VoiceCommand | None:
     t = _norm(text)
+    if is_farewell(t):
+        return VoiceCommand(
+            name="conversation.end",
+            replies=("Бувай! Покличеш, як знадоблюся.", "До зустрічі!", "Давай, ще побалакаємо."),
+        )
     if len(t) < 6:
         return None
 

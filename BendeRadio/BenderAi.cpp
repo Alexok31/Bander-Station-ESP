@@ -9,6 +9,7 @@
 #include <atomic>
 #include <memory>
 #include <esp_wifi.h>
+#include <esp_random.h>
 #include <mbedtls/base64.h>
 
 #include "AirPlay.h"
@@ -17,6 +18,11 @@
 #include "core0.h"
 #include "pcm_analyzer.h"
 #include "Pcm16.h"
+#include "WakeRuntime.h"
+#include "WakeVoice.h"
+#include "WakeReply.h"
+#include "WakeReplyAudio.h"
+#include "PlaybackCompletion.h"
 #include "secrets.h"
 
 #ifndef BENDER_AI_LOG
@@ -176,8 +182,9 @@ constexpr size_t CHUNK = 240;
 constexpr size_t CHUNK_BYTES = CHUNK * 2;
 constexpr size_t RING_BYTES = 512 * 1024;
 static_assert(RING_BYTES % 2 == 0 && CHUNK_BYTES % 2 == 0, "PCM16 ring and chunks must be sample-aligned");
-constexpr uint16_t PREBUF_N = 1700;
+constexpr uint16_t PREBUF_N = 2000;
 constexpr uint16_t PRE_IDLE_N = 80;
+constexpr uint16_t WAKE_PREROLL_N = 320; // Keep late detections and the start of an immediate question.
 constexpr size_t PREBUF_BYTES = (size_t)PREBUF_N * CHUNK_BYTES;
 constexpr size_t PCM_DECODE_BYTES = 192 * 1024;
 constexpr uint8_t MIC_SHIFT = RadioConfig::micPcmShiftRight;
@@ -211,11 +218,32 @@ static volatile bool sessionReady = false;
 static volatile bool wantOnline = false;
 static volatile bool s_ai_awake = false;
 static uint32_t s_ai_last_live_ms = 0;
-static bool s_mic_on = false;
+static std::atomic<bool> s_mic_on{false};
+static StaticSemaphore_t s_mic_mutex_storage;
+static SemaphoreHandle_t s_mic_mutex = nullptr;
+// Serialize reads with begin/end across PTT, sleep and diagnostic listening.
+// A dedicated mic lock never blocks the AirPlay playback lock for a read.
+struct MicGuard {
+    MicGuard() { if (s_mic_mutex) xSemaphoreTakeRecursive(s_mic_mutex, portMAX_DELAY); }
+    ~MicGuard() { if (s_mic_mutex) xSemaphoreGiveRecursive(s_mic_mutex); }
+};
 static volatile bool hangupPending = false;
 static volatile bool sessionArmed = false;
 static volatile bool pttHeld = false;
 static volatile bool s_ptt_armed = false;
+// Voice lifecycle is owned by wsTask. PTT callbacks ignore an active voice turn.
+static std::atomic<uint8_t> s_wake_voice{0}; // 0 idle, 1 connecting, 2 recording, 3 answer
+static std::atomic<uint32_t> s_wake_warmup{0};
+static std::atomic<bool> s_wake_cue{false};
+static uint32_t s_wake_since = 0;
+static WakeVoice::Endpoint s_wake_endpoint;
+static bool s_wake_followup = false; // wsTask only; controls the no-question timeout.
+static std::atomic<bool> s_wake_local_capture{false}, s_wake_recorded{false};
+static std::atomic<bool> s_wake_prompt_pending{false};
+static bool s_wake_invocation = false; // Sent with the first buffered utterance only.
+static WakeVoice::Result s_wake_initial_result = WakeVoice::Continue;
+static std::atomic<bool> s_dialogue_ending{false}; // Drain goodbye, then return to wake detection.
+static uint32_t s_wake_no_speech_ms = 6000;
 static std::atomic<uint32_t> s_favorites_lo{0}, s_favorites_hi{0};
 static std::atomic<bool> s_event_voice_enabled{true};
 static std::atomic<uint32_t> s_pending_event{0};
@@ -252,6 +280,7 @@ static bool g_mic32bit = true;
 static int32_t micSmoothPk = 0;
 
 static volatile bool s_owns_spk = false;
+static std::atomic<bool> s_pcm_in_flight{false};
 static volatile bool s_taking = false;
 static bool s_spk_stereo = true;
 static uint16_t s_take_n = 0;
@@ -262,6 +291,18 @@ static volatile bool s_started = false;
 static volatile uint8_t s_demo = 0;
 static uint8_t* s_demo_pcm = nullptr;
 static size_t s_demo_cap = 0;
+static std::atomic<WakeSample::State> s_sample_state{WakeSample::Idle};
+static std::atomic<bool> s_sample_cancel{false}, s_sample_leased{false};
+static std::atomic<uint32_t> s_sample_bytes{0};
+static uint8_t* s_sample_wav = nullptr;
+static WakeSample::Pool s_sample_pool;
+static_assert(WakeSample::pcmBytes % CHUNK_BYTES == 0 && WakeSample::rate == RATE,
+              "Dataset buffer must contain whole microphone chunks at the native rate");
+static uint32_t s_sample_id = 0, s_sample_queued_ms = 0;
+static uint8_t s_sample_label = 0, s_sample_split = 0;
+static bool sampleActive() { return WakeSample::active(s_sample_state.load()); }
+static bool initMic();
+static void micSleep();
 static volatile uint32_t s_progress_ms = 0;
 static volatile uint32_t s_last_pcm_ms = 0;
 
@@ -379,10 +420,10 @@ static void spkWrite(uint8_t* buf, size_t n, bool from_pcm) {
     }
     if (from_pcm && n >= 2) {
         pcm_analyzer_on_bender_pcm16((const int16_t*)buf, (uint16_t)(n / 2));
-        s_tts_out_ms = millis();
     }
     ampMuteHw(false);
     i2sOutMono(buf, n);
+    if (from_pcm && n >= 2) s_tts_out_ms = millis();
 }
 
 static void spkWriteSilence() {
@@ -455,6 +496,16 @@ static void noteProgress() {
 static uint32_t s_sock_wait_ms;
 
 static void forceRecover(const char* why, bool show_error = false, bool keep_queued_preview = false) {
+    if (s_wake_voice.load() != 0) {
+        s_wake_voice.store(0);
+        pttHeld = s_ptt_armed = false;
+        s_ai_awake = wantOnline = false;
+        s_ws_close_requested.store(true);
+    }
+    s_wake_local_capture.store(false);
+    s_wake_recorded.store(false);
+    s_wake_prompt_pending.store(false);
+    s_wake_invocation=false;
     const uint8_t previewState = s_preview_state.load();
     if ((previewState == 1 && !keep_queued_preview) || previewState == 2 ||
         (previewState == 3 && show_error)) s_preview_state.store(5);
@@ -542,6 +593,12 @@ static void micResetSmooth() {
 }
 
 static void resetTxState() {
+    s_wake_voice.store(0);
+    s_wake_local_capture.store(false);
+    s_wake_recorded.store(false);
+    s_wake_prompt_pending.store(false);
+    s_wake_invocation = false;
+    s_dialogue_ending.store(false);
     waitingACK = false;
     responsePending = false;
     sessionArmed = false;
@@ -568,6 +625,7 @@ static void resetTxState() {
 }
 
 static void requestHangup() {
+    if (s_wake_voice.load() == 3 && (s_wake_prompt_pending.load() || WakeRuntime::followupEnabled()) && !s_voice_pending && !s_dialogue_ending.load()) return;
     if (providerIsLocal()) {
         hangupPending = false;
         // Не віддавати I2S одразу: кільце порожнє, а DMA ще грає хвіст слова.
@@ -587,14 +645,46 @@ static void doHangup() {
 }
 
 static void micDump() {
+    MicGuard guard;
     static uint8_t dump[1024];
     for (int i = 0; i < 8; i++) {
         i2sMic.readBytes((char*)dump, sizeof(dump));
     }
 }
 
-static bool readMicChunk16(uint8_t* mic16, int32_t* chunkPeak, bool countStats) {
-    static uint8_t micRaw[CHUNK * 4];
+static void playWakeReadyCue() {
+    // Only acknowledge a fresh wake phrase. Follow-up listening is silent.
+    if (s_wake_followup) return;
+    // Bender's pre-rendered voice lives in flash; no server request at runtime.
+    // Keep recording in preparation until both the reply and microphone echo drain.
+    static uint8_t previous = 255;
+    static_assert(WakeReplyAudio::count == 12, "Wake reply banks must match the audio pack");
+    const auto traits = nvsLoadCharacter();
+    const uint8_t selected = WakeReply::choose(traits, s_wake_followup, esp_random(), previous);
+    previous = selected;
+    const auto& clip = WakeReplyAudio::clips[selected];
+    ALOG("[WakeVoice] local reply=%u followup=%u\n",unsigned(selected),unsigned(s_wake_followup));
+    s_wake_cue.store(true);
+    {
+        AirPlayAudioGuard guard;
+        int16_t pcm[CHUNK];
+        for(size_t offset=0;offset<clip.bytes;offset+=sizeof(pcm)) {
+            const size_t bytes=minOf(sizeof(pcm),clip.bytes-offset);
+            // spkWrite applies volume in place; never modify the flash asset.
+            memcpy(pcm,clip.data+offset,bytes);
+            spkWrite(reinterpret_cast<uint8_t*>(pcm),bytes,true);
+        }
+        i2sWriteSilenceChunks(4);
+        ampMuteHw(true);
+    }
+    s_wake_cue.store(false);
+}
+
+static bool readMicChunk16(uint8_t* mic16, int32_t* chunkPeak, bool countStats,
+                           WakeSample::MicFilter* sampleFilter = nullptr, bool diagnostic = false) {
+    MicGuard guard;
+    if (!s_mic_on || (diagnostic && (s_ai_awake || wantOnline || sampleActive()))) return false;
+    alignas(int32_t) static uint8_t micRaw[CHUNK * 4];
     size_t need = g_mic32bit ? (CHUNK * 4) : CHUNK_BYTES;
     size_t got = i2sMic.readBytes((char*)micRaw, need);
     if (got != need) {
@@ -605,6 +695,12 @@ static bool readMicChunk16(uint8_t* mic16, int32_t* chunkPeak, bool countStats) 
     if (g_mic32bit) {
         int32_t* s32 = (int32_t*)micRaw;
         for (size_t i = 0; i < CHUNK; i++) {
+            if (sampleFilter) {
+                // Preserve the raw headroom while removing DC, without the
+                // additional PTT gain (currently x4). Never filter clipped PCM.
+                s16[i] = sampleFilter->process(float(s32[i]) / float(uint32_t(1) << MIC_SHIFT));
+                continue;
+            }
             int32_t v = (s32[i] >> MIC_SHIFT) * MIC_GAIN;
             bool clipped = false;
             if (v > 32767) {
@@ -632,6 +728,10 @@ static bool readMicChunk16(uint8_t* mic16, int32_t* chunkPeak, bool countStats) 
     } else {
         memcpy(mic16, micRaw, CHUNK_BYTES);
         for (size_t i = 0; i < CHUNK; i++) {
+            if (sampleFilter) {
+                s16[i] = sampleFilter->process(float(s16[i]));
+                continue;
+            }
             int32_t a = s16[i] < 0 ? -s16[i] : s16[i];
             if (a > peak) {
                 peak = a;
@@ -752,6 +852,25 @@ static void drainPrebufToWs(uint8_t max_n) {
 
 static void tryPttCommit();
 
+static bool flushRecording() {
+    const uint32_t started = millis();
+    while (preN) {
+        if (!sessionReady || !wsReady || convState != ST_RECORDING ||
+            (s_wake_voice.load() != 0 && !WakeRuntime::voiceEnabled()) ||
+            uint32_t(millis()-started) >= 8000u) {
+            preN = preHead = 0;
+            pttHeld = s_ptt_armed = false;
+            forceRecover("recording upload interrupted", true);
+            requestHangup();
+            return false;
+        }
+        drainPrebufToWs(40);
+        wsClient->poll();
+        vTaskDelay(1);
+    }
+    return sessionReady && wsReady && convState == ST_RECORDING;
+}
+
 static void pttStartCapture() {
     sessionArmed = true;
     serverCommitted = false;
@@ -784,7 +903,10 @@ static void tryPttCommit() {
     if (serverCommitted && ok) {
         JsonDocument r;
         r["type"] = "response.create";
-        if (providerIsLocal()) r["current_station"] = (int)radioState.station;
+        if (providerIsLocal()) {
+            r["current_station"] = (int)radioState.station;
+            r["wake_invocation"] = s_wake_invocation;
+        }
         wsSend(r);
         waitingACK = false;
     } else {
@@ -808,12 +930,23 @@ static void onSessionReadyConv() {
         return;
     }
     if (!pttHeld || commitWhenReady) {
-        while (preN) {
-            drainPrebufToWs(40);
-            wsClient->poll();
-        }
-        tryPttCommit();
+        if (flushRecording()) tryPttCommit();
     }
+}
+
+static void startPttRecording();
+
+static void cancelWakeVoice(const char* reason, bool error = false) {
+    s_wake_followup = false;
+    s_wake_voice.store(0);
+    pttHeld = s_ptt_armed = false;
+    preN = preHead = 0;
+    forceRecover(reason, error);
+    resetRecStats();
+    s_ai_awake = wantOnline = false;
+    s_ws_close_requested.store(true);
+    micSleep();
+    ALOG("[WakeVoice] cancel %s\n", reason);
 }
 
 static size_t un64n(const char* s, size_t len, uint8_t* d, size_t cap) {
@@ -985,7 +1118,10 @@ static void onMessage(websockets::WebsocketsMessage m) {
             waitingACK = false;
             JsonDocument r;
             r["type"] = "response.create";
-            if (providerIsLocal()) r["current_station"] = (int)radioState.station;
+            if (providerIsLocal()) {
+                r["current_station"] = (int)radioState.station;
+                r["wake_invocation"] = s_wake_invocation;
+            }
             wsSend(r);
         }
     } else if (!strcmp(t, "response.created")) {
@@ -998,6 +1134,11 @@ static void onMessage(websockets::WebsocketsMessage m) {
         speaking = false;
         noteProgress();
     } else if (!strcmp(t, "response.done")) {
+        if (providerIsLocal() && s_wake_invocation && (j["wake_only"] | false) &&
+            s_wake_voice.load() == 3 && WakeRuntime::voiceEnabled()) {
+            s_wake_prompt_pending.store(true);
+            ALOGLN(F("[WakeVoice] name only — local acknowledgement requested"));
+        }
         s_event_reply = false;
         speaking = false;
         waitingACK = false;
@@ -1024,6 +1165,11 @@ static void onMessage(websockets::WebsocketsMessage m) {
         s_event_voice_enabled.store(j["event_voice"] | true);
     } else if (!strcmp(t, "device.command")) {
         const char* name = j["name"] | "";
+        if (providerIsLocal() && !strcmp(name, "conversation.end")) {
+            s_dialogue_ending.store(true);
+            ALOGLN(F("[WakeVoice] goodbye — finish playback, no follow-up"));
+            return;
+        }
         const int st = j["args"]["station"] | -1;
         queueVoiceCmd(name, st);
     }
@@ -1066,7 +1212,7 @@ static void speakerTask(void*) {
             // Інакше тиша/unmute дає тріск у колонку і він лізе в мікрофон.
             primed = false;
             quietSince = 0;
-            ampMuteHw(true);
+            { AirPlayAudioGuard guard; if (!s_wake_cue.load()) ampMuteHw(true); }
             vTaskDelay(5 / portTICK_PERIOD_MS);
             continue;
         }
@@ -1090,6 +1236,7 @@ static void speakerTask(void*) {
             if (avail >= 2) {
                 portENTER_CRITICAL(&mux);
                 size_t take = pcm16_whole_bytes(minOf(rbUsed(), (size_t)CHUNK_BYTES));
+                if (take) s_pcm_in_flight.store(true);
                 size_t first = minOf(take, RING_BYTES - tail);
                 memcpy(buf, ring + tail, first);
                 if (first < take) {
@@ -1103,6 +1250,7 @@ static void speakerTask(void*) {
                 }
                 memset(buf + take, 0, CHUNK_BYTES - take);
                 spkWrite(buf, CHUNK_BYTES, true);
+                s_pcm_in_flight.store(false);
                 continue;
             }
             if (speaking) {
@@ -1124,13 +1272,8 @@ static void speakerTask(void*) {
                 ampMuteHw(true);
                 quietSince = 0;
                 primed = false;
-                const bool still_wait = (convState == ST_WAIT_RESP) || responsePending || waitingACK;
-                const bool pcm_fresh = s_last_pcm_ms && (millis() - s_last_pcm_ms < 700);
-                if (!still_wait && !pcm_fresh &&
-                    (respPlaybackPending || convState == ST_IDLE)) {
-                    respPlaybackPending = false;
-                    requestGiveback();
-                }
+                // bender_ai_tick owns completion, including an empty unprimed
+                // stream and response.done received after an underrun.
             }
             spkWriteSilence();
             continue;
@@ -1147,6 +1290,7 @@ static void speakerTask(void*) {
             continue;
         }
         size_t first = minOf((size_t)CHUNK_BYTES, RING_BYTES - tail);
+        s_pcm_in_flight.store(true);
         memcpy(buf, ring + tail, first);
         if (first < CHUNK_BYTES) {
             memcpy(buf + first, ring, CHUNK_BYTES - first);
@@ -1154,15 +1298,190 @@ static void speakerTask(void*) {
         tail = (tail + CHUNK_BYTES) % RING_BYTES;
         portEXIT_CRITICAL(&mux);
         spkWrite(buf, CHUNK_BYTES, true);
+        s_pcm_in_flight.store(false);
         vTaskDelay(0);
     }
 }
 
+static BenderPlayback::State playbackState();
+
+static void scaleWakeChunk(uint8_t* bytes) {
+    auto* pcm = reinterpret_cast<int16_t*>(bytes);
+    for (size_t i=0;i<CHUNK;++i) {
+        const int32_t value=int32_t(pcm[i])*MIC_GAIN;
+        pcm[i]=int16_t(value>32767?32767:(value<-32767?-32767:value));
+    }
+}
+
+static void countWakeChunk(const uint8_t* bytes) {
+    const auto* pcm=reinterpret_cast<const int16_t*>(bytes);
+    for(size_t i=0;i<CHUNK;++i) {
+        const int32_t magnitude=pcm[i]<0?-int32_t(pcm[i]):int32_t(pcm[i]);
+        if(magnitude>recPeak) recPeak=magnitude;
+        if(magnitude>=32767) ++recClip;
+    }
+    recSamples+=CHUNK;
+    recMs+=10;
+}
+
+static void beginWakeInitialCapture() {
+    s_wake_followup=false;
+    s_wake_invocation=true;
+    s_wake_no_speech_ms=6000;
+    s_wake_warmup.store(0);
+    s_wake_recorded.store(false);
+    s_wake_prompt_pending.store(false);
+    s_wake_voice.store(2);
+    s_wake_since=millis();
+    resetRecStats();
+    s_wake_endpoint.reset();
+    // Calibrate from older pre-roll; a cold-start buffer can already contain
+    // speech throughout, so never classify its entire speech level as noise.
+    float levels[WAKE_PREROLL_N];
+    const uint16_t levelCount=preN<WAKE_PREROLL_N?preN:WAKE_PREROLL_N;
+    for(uint16_t n=0;n<levelCount;++n) {
+        const auto* pcm=prebuf+size_t((preHead+n)%PREBUF_N)*CHUNK_BYTES;
+        levels[n]=WakeVoice::Endpoint::level(reinterpret_cast<const int16_t*>(pcm),CHUNK);
+    }
+    std::sort(levels,levels+levelCount);
+    const float voiceRms=levelCount?levels[(levelCount-1)*95u/100u]:0;
+    for(uint16_t n=0;n<preN && n<50;++n) {
+        const auto* pcm=prebuf+size_t((preHead+n)%PREBUF_N)*CHUNK_BYTES;
+        s_wake_endpoint.observeBackground(reinterpret_cast<const int16_t*>(pcm),CHUNK);
+    }
+    s_wake_endpoint.finishCalibration(voiceRms/4.f);
+    s_wake_initial_result=WakeVoice::Continue;
+    for(uint16_t n=0;n<preN;++n) {
+        const auto* pcm=prebuf+size_t((preHead+n)%PREBUF_N)*CHUNK_BYTES;
+        countWakeChunk(pcm);
+        s_wake_initial_result=s_wake_endpoint.push(reinterpret_cast<const int16_t*>(pcm),CHUNK);
+    }
+    startPttRecording(); // Does not clear prebuf or drain the microphone.
+    s_wake_local_capture.store(true);
+    ALOG("[WakeVoice] local capture preroll=%ums — speak without waiting\n",unsigned(preN)*10u);
+}
+
+static WakeVoice::Result recordWakeInitialChunk(uint8_t* mic16) {
+    scaleWakeChunk(mic16);
+    prePush(mic16);
+    countWakeChunk(mic16);
+    const auto result=s_wake_endpoint.push(reinterpret_cast<const int16_t*>(mic16),CHUNK);
+    // Never wrap away the start of a question at the recording limit.
+    return preN>=PREBUF_N?WakeVoice::Finish:result;
+}
+
 static void wsTask(void*) {
     static uint8_t mic16[CHUNK_BYTES];
+    WakeSample::MicFilter wakeFilter;
+    bool wakeMic = false;
+    uint32_t wakeWarmup = 0;
     uint32_t lastPing = millis();
     uint32_t backoff = 0;
     for (;;) {
+        const uint8_t voice = s_wake_voice.load();
+        if (voice == 1 || voice == 2) {
+            const uint32_t limit = voice == 1 ? 10000u : s_wake_no_speech_ms+18000u;
+            if (!WakeRuntime::voiceEnabled() || WiFi.status() != WL_CONNECTED ||
+                uint32_t(millis()-s_wake_since) >= limit) {
+                cancelWakeVoice("disabled/offline/timeout");
+            }
+        } else if (voice == 3) {
+            if ((s_wake_prompt_pending.load() || WakeRuntime::followupEnabled()) && !s_voice_pending && !s_dialogue_ending.load() && sessionReady &&
+                BenderPlayback::readyToRelease(playbackState())) {
+                // Keep the same conversation and speaker between turns.
+                respPlaybackPending = s_giveback = false;
+                s_wake_followup = !s_wake_prompt_pending.exchange(false);
+                s_wake_invocation = false;
+                s_wake_since = millis();
+                s_wake_voice.store(1);
+                ALOG("[WakeVoice] follow-up — preparing %us listening window\n",unsigned(WakeRuntime::followupSeconds()));
+            } else if (!bender_ai_busy() && !s_giveback) {
+                s_wake_voice.store(0);
+                bender_ai_sleep();
+                ALOGLN(F("[WakeVoice] done — waiting for wake phrase"));
+            }
+        }
+        const bool wakeListen = WakeRuntime::enabled() && WakeRuntime::status().ready &&
+            !s_ai_awake && !wantOnline && !sampleActive() && !bender_ai_busy() && !s_demo;
+        if (!wakeListen && wakeMic) {
+            WakeRuntime::listening(false);
+            AirPlayAudioGuard guard;
+            { MicGuard micGuard; i2sMic.setTimeout(1000); }
+            if (!s_ai_awake && !wantOnline && !sampleActive()) micSleep();
+            wakeMic = false;
+        }
+        // Finish the first utterance before any blocking websocket connection.
+        // This same task remains the sole microphone reader throughout handoff.
+        if (s_wake_local_capture.load() && s_wake_voice.load()==2) {
+            if (s_wake_initial_result==WakeVoice::Continue) {
+                if (!readMicChunk16(mic16,nullptr,false,&wakeFilter)) {
+                    cancelWakeVoice("initial capture microphone gap",true);continue;
+                }
+                s_wake_initial_result=recordWakeInitialChunk(mic16);
+            }
+            if(s_wake_initial_result==WakeVoice::Cancel) {
+                cancelWakeVoice("initial capture no speech");continue;
+            }
+            if(s_wake_initial_result==WakeVoice::Finish) {
+                s_wake_local_capture.store(false);
+                s_wake_recorded.store(true);
+                s_wake_voice.store(1);
+                s_wake_since=millis();
+                ALOG("[WakeVoice] utterance buffered %ums — connecting\n",unsigned(preN)*10u);
+            }
+            continue;
+        }
+        // This task is the only PCM reader. Dataset samples never enter prebuf,
+        // response audio, or the websocket path (works with no network/server).
+        if (s_sample_state.load() == WakeSample::Queued) {
+            bool micOk = false;
+            {
+                AirPlayAudioGuard guard;
+                if (!s_sample_cancel.load() && uint32_t(millis() - s_sample_queued_ms) < WakeSample::queueTimeoutMs)
+                    micOk = initMic();
+                if (micOk) {
+                    i2sMic.setTimeout(100);
+                }
+            }
+            const uint32_t started = millis();
+            WakeSample::MicFilter sampleFilter;
+            size_t warmed = 0;
+            size_t filled = 0;
+            while (micOk && filled < WakeSample::pcmBytes && !s_sample_cancel.load() &&
+                   uint32_t(millis() - started) < WakeSample::captureTimeoutMs) {
+                if (radioState.state || airplay_owns_speaker() || strcmp(g_audio_source, "wifi") != 0) break;
+                if (readMicChunk16(mic16, nullptr, false, &sampleFilter)) {
+                    if (warmed < WakeSample::rate * 2 * WakeSample::warmupMs / 1000) {
+                        warmed += CHUNK_BYTES;
+                        // Keep the UI in "preparing" until startup/filter settle.
+                        if (warmed >= WakeSample::rate * 2 * WakeSample::warmupMs / 1000)
+                            s_sample_state.store(WakeSample::Recording);
+                        continue;
+                    }
+                    memcpy(s_sample_wav + WakeSample::headerBytes + filled, mic16, CHUNK_BYTES);
+                    filled += CHUNK_BYTES;
+                    s_sample_bytes.store(filled);
+                } else break; // Never silently join audio across dropped microphone frames.
+            }
+            {
+                AirPlayAudioGuard guard;
+                i2sMic.setTimeout(1000);
+                micSleep(); // active flag prevents the other task from closing I2S meanwhile
+                preHead = preN = 0;
+                const auto result = s_sample_cancel.load() ? WakeSample::Idle :
+                    (micOk && filled == WakeSample::pcmBytes ? WakeSample::Ready : WakeSample::Failed);
+                if (result == WakeSample::Ready) {
+                    WakeSample::wavHeader(s_sample_wav);
+                    s_sample_pool.find(s_sample_id)->ready = true;
+                } else {
+                    free(s_sample_pool.remove(s_sample_id));
+                    s_sample_wav = nullptr;
+                }
+                s_sample_state.store(result);
+                ALOG("[WakeSample] state=%u bytes=%u id=%u\n", unsigned(result), unsigned(filled), unsigned(s_sample_id));
+            }
+            continue;
+        }
         if (s_ws_close_requested.exchange(false)) {
             if (wsClient) wsClient->close();
             wsReady = sessionReady = false;
@@ -1213,6 +1532,60 @@ static void wsTask(void*) {
             s_preview_state.store(5);
         if (!s_ai_awake && !s_demo && !wantOnline) {
             backoff = 0;
+            if (wakeListen) {
+                if (WakeRuntime::takeDetection()) {
+                    AirPlayAudioGuard guard;
+                    // Diagnostic mode never gets here. Don't retain a stale hit
+                    // while offline, busy, or using the external Bluetooth path.
+                    if (WakeRuntime::voiceEnabled() && !s_ai_awake && !wantOnline &&
+                        WiFi.status() == WL_CONNECTED && !bender_ai_busy() &&
+                        strcmp(g_audio_source, "wifi") == 0 && !s_giveback) {
+                        s_face_error_ms.store(0, std::memory_order_relaxed);
+                        s_preN_at_arm = 0;
+                        wifi_touch_activity();
+                        bender_ai_wake();
+                        beginWakeInitialCapture();
+                        if(!s_owns_spk) cancelWakeVoice("speaker unavailable",true);
+                    } else {
+                        ALOGLN(F("[WakeVoice] ignored: offline/busy/source"));
+                    }
+                    continue;
+                }
+                if (!wakeMic || !s_mic_on) {
+                    WakeRuntime::listening(false);
+                    AirPlayAudioGuard guard;
+                    if (s_ai_awake || wantOnline || sampleActive()) continue;
+                    if (!initMic()) { WakeRuntime::micError(); continue; }
+                    { MicGuard micGuard; i2sMic.setTimeout(100); }
+                    wakeFilter = WakeSample::MicFilter{};
+                    preN=preHead=0;
+                    wakeWarmup = 0; wakeMic = true;
+                }
+                if (readMicChunk16(mic16, nullptr, false, &wakeFilter, true)) {
+                    if (s_ai_awake || wantOnline || sampleActive() || !WakeRuntime::enabled()) continue;
+                    if (wakeWarmup < WakeSample::rate * WakeSample::warmupMs / 1000) {
+                        wakeWarmup += CHUNK;
+                    } else {
+                        WakeRuntime::listening(true);
+                        WakeRuntime::submit(reinterpret_cast<const int16_t*>(mic16), CHUNK);
+                        if(WakeRuntime::voiceEnabled()) {
+                            // Detector receives its original PCM; only the ASR buffer is amplified.
+                            scaleWakeChunk(mic16);
+                            prePush(mic16);
+                            while(preN>WAKE_PREROLL_N) {preHead=(preHead+1)%PREBUF_N;--preN;}
+                        }
+                    }
+                } else {
+                    WakeRuntime::listening(false);
+                    WakeRuntime::gap();
+                    // Also discard startup after a timeout/reopen; never stitch
+                    // an incomplete phrase to unrelated microphone samples.
+                    wakeFilter = WakeSample::MicFilter{}; wakeWarmup = 0;
+                    preN=preHead=0;
+                    vTaskDelay(1);
+                }
+                continue;
+            }
             vTaskDelay(100 / portTICK_PERIOD_MS);
             continue;
         }
@@ -1251,12 +1624,38 @@ static void wsTask(void*) {
                 if (!pttHeld && (s_owns_spk || convState != ST_IDLE || s_taking)) {
                     forceRecover("connect fail", true);
                 }
+                if (s_wake_voice.load() == 1) cancelWakeVoice("connect failed", true);
             } else {
                 backoff = 0;
             }
             continue;
         }
         backoff = 0;
+        if (s_wake_voice.load() == 1 && sessionReady) {
+            if (!WakeRuntime::voiceEnabled()) { cancelWakeVoice("disabled"); continue; }
+            if(s_wake_recorded.load()) {
+                wsSendRaw("{\"type\":\"input_audio_buffer.clear\"}");
+                if(!flushRecording()) continue;
+                if(s_wake_voice.load()!=1 || convState!=ST_RECORDING) continue;
+                s_wake_recorded.store(false);
+                s_wake_voice.store(3);
+                tryPttCommit();
+                continue;
+            }
+            s_wake_invocation=false;
+            s_wake_no_speech_ms=s_wake_followup?uint32_t(WakeRuntime::followupSeconds())*1000u:6000u;
+            if(!s_wake_no_speech_ms) {cancelWakeVoice("follow-up disabled");continue;}
+            s_wake_endpoint.reset(s_wake_no_speech_ms);
+            s_wake_warmup.store(75); // 250 ms settle, then 500 ms background calibration.
+            preN = preHead = s_preN_at_arm = 0;
+            resetRecStats();
+            s_wake_since = millis();
+            s_wake_voice.store(2);
+            startPttRecording();
+            if (!s_owns_spk) { cancelWakeVoice("speaker unavailable", true); continue; }
+            wsSendRaw("{\"type\":\"input_audio_buffer.clear\"}");
+            micDump();
+        }
         if (s_preview_state.load() == 1) {
             if (bender_ai_busy() || airplay_owns_speaker() || strcmp(g_audio_source, "wifi") != 0 || radioState.vol <= 0) {
                 s_preview_state.store(5);
@@ -1330,9 +1729,43 @@ static void wsTask(void*) {
         if (capturing || s_ptt_armed) {
             if (readMicChunk16(mic16, &chunkPeak, keep_rec)) {
                 if (keep_rec) {
+                    if (s_wake_voice.load() == 2 && s_wake_warmup.load()) {
+                        const auto remaining=s_wake_warmup.load();
+                        if(remaining<=50) s_wake_endpoint.observeBackground(reinterpret_cast<const int16_t*>(mic16),CHUNK);
+                        if (remaining == 1) {
+                            s_wake_endpoint.finishCalibration();
+                            playWakeReadyCue();
+                            micDump(); // Discard buffered cue audio, before exposing Listening.
+                            resetRecStats();
+                            s_wake_warmup.store(0);
+                            ALOG("[WakeVoice] listening cue=ready noise=%u threshold=%u followup=%u — speak your question\n",
+                                 unsigned(s_wake_endpoint.noise()),unsigned(s_wake_endpoint.threshold()),unsigned(s_wake_followup));
+                        } else s_wake_warmup.store(remaining-1);
+                        continue;
+                    }
                     prePush(mic16);
                     recMs += 10;
-                    if (recMs >= MAX_RECORD_MS) {
+                    if (s_wake_voice.load() == 2) {
+                        const auto endpoint = s_wake_endpoint.push(reinterpret_cast<const int16_t*>(mic16), CHUNK);
+                        if (!s_wake_endpoint.heardSpeech()) {preTrimIdle();recMs=uint32_t(preN)*10;}
+                        if ((s_wake_endpoint.elapsedMs() % 1000u) == 0) {
+                            ALOG("[WakeVoice] level rms=%u threshold=%u quiet=%ums voiced=%ums clips=%u/%u\n",
+                                 unsigned(s_wake_endpoint.rms()), unsigned(s_wake_endpoint.threshold()),
+                                 unsigned(s_wake_endpoint.quietMs()), unsigned(s_wake_endpoint.voicedMs()),
+                                 unsigned(recClip), unsigned(recSamples));
+                        }
+                        if (endpoint == WakeVoice::Cancel) {
+                            cancelWakeVoice("no question");
+                            continue;
+                        }
+                        if (endpoint == WakeVoice::Finish) {
+                            ALOG("[WakeVoice] question end voiced=%ums recorded=%ums\n",
+                                 unsigned(s_wake_endpoint.voicedMs()), unsigned(recMs));
+                            pttHeld = false;
+                            s_need_commit = true;
+                        }
+                    }
+                    if (s_wake_voice.load() != 2 && recMs >= MAX_RECORD_MS) {
                         ALOGLN(F("[PTT] max rec"));
                         s_need_commit = true;
                     }
@@ -1344,9 +1777,10 @@ static void wsTask(void*) {
         }
         if (s_need_commit && convState == ST_RECORDING) {
             s_need_commit = false;
+            const bool voiceRecording = s_wake_voice.load() == 2;
             // Idle до натискання (~0.8 с) + клац кнопки. Різати лише 30 мс з голови
             // не чіпало клац — він сидів після преролу, replay починався з нього.
-            uint16_t drop_head = (uint16_t)s_preN_at_arm + (uint16_t)PTT_DROP_HEAD;
+            uint16_t drop_head = voiceRecording ? 0 : (uint16_t)s_preN_at_arm + (uint16_t)PTT_DROP_HEAD;
             s_preN_at_arm = 0;
             if (preN > 40) {
                 while (drop_head && preN > 28) {
@@ -1354,7 +1788,7 @@ static void wsTask(void*) {
                     preN--;
                     drop_head--;
                 }
-                uint8_t drop_tail = PTT_DROP_TAIL;
+                uint8_t drop_tail = voiceRecording ? 0 : PTT_DROP_TAIL;
                 while (drop_tail && preN > 24) {
                     preN--;
                     drop_tail--;
@@ -1362,11 +1796,11 @@ static void wsTask(void*) {
             }
             const uint32_t queued_ms = (uint32_t)preN * 10u;
             const uint32_t t0 = millis();
-            while (preN) {
-                drainPrebufToWs(40);
-                wsClient->poll();
-            }
+            if (!flushRecording()) continue;
             ALOG("[PTT] flush %u ms audio in %u ms\n", (unsigned)queued_ms, (unsigned)(millis() - t0));
+            // A poll during flush can disconnect/recover; never resurrect it.
+            if (voiceRecording && s_wake_voice.load() == 2 && convState == ST_RECORDING)
+                s_wake_voice.store(3);
             tryPttCommit();
         }
 
@@ -1402,6 +1836,8 @@ static void wsTask(void*) {
 }
 
 static void micSleep() {
+    MicGuard guard;
+    WakeRuntime::listening(false);
     if (!s_mic_on) {
         return;
     }
@@ -1411,6 +1847,7 @@ static void micSleep() {
 }
 
 static bool initMic() {
+    MicGuard guard;
     if (s_mic_on) {
         return true;
     }
@@ -1442,7 +1879,8 @@ static bool initMic() {
 }
 
 bool bender_ai_busy() {
-    return s_demo || s_ptt_armed || s_taking || s_owns_spk || convState != ST_IDLE || speaking || waitingACK || responsePending ||
+    if (s_wake_voice.load() == 1) return true;
+    return sampleActive() || s_demo || s_ptt_armed || s_taking || s_owns_spk || convState != ST_IDLE || speaking || waitingACK || responsePending ||
            (respPlaybackPending && rbUsed() > 0) || pttHeld || s_dbg_play;
 }
 
@@ -1453,6 +1891,85 @@ bool bender_ai_favorite_station(int station) {
 }
 
 bool bender_ai_event_voice_enabled() { return s_event_voice_enabled.load(); }
+
+const char* bender_ai_sample_start(const char* label, const char* split) {
+    AirPlayAudioGuard guard;
+    const int li = WakeSample::labelIndex(label), si = WakeSample::splitIndex(split);
+    if (li < 0 || si < 0) return "Выбери фразу и набор примеров.";
+    if (!s_started) return "Микрофон недоступен: перезапусти колонку.";
+    if (bender_ai_busy() || s_ai_awake || wantOnline || wsReady || s_preview_state.load() == 1 ||
+        s_drop_event_reply || s_sample_leased.load())
+        return "Бендер занят. Дождись завершения и повтори.";
+    if (radioState.state || airplay_owns_speaker() || strcmp(g_audio_source, "wifi") != 0)
+        return "Поставь музыку на паузу, заверши AirPlay и выбери режим FM.";
+    if (s_sample_pool.count() >= WakeSample::poolCapacity)
+        return "Пул заполнен: 30 записей. Скачай набор и удали ненужные примеры.";
+    const size_t bytes = WakeSample::headerBytes + WakeSample::pcmBytes;
+    if (ESP.getFreePsram() < bytes + WakeSample::memoryReserve)
+        return "Достигнут резерв памяти. Скачай набор и освободи место в пуле.";
+    auto* wav = (uint8_t*)ps_malloc(bytes);
+    if (!wav) return "Недостаточно непрерывной памяти для записи. Скачай набор и освободи место.";
+    s_sample_label = uint8_t(li); s_sample_split = uint8_t(si);
+    if (s_sample_id == 0) s_sample_id = esp_random(); // Avoid matching a stale tab after reboot.
+    do { if (++s_sample_id == 0) ++s_sample_id; } while (s_sample_pool.find(s_sample_id));
+    if (!s_sample_pool.add(s_sample_id, uint8_t(li), uint8_t(si), wav)) {
+        free(wav); return "Не удалось добавить запись в пул.";
+    }
+    s_sample_wav = wav;
+    s_sample_bytes.store(0); s_sample_cancel.store(false);
+    s_sample_queued_ms = millis();
+    s_pending_event.store(0);
+    s_ai_awake = wantOnline = false;
+    s_ws_close_requested.store(true);
+    s_sample_state.store(WakeSample::Queued);
+    return nullptr;
+}
+
+WakeSample::Status bender_ai_sample_status() {
+    AirPlayAudioGuard guard;
+    return {s_sample_state.load(), s_sample_id, s_sample_bytes.load() * 1000u / (WakeSample::rate * 2u),
+            s_sample_label, s_sample_split};
+}
+
+bool bender_ai_sample_cancel(uint32_t id) {
+    AirPlayAudioGuard guard;
+    if (s_sample_leased.load()) return false;
+    if (id == s_sample_id && sampleActive()) { s_sample_cancel.store(true); return true; }
+    auto* wav = s_sample_pool.remove(id);
+    if (!wav) return false;
+    free(wav);
+    if (id == s_sample_id) {
+        s_sample_state.store(WakeSample::Idle); s_sample_wav = nullptr;
+        s_sample_bytes.store(0);
+    }
+    return true;
+}
+
+const uint8_t* bender_ai_sample_audio(uint32_t id, size_t& size) {
+    AirPlayAudioGuard guard;
+    size = 0;
+    const auto* entry = s_sample_pool.find(id);
+    if (!entry || !entry->ready || s_sample_leased.exchange(true)) return nullptr;
+    size = WakeSample::headerBytes + WakeSample::pcmBytes;
+    return entry->wav;
+}
+
+void bender_ai_sample_audio_release() { s_sample_leased.store(false); }
+
+size_t bender_ai_sample_list(WakeSample::Status* out, size_t capacity) {
+    AirPlayAudioGuard guard;
+    return s_sample_pool.list(out, capacity);
+}
+
+bool bender_ai_sample_clear() {
+    AirPlayAudioGuard guard;
+    if (sampleActive() || s_sample_leased.load()) return false;
+    WakeSample::Status items[WakeSample::poolCapacity];
+    const size_t count = s_sample_pool.list(items, WakeSample::poolCapacity);
+    for (size_t i = 0; i < count; ++i) free(s_sample_pool.remove(items[i].id));
+    s_sample_wav = nullptr; s_sample_bytes.store(0); s_sample_state.store(WakeSample::Idle);
+    return true;
+}
 
 const char* bender_ai_preview_character(const BenderCharacter::Settings& settings, const char* question) {
     AirPlayAudioGuard guard;
@@ -1517,6 +2034,11 @@ bool bender_ai_tts_playing() {
 }
 
 BenderFaceState bender_ai_face_state() {
+    if (s_sample_state.load() == WakeSample::Recording) return BenderFaceState::Listening;
+    if (s_wake_cue.load()) return BenderFaceState::Speaking;
+    if (s_wake_recorded.load()) return BenderFaceState::Thinking;
+    if (s_wake_voice.load() == 1 || (s_wake_voice.load() == 2 && s_wake_warmup.load()))
+        return BenderFaceState::Curious;
     const uint32_t now = millis();
     const bool output_recent = s_owns_spk && bender_face_recent(now, s_tts_out_ms, 300u);
     return bender_face_resolve({
@@ -1530,6 +2052,9 @@ BenderFaceState bender_ai_face_state() {
 }
 
 void bender_ai_wake() {
+    AirPlayAudioGuard guard;
+    if (sampleActive()) return;
+    WakeRuntime::listening(false);
     s_ai_awake = true;
     wantOnline = true;
     s_ai_last_live_ms = millis();
@@ -1537,6 +2062,9 @@ void bender_ai_wake() {
 }
 
 void bender_ai_sleep() {
+    AirPlayAudioGuard guard;
+    if (sampleActive()) return;
+    if (s_wake_voice.load() == 1) return;
     if (s_preview_state.load() == 1) s_preview_state.store(5);
     if (pttHeld || s_demo || convState == ST_RECORDING || convState == ST_WAIT_RESP || speaking ||
         waitingACK || responsePending) {
@@ -1556,7 +2084,16 @@ bool bender_ai_awake() {
     return s_ai_awake;
 }
 
+uint8_t bender_ai_wake_voice_state() {
+    if(s_wake_recorded.load()) return 3; // Already heard the question; waiting for transport/ASR.
+    const uint8_t state = s_wake_voice.load();
+    return state == 2 && s_wake_warmup.load() ? 1 : state;
+}
+
 void bender_ai_ptt_arm() {
+    if (s_wake_voice.load()) return;
+    AirPlayAudioGuard guard;
+    if (sampleActive()) { s_sample_cancel.store(true); return; }
     if (s_preview_state.load() >= 1 && s_preview_state.load() <= 3) s_preview_state.store(5);
     s_pending_event.store(0);
     if (s_event_reply) {
@@ -1576,6 +2113,7 @@ void bender_ai_ptt_arm() {
 }
 
 void bender_ai_ptt_cancel() {
+    if (sampleActive()) return;
     if (convState == ST_RECORDING || pttHeld) {
         return;
     }
@@ -1599,6 +2137,8 @@ void bender_ai_yield_radio() {
 }
 
 void bender_ai_ptt_down() {
+    if (s_wake_voice.load()) return;
+    if (sampleActive()) { s_sample_cancel.store(true); return; }
     if (s_demo) {
         ALOGLN(F("[PTT] wait answer"));
         return;
@@ -1628,6 +2168,11 @@ void bender_ai_ptt_down() {
         }
         forceRecover("ptt barge");
     }
+    startPttRecording();
+}
+
+static void startPttRecording() {
+    if(s_wake_voice.load()==0) s_wake_invocation=false;
     s_resume_radio = radioState.state && strcmp(g_audio_source, "wifi") == 0;
     if (airplay_owns_speaker()) {
         airplay_interrupt();
@@ -1657,6 +2202,8 @@ void bender_ai_ptt_down() {
 }
 
 void bender_ai_ptt_up() {
+    if (s_wake_voice.load()) return;
+    if (sampleActive()) return;
     pttHeld = false;
     s_ptt_armed = false;
     if (convState == ST_RECORDING) {
@@ -1665,7 +2212,28 @@ void bender_ai_ptt_up() {
     }
 }
 
+static BenderPlayback::State playbackState() {
+    // Queue removal and the in-flight flag are one operation in speakerTask.
+    // Read them together so the final dequeued block cannot look like silence.
+    portENTER_CRITICAL(&mux);
+    const BenderPlayback::State state{
+        s_owns_spk, s_taking, convState == ST_IDLE && !pttHeld && !s_ptt_armed && s_wake_voice.load()!=1,
+        speaking, responsePending || waitingACK || s_need_speaker,
+        bool(s_demo == 1 || s_demo == 2 || s_dbg_play), s_pcm_in_flight.load(), rbUsed(),
+        millis(), s_last_pcm_ms, s_tts_out_ms};
+    portEXIT_CRITICAL(&mux);
+    return state;
+}
+
 void bender_ai_tick() {
+    // Independent of priming: never leave I2S owned forever after the final
+    // buffer drained while response.done / the input freshness timer was pending.
+    const bool keepForFollowup = s_wake_voice.load() == 3 && (s_wake_prompt_pending.load() || WakeRuntime::followupEnabled()) &&
+        !s_voice_pending && !s_dialogue_ending.load() && sessionReady;
+    if (!keepForFollowup && BenderPlayback::readyToRelease(playbackState())) {
+        respPlaybackPending = false;
+        requestGiveback();
+    }
     if (s_preview_state.load() == 3 && !bender_ai_busy()) s_preview_state.store(4);
     if (s_need_speaker && !s_owns_spk && !s_giveback) {
         s_need_speaker = false;
@@ -1674,9 +2242,12 @@ void bender_ai_tick() {
             forceRecover("speaker busy/unavailable", true);
         }
     }
+    const auto playback = playbackState();
     const bool pcm_fresh = s_last_pcm_ms && (millis() - s_last_pcm_ms < 800);
-    if (s_giveback && !pttHeld && convState != ST_RECORDING && convState != ST_WAIT_RESP &&
-        !responsePending && !waitingACK && !s_dbg_play && rbUsed() == 0 && !pcm_fresh) {
+    if (!keepForFollowup && s_giveback && s_wake_voice.load()!=1 && !pttHeld && convState != ST_RECORDING && convState != ST_WAIT_RESP &&
+        !responsePending && !waitingACK && !s_dbg_play && !playback.inFlight &&
+        playback.queuedBytes == 0 && !pcm_fresh &&
+        (!s_tts_out_ms || uint32_t(millis()-s_tts_out_ms) >= 350u)) {
         s_giveback = false;
         s_demo = 0;
         speaking = false;
@@ -1685,6 +2256,12 @@ void bender_ai_tick() {
         if (had_cmd) {
             radio_voice_after_speaker();
         }
+    }
+    if (s_dialogue_ending.load() && !bender_ai_busy() && !s_giveback && !s_ptt_armed) {
+        s_wake_voice.store(0);
+        bender_ai_sleep();
+        s_dialogue_ending.store(false);
+        ALOGLN(F("[WakeVoice] conversation ended — waiting for wake phrase"));
     }
     if (s_ai_awake && !bender_ai_busy() && !s_ptt_armed && s_preview_state.load() != 1 &&
         (uint32_t)(millis() - s_ai_last_live_ms) > 8000u) {
@@ -1698,6 +2275,8 @@ void bender_ai_begin() {
     if (s_started) {
         return;
     }
+    WakeRuntime::setFollowupSeconds(nvsLoadWakeFollowupSeconds());
+    if (!s_mic_mutex) s_mic_mutex = xSemaphoreCreateRecursiveMutexStatic(&s_mic_mutex_storage);
     ring = (uint8_t*)ps_malloc(RING_BYTES);
     pcmDecode = (uint8_t*)ps_malloc(PCM_DECODE_BYTES);
     prebuf = (uint8_t*)ps_malloc(PREBUF_BYTES);
@@ -1732,6 +2311,13 @@ void bender_ai_begin() {
     xTaskCreatePinnedToCore(speakerTask, "ai_spk", 4096, nullptr, 2, nullptr, 1);
     xTaskCreatePinnedToCore(wsTask, "ai_ws", 16384, nullptr, 5, nullptr, 1);
     s_started = true;
+    if (nvsLoadWakeVoiceEnabled()) {
+        if (const char* error = WakeRuntime::enable(true, true)) {
+            ALOG("[Wake] restore failed: %s\n", error);
+        } else {
+            ALOGLN(F("[Wake] voice restored from settings"));
+        }
+    }
     ALOGLN(F("[AI] PTT hold=talk  8=sleep  9=restart"));
 }
 

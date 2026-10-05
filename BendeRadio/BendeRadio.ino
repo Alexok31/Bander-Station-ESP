@@ -150,6 +150,11 @@ void setup() {
     }
 
     Serial.begin(115200);
+#if ARDUINO_USB_CDC_ON_BOOT
+    // Logs must never stall audio, wake detection or the UI when the host
+    // keeps USB connected but closes Serial Monitor. Drop excess output.
+    Serial.setTxTimeoutMs(0);
+#endif
     delay(300);
     free_uart0_from_i2s_pins();
     Serial.println();

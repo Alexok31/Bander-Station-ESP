@@ -39,3 +39,7 @@ uint8_t nvsLoadCalmMinutes();
 void nvsSaveCalmMinutes(uint8_t value);
 BenderCharacter::Settings nvsLoadCharacter();
 bool nvsSaveCharacter(const BenderCharacter::Settings& settings);
+uint8_t nvsLoadWakeFollowupSeconds();
+bool nvsLoadWakeVoiceEnabled();
+bool nvsSaveWakeVoiceEnabled(bool enabled);
+bool nvsSaveWakeFollowupSeconds(uint8_t seconds);

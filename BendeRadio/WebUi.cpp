@@ -1,9 +1,12 @@
 #include "WebUi.h"
 
 #include <Arduino.h>
+#include <ArduinoJson.h>
 #include <DNSServer.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <lwip/sockets.h>
+#include <cerrno>
 
 #include "NvsConfig.h"
 #include "RadioConfig.h"
@@ -11,6 +14,9 @@
 #include "WebUiPage.h"
 #include "WebUiSaveScope.h"
 #include "BenderAi.h"
+#include "WakeRuntime.h"
+#include "WakeDecision.h"
+#include "WakeVoiceSettings.h"
 
 static WebServer server(80);
 static DNSServer dnsServer;
@@ -347,6 +353,149 @@ static void handleCalib() {
     server.send(200, "application/json", "{\"ok\":true}");
 }
 
+static void handleWakeDiagnostic() {
+    wifi_touch_activity(); web_send_close_connection();
+    server.sendHeader("Cache-Control", "no-store");
+    if (server.method() == HTTP_POST) {
+        if (server.header("X-Bender-Record") != "1") {
+            server.send(403, "text/plain; charset=utf-8", "Открой настройки колонки заново."); return;
+        }
+        if (server.arg("action") == "settings") {
+            uint16_t seconds=0;
+            if(!BenderBehavior::parseUnsigned(server.arg("follow_up_seconds").c_str(),seconds) ||
+               !WakeVoiceSettings::validFollowup(seconds)) {
+                server.send(400,"text/plain; charset=utf-8","Время ожидания: от 0 до 30 секунд.");return;
+            }
+            if(!nvsSaveWakeFollowupSeconds(uint8_t(seconds))) {
+                server.send(409,"text/plain; charset=utf-8","Не удалось сохранить время ожидания.");return;
+            }
+            WakeRuntime::setFollowupSeconds(uint8_t(seconds));
+        } else {
+        const String enabled = server.arg("enabled");
+        if (enabled != "0" && enabled != "1") { server.send(400,"text/plain","Invalid enabled"); return; }
+        const String mode = server.hasArg("mode") ? server.arg("mode") : "diagnostic";
+        if (mode != "voice" && mode != "diagnostic") { server.send(400,"text/plain","Invalid mode"); return; }
+        const bool previousEnabled = WakeRuntime::enabled();
+        const bool previousVoice = WakeRuntime::voiceEnabled();
+        if (const char* error = WakeRuntime::enable(enabled == "1", mode == "voice")) {
+            server.send(409,"text/plain; charset=utf-8",error); return;
+        }
+        // Persist the user's voice choice; diagnostic-only mode stays temporary.
+        if (!nvsSaveWakeVoiceEnabled(enabled == "1" && mode == "voice")) {
+            WakeRuntime::enable(previousEnabled, previousVoice);
+            server.send(409,"text/plain; charset=utf-8","Не удалось сохранить голосовой вызов."); return;
+        }
+        }
+    }
+    const auto s = WakeRuntime::status();
+    JsonDocument doc;
+    doc["enabled"]=s.enabled; doc["listening"]=s.listening; doc["ready"]=s.ready;
+    doc["diagnostic"]=!WakeRuntime::voiceEnabled(); doc["model"]="v7"; doc["threshold"]=0.25;
+    doc["voice_state"]=bender_ai_wake_voice_state();
+    doc["follow_up"]=WakeRuntime::followupEnabled();
+    doc["follow_up_seconds"]=WakeRuntime::followupSeconds();
+    doc["decisions"]=s.decisions; doc["detections"]=s.detections;
+    doc["dropped"]=s.dropped; doc["resets"]=s.resets; doc["last_hit_ms"]=s.lastHitMs;
+    doc["score"]=s.score; doc["processing_us"]=s.processingUs;
+    doc["peak_processing_us"]=s.peakProcessingUs; doc["arena_bytes"]=s.arenaBytes;
+    doc["runtime"]=9; doc["decision_ms"]=WakeDecision::intervalMs;
+    doc["frontend_us"]=s.frontendUs; doc["inference_us"]=s.inferenceUs;
+    doc["overruns"]=s.overruns; doc["queue_high_water"]=s.queueHighWater;
+    doc["stack_free_bytes"]=s.stackFreeBytes; doc["error"]=s.error;
+    doc["heap"]=ESP.getFreeHeap(); doc["psram"]=ESP.getFreePsram();
+    String json; serializeJson(doc,json); server.send(200,"application/json",json);
+}
+
+static void sendWakeSampleStatus(int code = 200) {
+    const auto s = bender_ai_sample_status();
+    String json = String("{\"state\":") + unsigned(s.state) + ",\"id\":" + s.id +
+        ",\"ms\":" + s.elapsedMs + ",\"label\":\"" + WakeSample::labels[s.label] +
+        "\",\"split\":\"" + WakeSample::splits[s.split] + "\"}";
+    server.send(code, "application/json", json);
+}
+
+static void handleWakeSampleList() {
+    wifi_touch_activity(); web_send_close_connection();
+    server.sendHeader("Cache-Control", "no-store");
+    WakeSample::Status items[WakeSample::poolCapacity];
+    const size_t count = bender_ai_sample_list(items, WakeSample::poolCapacity);
+    const bool active = WakeSample::active(bender_ai_sample_status().state);
+    const size_t free = ESP.getFreePsram();
+    size_t available = free > WakeSample::memoryReserve ?
+        (free - WakeSample::memoryReserve) / (WakeSample::headerBytes + WakeSample::pcmBytes) : 0;
+    const size_t slots = count + size_t(active) < WakeSample::poolCapacity ?
+        WakeSample::poolCapacity - count - size_t(active) : 0;
+    if (available > slots) available = slots;
+    String json = String("{\"capacity\":") + unsigned(WakeSample::poolCapacity) +
+        ",\"available\":" + unsigned(available) + ",\"volatile\":true,\"items\":[";
+    for (size_t i = 0; i < count; ++i) {
+        if (i) json += ',';
+        json += String("{\"id\":") + items[i].id + ",\"state\":3,\"ms\":4000,\"label\":\"" +
+            WakeSample::labels[items[i].label] + "\",\"split\":\"" + WakeSample::splits[items[i].split] + "\"}";
+    }
+    json += "]}";
+    server.send(200, "application/json", json);
+}
+
+static void handleWakeSample() {
+    wifi_touch_activity();
+    web_send_close_connection();
+    server.sendHeader("Cache-Control", "no-store");
+    if (server.method() == HTTP_GET) { sendWakeSampleStatus(); return; }
+    // Browser requests from another origin cannot set this header without a
+    // CORS preflight; no cross-origin microphone controls are exposed.
+    if (server.header("X-Bender-Record") != "1") {
+        server.send(403, "text/plain; charset=utf-8", "Открой настройки колонки заново."); return;
+    }
+    if (server.arg("action") == "start") {
+        if (const char* error = bender_ai_sample_start(server.arg("label").c_str(), server.arg("split").c_str())) {
+            server.send(409, "text/plain; charset=utf-8", error); return;
+        }
+        sendWakeSampleStatus(202);
+    } else if (server.arg("action") == "cancel") {
+        uint32_t id;
+        if (!WakeSample::parseId(server.arg("id").c_str(), id) || !bender_ai_sample_cancel(id)) {
+            server.send(409, "text/plain; charset=utf-8", "Эта запись уже недоступна. Обнови статус."); return;
+        }
+        sendWakeSampleStatus();
+    } else if (server.arg("action") == "clear") {
+        if (!bender_ai_sample_clear()) {
+            server.send(409, "text/plain; charset=utf-8", "Дождись окончания записи или скачивания."); return;
+        }
+        sendWakeSampleStatus();
+    } else server.send(400, "text/plain; charset=utf-8", "Неизвестное действие.");
+}
+
+static void handleWakeSampleAudio() {
+    wifi_touch_activity();
+    web_send_close_connection();
+    server.sendHeader("Cache-Control", "no-store");
+    uint32_t id;
+    if (!WakeSample::parseId(server.arg("id").c_str(), id)) {
+        server.send(400, "text/plain", "Invalid sample ID"); return;
+    }
+    size_t bytes = 0;
+    const uint8_t* wav = bender_ai_sample_audio(id, bytes);
+    if (!wav) { server.send(409, "text/plain; charset=utf-8", "Запись ещё не готова, удалена или сейчас скачивается."); return; }
+    // Lease is held until the synchronous transfer ends. No large String/copy
+    // in internal RAM and no audio lock across slow network writes.
+    server.setContentLength(bytes);
+    server.send(200, "audio/wav", "");
+    auto client = server.client();
+    const int socket = client.fd();
+    const uint32_t started = millis();
+    size_t sent = 0;
+    while (sent < bytes && client.connected() && uint32_t(millis() - started) < 8000u) {
+        const size_t remaining = bytes - sent;
+        const int n = ::send(socket, wav + sent, remaining > 1460 ? 1460 : remaining, MSG_DONTWAIT);
+        if (n > 0) sent += size_t(n);
+        else if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) break;
+        delay(1);
+    }
+    bender_ai_sample_audio_release();
+    if (sent != bytes) client.stop();
+}
+
 void webUiBegin() {
     if (!handlersInstalled) {
         server.on("/generate_204", HTTP_ANY, sendRedirectRoot);        // Android
@@ -361,6 +510,14 @@ void webUiBegin() {
         server.on("/calib", HTTP_POST, handleCalib);
         server.on("/character/preview", HTTP_POST, handleCharacterPreview);
         server.on("/character/preview", HTTP_GET, handleCharacterPreview);
+        const char* recordHeaders[] = {"X-Bender-Record"};
+        server.collectHeaders(recordHeaders, 1);
+        server.on("/wakeword/sample", HTTP_GET, handleWakeSample);
+        server.on("/wakeword/sample", HTTP_POST, handleWakeSample);
+        server.on("/wakeword/audio.wav", HTTP_GET, handleWakeSampleAudio);
+        server.on("/wakeword/samples", HTTP_GET, handleWakeSampleList);
+        server.on("/wakeword/diagnostic", HTTP_GET, handleWakeDiagnostic);
+        server.on("/wakeword/diagnostic", HTTP_POST, handleWakeDiagnostic);
         server.on("/save", HTTP_POST, handleSave);
         server.onNotFound([]() {
             web_send_close_connection();

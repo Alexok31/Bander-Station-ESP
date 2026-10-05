@@ -1,5 +1,6 @@
 import ast
 import asyncio
+import copy
 import json
 import re
 import sys
@@ -238,8 +239,65 @@ class CharacterProtocolTests(unittest.IsolatedAsyncioTestCase):
         ns['set_device_character'](profile)  # Reconnect with the same device settings.
         _ = [part async for part in ns['_grok_pieces'](history, 140, .68)]
         self.assertEqual(requests[1]['previous_response_id'], 'fresh-chain')
-        self.assertEqual(requests[1]['instructions'], ns['bender_prompt']())
+        self.assertNotIn('instructions', requests[1])
         self.assertEqual(len(requests[1]['input']), 1)
+
+    async def test_grok_chain_recovery_preserves_history_and_reports_stream_errors(self):
+        for case in ('expired', 'fallback_error', 'partial_error', 'new_legacy'):
+            with self.subTest(case=case):
+                ns = server_namespace()
+                requests = []
+
+                class Stream:
+                    def __init__(self, status=200): self.status_code = status
+                    async def __aenter__(self): return self
+                    async def __aexit__(self, *args): pass
+                    async def aread(self): return b'previous_response_id not found'
+
+                class Client(Stream):
+                    def stream(self, method, url, headers, json):
+                        requests.append(copy.deepcopy(json))
+                        # Match the actual xAI contract, including retries.
+                        if 'previous_response_id' in json and 'instructions' in json:
+                            return Stream(400)
+                        return Stream(404 if len(requests) == 1 and case in
+                                      ('expired', 'fallback_error') else 200)
+
+                async def events(response):
+                    if case == 'fallback_error':
+                        yield {'error': 'fallback failed'}
+                        return
+                    yield {'id': 'recovered', 'text': 'answer'}
+                    if case == 'partial_error':
+                        yield {'error': 'previous_response stream failed'}
+
+                ns.update(XAI_API_KEY='fake', XAI_RESP_URL='unused',
+                          CHAT_CONV_ID='test', CHAT_SUMMARY='earlier context',
+                          CHAT_GROK_RESP_ID='' if case == 'new_legacy' else 'expired-chain',
+                          _httpx_async=Client, _iter_sse=events,
+                          _grok_event_id=lambda ev: ev.get('id', ''),
+                          _grok_delta_text=lambda ev: ev.get('text', ''),
+                          _history_user_asst_nudge=lambda h: (h[-1]['content'], '', ''))
+                history = [{'role': 'user' if i % 2 == 0 else 'assistant',
+                            'content': f'turn-{i}'} for i in range(15)]
+                original = copy.deepcopy(history)
+                if case in ('fallback_error', 'partial_error'):
+                    with self.assertRaisesRegex(RuntimeError, 'failed'):
+                        _ = [p async for p in ns['_grok_pieces'](history, 140, .68)]
+                else:
+                    self.assertEqual([p async for p in ns['_grok_pieces'](history, 140, .68)], ['answer'])
+                    self.assertEqual(ns['CHAT_GROK_RESP_ID'], 'recovered')
+                self.assertEqual(len(requests), 2 if case in ('expired', 'fallback_error') else 1)
+                for request in requests:
+                    self.assertFalse('instructions' in request and 'previous_response_id' in request)
+                if case != 'partial_error':
+                    rebuilt = requests[-1]
+                    self.assertEqual(rebuilt['instructions'], ns['bender_prompt']())
+                    self.assertNotIn('previous_response_id', rebuilt)
+                    self.assertIn('earlier context', rebuilt['input'][0]['content'])
+                    self.assertEqual(rebuilt['input'][1:-1], history[-10:-1])
+                    self.assertEqual(rebuilt['input'][-1]['content'].count('turn-14'), 1)
+                self.assertEqual(history, original)
 
     async def test_session_update_applies_complete_profile_and_keeps_ack(self):
         ns = server_namespace()

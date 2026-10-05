@@ -1982,7 +1982,6 @@ async def _grok_pieces(history: list[dict], n_pred: int, n_temp: float):
         return
     body: dict = {
         "model": GROK_MODEL,
-        "instructions": bender_prompt(),
         "input": [{"role": "user", "content": grok_turn_text(last_user, last_asst, nudge)}],
         "stream": True,
         "store": True,
@@ -1995,19 +1994,25 @@ async def _grok_pieces(history: list[dict], n_pred: int, n_temp: float):
         body["reasoning"] = {"effort": "none"}
     elif re.search(r"grok-4\.[56]", GROK_MODEL):
         body["reasoning"] = {"effort": "low"}
+
+    def new_chain_body() -> dict:
+        # xAI rejects instructions together with previous_response_id. A new
+        # chain needs both the current personality and bounded local context.
+        req = {key: value for key, value in body.items() if key != "previous_response_id"}
+        req["instructions"] = bender_prompt()
+        context = []
+        if CHAT_SUMMARY:
+            context.append({"role": "user", "content": "Контекст попередньої розмови:\n" + CHAT_SUMMARY})
+        context.extend(history[-HISTORY_SEND:-1])
+        req["input"] = context + body["input"]
+        return req
+
     prev = CHAT_GROK_RESP_ID
     if prev:
         body["previous_response_id"] = prev
         log(f"Grok {GROK_MODEL} continue {prev[:12]}… level={BENDER_LEVEL} temp={n_temp:.2f}")
     else:
-        if DEVICE_CHARACTER is not None:
-            # A personality change needs new instructions, not amnesia. Reuse the
-            # bounded local dialogue when starting the replacement remote chain.
-            context = []
-            if CHAT_SUMMARY:
-                context.append({"role": "user", "content": "Контекст попередньої розмови:\n" + CHAT_SUMMARY})
-            context.extend(history[-HISTORY_SEND:-1])
-            body["input"] = context + body["input"]
+        body = new_chain_body()
         log(f"Grok {GROK_MODEL} new chain level={BENDER_LEVEL} temp={n_temp:.2f}")
     headers = {
         "Authorization": f"Bearer {XAI_API_KEY}",
@@ -2024,6 +2029,7 @@ async def _grok_pieces(history: list[dict], n_pred: int, n_temp: float):
                 async for ev in _iter_sse(r):
                     yield ev
 
+    emitted = False
     try:
         async with aclosing(_stream(body)) as events:
             async for ev in events:
@@ -2032,17 +2038,17 @@ async def _grok_pieces(history: list[dict], n_pred: int, n_temp: float):
                     CHAT_GROK_RESP_ID = rid
                 piece = _grok_delta_text(ev)
                 if piece:
+                    emitted = True
                     yield piece
                 err = ev.get("error")
                 if err:
                     raise RuntimeError(str(err)[:300])
     except RuntimeError as e:
         msg = str(e)
-        if prev and ("previous_response" in msg.lower() or "404" in msg or "400" in msg):
+        if prev and not emitted and ("previous_response" in msg.lower() or "404" in msg or "400" in msg):
             log(f"Grok chain miss — new chain: {msg[:180]}")
             CHAT_GROK_RESP_ID = ""
-            body.pop("previous_response_id", None)
-            body["instructions"] = bender_prompt()
+            body = new_chain_body()
             async with aclosing(_stream(body)) as events:
                 async for ev in events:
                     rid = _grok_event_id(ev)
@@ -2051,6 +2057,9 @@ async def _grok_pieces(history: list[dict], n_pred: int, n_temp: float):
                     piece = _grok_delta_text(ev)
                     if piece:
                         yield piece
+                    err = ev.get("error")
+                    if err:
+                        raise RuntimeError(str(err)[:300])
         else:
             raise
 
@@ -2148,51 +2157,6 @@ def _is_question(text: str) -> bool:
     return bool(re.search(r"\?[!?]*\s*$", t))
 
 
-def _question_intonation(pcm: np.ndarray, sr: int, semitones: float = 4.2) -> np.ndarray:
-    """Підйом тону в хвості — Piper/RVC інакше читають «?» як крапку."""
-    x = np.asarray(pcm, dtype=np.float32)
-    n = int(x.size)
-    if n < int(sr * 0.12) or semitones <= 0:
-        return pcm
-    win_n = max(64, int(sr * 0.028))
-    if win_n % 2:
-        win_n += 1
-    hop = win_n // 2
-    w = np.hanning(win_n).astype(np.float32)
-    tail_n = int(np.clip(n * 0.50, sr * 0.22, sr * 0.58))
-    tail_n = min(tail_n, max(hop * 4, n - hop))
-    start = max(0, n - tail_n)
-    acc = np.zeros(n + win_n, dtype=np.float32)
-    wacc = np.zeros(n + win_n, dtype=np.float32)
-    acc[:start] = x[:start]
-    wacc[:start] = 1.0
-    pos = start
-    while pos + win_n <= n:
-        t = (pos - start) / max(1, tail_n - win_n)
-        t = min(1.0, max(0.0, (t - 0.08) / 0.92))
-        ratio = 2.0 ** ((semitones * (t ** 1.2)) / 12.0)
-        frame = x[pos : pos + win_n]
-        new_len = max(32, int(round(win_n / ratio)))
-        src_i = np.arange(win_n, dtype=np.float32)
-        dst_i = np.linspace(0, win_n - 1, new_len)
-        shifted = np.interp(dst_i, src_i, frame).astype(np.float32)
-        sw = np.interp(dst_i, src_i, w).astype(np.float32)
-        pad = (win_n - new_len) // 2
-        a = pos + pad
-        acc[a : a + new_len] += shifted * sw
-        wacc[a : a + new_len] += sw
-        pos += hop
-    if pos < n:
-        acc[pos:n] += x[pos:n]
-        wacc[pos:n] += 1.0
-    y = acc[:n] / np.maximum(wacc[:n], 1e-4)
-    fade = min(hop, start, n // 8)
-    if fade > 0:
-        ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)
-        y[start : start + fade] = x[start : start + fade] * (1.0 - ramp) + y[start : start + fade] * ramp
-    return np.clip(y, -32767, 32767).astype(np.int16)
-
-
 def _pause_samples(unit: str, sr: int) -> int:
     if re.search(r"[.!?…]\s*$", unit):
         ms = PIPER_PAUSE_SENT_MS
@@ -2245,41 +2209,23 @@ def synth(text: str) -> bytes:
                 q_flags.append(False)
     if not pieces:
         return b""
-    spans22: list[tuple[int, int]] = []
-    pos = 0
-    for p, is_q in zip(pieces, q_flags):
-        if is_q and p.size:
-            spans22.append((pos, pos + int(p.size)))
-        pos += int(p.size)
     pcm = np.concatenate(pieces)
     piper_ms = (perf_counter() - voice_started) * 1000
-    n_q = len(spans22)
+    n_q = sum(q_flags)
     pcm = resample_int16(pcm, sr, OUT_RATE)
-    scale = OUT_RATE / float(sr or 22050)
-    spans = [(int(a * scale), int(b * scale)) for a, b in spans22]
     out = pcm.tobytes()
     rvc_ms = 0.0
     if rvc_convert.enabled():
         rvc_started = perf_counter()
         try:
-            n0 = max(1, len(out) // 2)
             out = rvc_convert.convert_pcm(out, OUT_RATE)
-            n1 = max(1, len(out) // 2)
-            if n1 != n0:
-                spans = [(int(a * n1 / n0), int(b * n1 / n0)) for a, b in spans]
             log("RVC ok")
         except Exception as e:
             log(f"RVC fail (Piper raw): {e}")
         finally:
             rvc_ms = (perf_counter() - rvc_started) * 1000
-    if spans:
-        y = np.frombuffer(out, dtype=np.int16).copy()
-        for a, b in spans:
-            a = max(0, min(y.size, a))
-            b = max(a, min(y.size, b))
-            if b - a > 32:
-                y[a:b] = _question_intonation(y[a:b], OUT_RATE, 4.2)
-        out = y.tobytes()
+    # Keep the voice model's question prosody. Post-RVC tail resampling raised
+    # pitch/formants and made short questions sound squeaky.
     peak = int(np.max(np.abs(np.frombuffer(out, dtype=np.int16)))) if out else 0
     log(
         f"TTS {len(out) // 2} samples peak={peak} "
@@ -2444,7 +2390,7 @@ def favorite_voice_command(text: str):
     return None
 
 
-async def run_turn(ws, pcm_in: bytes, prompt: str, history: list) -> None:
+async def run_turn(ws, pcm_in: bytes, prompt: str, history: list, wake_invocation: bool = False) -> None:
     timing = TurnTiming(log)
     pacer = PcmPacer(OUT_RATE)
     delivered: list[str] = []
@@ -2486,6 +2432,14 @@ async def run_turn(ws, pcm_in: bytes, prompt: str, history: list) -> None:
             pcm_out = await synth_sentence(reply)
             await send_sentence(pcm_out)
         else:
+            if wake_invocation:
+                text = voice_commands.wake_question(text)
+                if not text:
+                    log("Wake invocation only — request local acknowledgement, no LLM/TTS")
+                    await ws.send(dumps({"type": "response.output_audio.done"}))
+                    await ws.send(dumps({"type": "response.done", "wake_only": True}))
+                    return
+                log(f"Wake question: {text!r}")
             personal = handle_personal_command(text, history)
             if personal:
                 if personal.changed:
@@ -2501,10 +2455,15 @@ async def run_turn(ws, pcm_in: bytes, prompt: str, history: list) -> None:
                 reply = cmd.reply(len(history))
                 send_name = cmd.name
                 log(f"CMD {send_name or 'talk'} {play_args} → {reply!r}")
+                if send_name == "conversation.end":
+                    # Suppress follow-up even if goodbye synthesis fails. The
+                    # device still drains the spoken reply before going idle.
+                    await ws.send(dumps({"type": "device.command", "name": send_name, "args": {}}))
+                    grok_break_chain("conversation ended")
                 pcm_out = await synth_sentence(reply)
                 await send_sentence(pcm_out)
                 history.append({"role": "assistant", "content": reply})
-                if send_name:
+                if send_name and send_name != "conversation.end":
                     await ws.send(dumps({
                         "type": "device.command",
                         "name": send_name,
@@ -2814,7 +2773,7 @@ async def handle(ws) -> None:
                     DEVICE_CURRENT_STATION = ev["current_station"]
                 pcm_in = bytes(buf)
                 buf.clear()
-                await run_turn(ws, pcm_in, prompt, CHAT)
+                await run_turn(ws, pcm_in, prompt, CHAT, wake_invocation=ev.get("wake_invocation") is True)
             elif t == "response.cancel":
                 buf.clear()
             elif t == "character.preview":

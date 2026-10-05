@@ -1,0 +1,12 @@
+# Local builds, training recordings, downloaded tools and model environments.
+/artifacts/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Device credentials and private server state (keep on this machine).
+/BendeRadio/secrets.h
+/BendeRadio/examples/BenderRealtime/local_server/config.json
+/BendeRadio/examples/BenderRealtime/local_server/chat.json
+/BendeRadio/examples/BenderRealtime/local_server/personal_memory.json*

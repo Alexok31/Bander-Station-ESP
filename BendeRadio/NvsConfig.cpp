@@ -3,8 +3,42 @@
 #include <Preferences.h>
 
 #include "RadioConfig.h"
+#include "WakeVoiceSettings.h"
 
 static constexpr char kNs[] = "bende";
+
+bool nvsLoadWakeVoiceEnabled() {
+    Preferences p;
+    if (!p.begin(kNs, true)) return false;
+    const bool enabled = p.getBool("wake_voice", false);
+    p.end();
+    return enabled;
+}
+
+bool nvsSaveWakeVoiceEnabled(bool enabled) {
+    Preferences p;
+    if (!p.begin(kNs, false)) return false;
+    const bool ok = p.getBool("wake_voice", false) == enabled ||
+                    p.putBool("wake_voice", enabled) == 1;
+    p.end();
+    return ok;
+}
+
+uint8_t nvsLoadWakeFollowupSeconds() {
+    Preferences p;
+    if(!p.begin(kNs,true)) return WakeVoiceSettings::defaultFollowupSeconds;
+    const auto seconds=p.getUChar("wake_follow",WakeVoiceSettings::defaultFollowupSeconds);
+    p.end();
+    return WakeVoiceSettings::validFollowup(seconds)?seconds:WakeVoiceSettings::defaultFollowupSeconds;
+}
+bool nvsSaveWakeFollowupSeconds(uint8_t seconds) {
+    if(!WakeVoiceSettings::validFollowup(seconds)) return false;
+    if(seconds==nvsLoadWakeFollowupSeconds()) return true;
+    Preferences p;
+    if(!p.begin(kNs,false)) return false;
+    const bool ok=p.putUChar("wake_follow",seconds)==1;
+    p.end();return ok;
+}
 
 void nvsLoadWifi(WifiStored& w) {
     Preferences p;
