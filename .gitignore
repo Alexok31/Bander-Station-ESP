@@ -7,6 +7,8 @@ venv/
 
 # Device credentials and private server state (keep on this machine).
 /BendeRadio/secrets.h
+/BendeRadio/examples/BenderRealtime/secrets.h
+/BendeRadio/examples/DaziBender_chat_asr/dazi_secrets.h
 /BendeRadio/examples/BenderRealtime/local_server/config.json
 /BendeRadio/examples/BenderRealtime/local_server/chat.json
 /BendeRadio/examples/BenderRealtime/local_server/personal_memory.json*
