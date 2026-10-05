@@ -70,6 +70,24 @@ details{border:1px solid var(--line);border-radius:16px;background:var(--panel);
 <form class="details-body" method="post" action="/save" data-save-form><input type="hidden" name="section" value="wifi"><div class="field-grid"><div class="field"><label for="sta_ssid">Домашняя сеть</label><input id="sta_ssid" name="sta_ssid" maxlength="32" value="Домашняя сеть" autocomplete="off" required></div><div class="field"><label for="sta_pass">Новый пароль сети</label><input id="sta_pass" name="sta_pass" type="password" maxlength="64" placeholder="Оставь пустым, чтобы сохранить" autocomplete="new-password"></div></div><p class="hint">Поддерживается Wi-Fi 2,4 ГГц. Для раздачи с iPhone включи «Максимальную совместимость».</p><hr class="rule"><div class="field-grid"><div class="field"><label for="ap_ssid">Точка доступа Бендера</label><input id="ap_ssid" name="ap_ssid" maxlength="32" value="Bender Station" autocomplete="off"></div><div class="field"><label for="ap_pass">Новый пароль точки доступа</label><input id="ap_pass" name="ap_pass" type="password" minlength="8" maxlength="64" placeholder="Не менее 8 символов" autocomplete="new-password"></div></div><p class="hint">Пустые поля паролей сохраняют текущие пароли.</p><div class="actions"><p>После перезапуска может понадобиться подключиться к новой сети.</p><button class="btn" type="submit">Сохранить Wi-Fi</button></div></form></details>
 <details><summary><span class="group-number">04</span><div><h2>AI и голос</h2><div class="sub">Адрес сервера Бендера</div></div><span class="chevron" aria-hidden="true">⌄</span></summary>
 <form class="details-body" method="post" action="/save" data-save-form><input type="hidden" name="section" value="ai"><div class="field"><label for="ai_ws">Адрес сервера</label><input id="ai_ws" name="ai_ws" maxlength="160" value="" placeholder="ws://192.168.0.173:8765/v1/realtime" autocomplete="off" spellcheck="false"><p class="hint">Оставь пустым для домашнего ПК в той же сети. Для удалённого подключения укажи адрес ws:// или wss://.</p></div><div class="actions"><p>Сохранение перезапустит колонку.</p><button class="btn" type="submit">Сохранить сервер</button></div></form></details>
+<details id="wake-sample-section"><summary><span class="group-number">05</span><div><h2>Голосовой вызов</h2><div class="sub">Запись примеров с микрофона Бендера</div></div><span class="chevron" aria-hidden="true">⌄</span></summary>
+<div class="details-body"><p class="hint">Скажи «Эй, Бендер», «Привет, Бендер» или «Бендер». Он откликнется короткой репликой в своём характере. Когда вверху правого глаза загорится точка — задавай вопрос. Реплики хранятся на колонке и выбираются по сохранённому эквалайзеру характера. Пауза около секунды завершает вопрос. Пока это эксперимент: возможны пропуски и ложные срабатывания.</p>
+<div class="field"><label for="wake-follow-up">Ожидание следующего вопроса: <output id="wake-follow-value">8 с</output></label><input type="range" id="wake-follow-up" min="0" max="30" step="1" value="8"><p class="hint">0 — каждый вопрос после обращения. Иначе после ответа прозвучит сигнал и можно продолжить разговор. Настройка сохраняется после перезагрузки и применяется к следующему окну слушания.</p><button class="btn secondary" type="button" id="wake-follow-save">Сохранить время</button></div>
+<div class="preset-grid"><button class="btn" type="button" id="wake-voice-start">Включить голосовой вызов</button><button class="btn secondary" type="button" id="wake-diag-start">Только проверка</button><button class="btn secondary" type="button" id="wake-diag-stop">Выключить</button></div>
+<p id="wake-diag-status" class="calib-status" role="status" aria-live="polite">Голосовой вызов выключен после перезагрузки.</p>
+<p class="hint">Обращения распознаются на колонке. В режиме голосового вызова вопросы отправляются настроенному AI-серверу; для ответа нужна сеть. При молчании Бендер вернётся к ожиданию обращения: через 6 секунд после вызова или через выбранное время после ответа. «Только проверка» считает обращения без передачи звука. Закрытие страницы не выключает микрофон. После перезагрузки включи голосовой вызов заново.</p>
+<h3>Записи для обучения</h3>
+<div class="field-grid"><div class="field"><label for="wake-sample-label">Что произнести</label><select id="wake-sample-label"><option value="hey_bender">Эй, Бендер</option><option value="privet_bender">Привет, Бендер</option><option value="bender">Бендер</option><option value="negative">Обычная речь или фон — без вызова</option></select></div><div class="field"><label for="wake-sample-split">Набор примеров</label><select id="wake-sample-split"><option value="train">Для обучения</option><option value="test">Для проверки — отдельная сессия</option></select></div></div>
+<p class="hint">Поставь музыку на паузу и заверши AirPlay. Нажми «Записать», дождись «Говори» и произнеси фразу один раз обычным голосом. Запись остановится через 4 секунды.</p>
+<div class="preset-grid"><button class="btn" type="button" id="wake-sample-start">Записать 4 секунды</button><button class="btn secondary" type="button" id="wake-sample-cancel" disabled>Отменить запись</button><button class="btn secondary small" type="button" id="wake-sample-refresh">Обновить статус</button></div>
+<progress id="wake-sample-progress" max="4000" value="0" style="width:100%;accent-color:var(--mint)" aria-label="Длительность записи"></progress>
+<p class="calib-status" id="wake-sample-status" role="status" aria-live="polite">Готов к записи примера с микрофона колонки.</p>
+<div id="wake-sample-result" hidden><audio id="wake-sample-audio" controls preload="none" style="width:100%"></audio><div class="preset-grid"><a class="btn" id="wake-sample-download">Скачать пример</a><button class="btn secondary small" type="button" id="wake-sample-discard">Удалить с колонки</button></div><p class="hint">Прослушивание идёт в браузере. Новые записи добавляются в пул, старые остаются.</p></div>
+<p class="calib-status" id="wake-sample-pool-status" role="status">Пул записей: нажми «Обновить статус».</p>
+<p class="hint">До 30 примеров, пока хватает свободной памяти. Сохраняются при закрытии страницы, но исчезают после выключения или перезагрузки колонки. Перед этим скачай набор. Скачивание не удаляет записи.</p>
+<div class="preset-grid"><button class="btn secondary" id="wake-sample-export" type="button" disabled>Собрать ZIP всего набора</button><a class="btn" id="wake-sample-archive" hidden>Скачать ZIP</a><button class="btn secondary small" id="wake-sample-clear-pool" type="button" disabled>Очистить пул</button></div>
+<div id="wake-sample-list" style="display:grid;gap:10px;margin-top:14px"></div>
+<p class="hint">Запись примеров не меняет установленную модель автоматически. Обучение выполняется отдельно на ПК.</p></div></details>
 <p class="settings-note">Сохраняется только выбранная группа. Изменения в других открытых группах останутся несохранёнными.</p>
 </section>
 <section id="panel-character" data-panel="character" aria-labelledby="character-title" hidden>
@@ -125,6 +143,142 @@ details{border:1px solid var(--line);border-radius:16px;background:var(--panel);
 </div>
 <noscript><style>[data-panel][hidden]{display:block!important;margin-top:35px}</style><p>Для переключения разделов и предпросмотра яркости включи JavaScript. Формы сохранения доступны без него.</p></noscript>
 <script>
+// Local dataset recording uses the device microphone, never getUserMedia or the AI server.
+const sampleEl=id=>document.getElementById('wake-sample-'+id);
+let sampleBusy=false,sampleId=0,sampleState=0,sampleUrl=null,sampleArchiveUrl=null,samplePool=[];
+function sampleMessage(text){sampleEl('status').textContent=text;}
+function sampleControls(){sampleEl('start').disabled=sampleBusy;sampleEl('refresh').disabled=sampleBusy;sampleEl('label').disabled=sampleBusy;sampleEl('split').disabled=sampleBusy;sampleEl('discard').disabled=sampleBusy;sampleEl('cancel').disabled=!sampleBusy||![1,2].includes(sampleState)||!sampleId;sampleEl('export').disabled=sampleBusy||!samplePool.length;sampleEl('clear-pool').disabled=sampleBusy||!samplePool.length;sampleEl('list').querySelectorAll('button').forEach(b=>b.disabled=sampleBusy);}
+function sampleClear(){sampleEl('audio').pause();sampleEl('audio').removeAttribute('src');sampleEl('audio').load();if(sampleUrl)URL.revokeObjectURL(sampleUrl);sampleUrl=null;sampleEl('download').removeAttribute('href');sampleEl('result').hidden=true;}
+async function sampleFetch(path,options={}){const c=new AbortController(),timer=setTimeout(()=>c.abort(),12000);try{const r=await fetch(path,{...options,signal:c.signal,cache:'no-store'});if(!r.ok)throw Error(await r.text());return r;}finally{clearTimeout(timer);}}
+function samplePost(values){return sampleFetch('/wakeword/sample',{method:'POST',headers:{'X-Bender-Record':'1'},body:new URLSearchParams(values)});}
+// Two-phase 65-tap Blackman-windowed sinc (7 kHz cutoff) suppresses aliasing
+// before 24 -> 16 kHz conversion. AudioBufferSource resampling alone does not
+// sufficiently filter above 8 kHz in every browser. No AudioContext is needed.
+async function sampleTrainingWav(blob){
+ const raw=await blob.arrayBuffer(),view=new DataView(raw);
+ const tag=offset=>String.fromCharCode(...new Uint8Array(raw,offset,4));
+ if(raw.byteLength!==192044||tag(0)!=='RIFF'||tag(8)!=='WAVE'||tag(36)!=='data'||view.getUint16(20,true)!==1||view.getUint16(22,true)!==1||view.getUint32(24,true)!==24000||view.getUint16(34,true)!==16||view.getUint32(40,true)!==192000)throw Error('Запись пришла не полностью. Нажми «Обновить статус», чтобы загрузить её снова.');
+ const input=new Float32Array(96000);
+ for(let i=0;i<input.length;i++)input[i]=view.getInt16(44+i*2,true)/32768;
+ const filters=[0,.5].map(phase=>{const weights=[];let total=0;for(let k=-32;k<=32;k++){const t=k-phase,x=2*Math.PI*7000/24000*t,window=.42+.5*Math.cos(Math.PI*t/33)+.08*Math.cos(2*Math.PI*t/33);const weight=(x===0?1:Math.sin(x)/x)*window;weights.push(weight);total+=weight;}return weights.map(w=>w/total);});
+ const samples=new Float32Array(64000);for(let j=0;j<samples.length;j++){const center=Math.floor(j*1.5),weights=filters[j%2];let value=0;for(let k=-32;k<=32;k++){const at=center+k;if(at>=0&&at<input.length)value+=input[at]*weights[k+32];}samples[j]=value;}
+ const out=new ArrayBuffer(44+samples.length*2),wav=new DataView(out);
+ new Uint8Array(out,0,44).set(new Uint8Array(raw,0,44));wav.setUint32(4,out.byteLength-8,true);wav.setUint32(24,16000,true);wav.setUint32(28,32000,true);wav.setUint32(40,samples.length*2,true);
+ let peak=0,clipped=0;for(let i=0;i<input.length;i++){peak=Math.max(peak,Math.abs(input[i]));if(Math.abs(input[i])>=32760/32768)clipped++;}
+ for(let i=0;i<samples.length;i++)wav.setInt16(44+i*2,Math.max(-32768,Math.min(32767,Math.round(samples[i]*32768))),true);
+ return {blob:new Blob([out],{type:'audio/wav'}),quiet:peak<.003,clipped:clipped/input.length>.02};
+}
+async function sampleFollow(s){
+ const id=s.id;sampleId=id;const deadline=Date.now()+25000;
+ while(true){
+  if(s.id!==id)throw Error('Запись заменена из другой вкладки. Нажми «Обновить статус».');
+  sampleState=s.state;sampleControls();sampleEl('progress').value=s.ms;
+  if(s.state===0){sampleClear();sampleMessage('Запись отменена или удалена. Можно записать новый пример.');return;}
+  if(s.state===4)throw Error('Запись не завершилась. Поставь музыку на паузу и повтори.');
+  if(s.state===3){
+   sampleClear();sampleMessage('Загружаю запись с колонки…');
+   const response=await sampleFetch('/wakeword/audio.wav?id='+id),audio=await sampleTrainingWav(await response.blob());
+   sampleUrl=URL.createObjectURL(audio.blob);sampleEl('audio').src=sampleUrl;
+   const link=sampleEl('download');link.href=sampleUrl;link.download=`bender_${s.label}_${s.split}_${new Date().toISOString().replace(/[:.]/g,'-')}_${id}.wav`;
+   sampleEl('result').hidden=false;
+   sampleMessage(audio.clipped?'Запись перегружена. Отойди от колонки и повтори.':audio.quiet&&s.label!=='negative'?'Очень тихая запись. Проверь её прослушиванием и попробуй говорить ближе.':'Готово. Пример сохранён в пуле колонки. Можно записать следующий.');return;
+  }
+  sampleMessage(s.state===1?'Подготавливаю микрофон колонки…':'Говори. Идёт запись: '+(s.ms/1000).toFixed(1)+' / 4 с');
+  if(Date.now()>deadline)throw Error('Ожидание затянулось. Нажми «Обновить статус».');
+  await new Promise(resolve=>setTimeout(resolve,250));s=await (await sampleFetch('/wakeword/sample')).json();
+ }
+}
+async function sampleAction(start){
+ if(sampleBusy)return;sampleBusy=true;sampleState=0;sampleControls();sampleMessage(start?'Подготавливаю запись…':'Проверяю запись в колонке…');
+ try{const r=start?await samplePost({action:'start',label:sampleEl('label').value,split:sampleEl('split').value}):await sampleFetch('/wakeword/sample');const s=await r.json();if(start)sampleClear();await sampleFollow(s);}
+ catch(e){sampleMessage(e.name==='AbortError'?'Связь с колонкой прервалась. Нажми «Обновить статус».':e.message);}
+ finally{await samplePoolRefresh();sampleBusy=false;sampleControls();}
+}
+sampleEl('start').addEventListener('click',()=>sampleAction(true));sampleEl('refresh').addEventListener('click',()=>sampleAction(false));
+sampleEl('cancel').addEventListener('click',async()=>{sampleEl('cancel').disabled=true;try{await samplePost({action:'cancel',id:sampleId});sampleMessage('Останавливаю запись…');}catch(e){sampleMessage(e.message);}});
+sampleEl('discard').addEventListener('click',()=>sampleDelete(sampleId));
+function sampleArchiveClear(){if(sampleArchiveUrl)URL.revokeObjectURL(sampleArchiveUrl);sampleArchiveUrl=null;sampleEl('archive').hidden=true;sampleEl('archive').removeAttribute('href');}
+async function samplePoolRefresh(){
+ try{
+  const data=await(await sampleFetch('/wakeword/samples')).json();
+  if(!Array.isArray(data.items)||data.items.length>30||!data.items.every(s=>Number.isInteger(s.id)&&s.id>0&&s.id<=4294967295&&['hey_bender','privet_bender','negative','bender'].includes(s.label)&&['train','test'].includes(s.split)))throw Error('Некорректный список записей.');
+  if(JSON.stringify(data.items)!==JSON.stringify(samplePool))sampleArchiveClear();samplePool=data.items;
+  sampleEl('pool-status').textContent=`В пуле: ${samplePool.length} / ${data.capacity}. Места ещё примерно на ${data.available} записей.`;
+  const list=sampleEl('list');list.replaceChildren();
+  for(const s of samplePool){const row=document.createElement('div'),title=document.createElement('div');row.className='field';title.textContent=({'hey_bender':'Эй, Бендер','privet_bender':'Привет, Бендер','bender':'Бендер','negative':'Речь / фон без вызова'})[s.label]+` · ${s.split==='test'?'проверка':'обучение'} · №${s.id}`;row.append(title);const actions=document.createElement('div');actions.className='preset-grid';for(const [text,action] of [['Прослушать',()=>sampleSelect(s)],['Удалить',()=>sampleDelete(s.id)]]){const b=document.createElement('button');b.type='button';b.className='btn secondary small';b.textContent=text;b.onclick=action;actions.append(b);}row.append(actions);list.append(row);}
+ }catch(e){sampleEl('pool-status').textContent='Не удалось обновить пул: '+e.message;}
+ sampleControls();
+}
+async function sampleSelect(s){if(sampleBusy)return;sampleBusy=true;sampleControls();try{await sampleFollow(s);}catch(e){sampleMessage(e.message);}finally{sampleBusy=false;sampleControls();}}
+async function sampleDelete(id){if(sampleBusy)return;sampleBusy=true;sampleState=0;sampleControls();try{await samplePost({action:'cancel',id});if(id===sampleId){sampleClear();sampleEl('progress').value=0;}sampleMessage('Пример удалён с колонки. Остальные записи сохранены.');}catch(e){sampleMessage(e.message);}finally{await samplePoolRefresh();sampleBusy=false;sampleControls();}}
+// ZIP STORE: bounded to 20 four-second WAVs; assembled in browser memory.
+function sampleZip(entries){
+ const local=[],central=[];let offset=0,centralSize=0;
+ for(const entry of entries){const name=new TextEncoder().encode(entry.name),data=entry.data;let crc=0xffffffff;for(const byte of data){crc^=byte;for(let k=0;k<8;k++)crc=(crc>>>1)^((crc&1)?0xedb88320:0);}crc=(crc^0xffffffff)>>>0;
+  const h=new Uint8Array(30+name.length),v=new DataView(h.buffer);v.setUint32(0,0x04034b50,true);v.setUint16(4,20,true);v.setUint16(12,33,true);v.setUint32(14,crc,true);v.setUint32(18,data.length,true);v.setUint32(22,data.length,true);v.setUint16(26,name.length,true);h.set(name,30);local.push(h,data);
+  const c=new Uint8Array(46+name.length),cv=new DataView(c.buffer);cv.setUint32(0,0x02014b50,true);cv.setUint16(4,20,true);cv.setUint16(6,20,true);cv.setUint16(14,33,true);cv.setUint32(16,crc,true);cv.setUint32(20,data.length,true);cv.setUint32(24,data.length,true);cv.setUint16(28,name.length,true);cv.setUint32(42,offset,true);c.set(name,46);central.push(c);centralSize+=c.length;offset+=h.length+data.length;
+ }
+ const end=new Uint8Array(22),e=new DataView(end.buffer);e.setUint32(0,0x06054b50,true);e.setUint16(8,entries.length,true);e.setUint16(10,entries.length,true);e.setUint32(12,centralSize,true);e.setUint32(16,offset,true);return new Blob([...local,...central,end],{type:'application/zip'});
+}
+async function sampleExport(){
+ if(sampleBusy)return;sampleBusy=true;sampleState=0;sampleControls();sampleArchiveClear();
+ try{
+  const data=await(await sampleFetch('/wakeword/samples')).json();
+  if(!Array.isArray(data.items)||!data.items.length||data.items.length>30)throw Error('Нет готовых записей для скачивания.');
+  const entries=[],manifest=[];
+  for(const [i,s] of data.items.entries()){
+   if(!Number.isInteger(s.id)||s.id<=0||s.id>4294967295||!['train','test'].includes(s.split)||!['hey_bender','privet_bender','negative','bender'].includes(s.label))throw Error('Некорректные данные записи.');
+   sampleMessage(`Собираю набор: ${i+1} / ${data.items.length}…`);
+   const audio=await sampleTrainingWav(await(await sampleFetch('/wakeword/audio.wav?id='+s.id)).blob()),name=`${s.split}/${s.label}/${s.id}.wav`;
+   entries.push({name,data:new Uint8Array(await audio.blob.arrayBuffer())});manifest.push({...s,file:name,rate:16000,quiet:audio.quiet,clipped:audio.clipped});
+  }
+  entries.push({name:'manifest.json',data:new TextEncoder().encode(JSON.stringify({version:1,source:'bender-microphone',exported_at:new Date().toISOString(),items:manifest},null,2))});
+  sampleArchiveUrl=URL.createObjectURL(sampleZip(entries));const link=sampleEl('archive');link.href=sampleArchiveUrl;link.download='bender-recordings-'+new Date().toISOString().replace(/[:.]/g,'-')+'.zip';link.hidden=false;
+  sampleMessage('Набор готов. Нажми «Скачать ZIP». Записи остаются в колонке.');
+ }catch(e){sampleMessage('Набор не собран: '+e.message+' Записи в колонке не удалены.');}
+ finally{sampleBusy=false;sampleControls();}
+}
+sampleEl('export').addEventListener('click',sampleExport);
+sampleEl('clear-pool').addEventListener('click',async()=>{if(sampleBusy||!confirm('Удалить все записи с колонки? Сначала скачай ZIP и проверь его.'))return;sampleBusy=true;sampleState=0;sampleControls();try{await samplePost({action:'clear'});sampleClear();sampleArchiveClear();sampleMessage('Пул очищен.');}catch(e){sampleMessage(e.message);}finally{await samplePoolRefresh();sampleBusy=false;sampleControls();}});
+let wakeDiagPending=false,wakeDiagTimer=0,wakeFollowDirty=false;
+function wakeFollowLabel(){const n=Number(document.getElementById('wake-follow-up').value);document.getElementById('wake-follow-value').textContent=n?`${n} с`:'выключено';}
+async function wakeDiagnostic(enabled,mode='diagnostic',followSeconds){
+ if(wakeDiagPending)return;
+ wakeDiagPending=true;
+ const start=document.getElementById('wake-diag-start'),voice=document.getElementById('wake-voice-start'),stop=document.getElementById('wake-diag-stop'),status=document.getElementById('wake-diag-status'),follow=document.getElementById('wake-follow-up');
+ const saveFollow=document.getElementById('wake-follow-save');
+ start.disabled=voice.disabled=stop.disabled=saveFollow.disabled=true;
+ try{
+  const saving=followSeconds!==undefined;
+  const options=saving?{method:'POST',headers:{'X-Bender-Record':'1'},body:new URLSearchParams({action:'settings',follow_up_seconds:String(followSeconds)})}:enabled===undefined?{}:{method:'POST',headers:{'X-Bender-Record':'1'},body:new URLSearchParams({enabled:enabled?'1':'0',mode})};
+  const s=await(await sampleFetch('/wakeword/diagnostic',options)).json();
+  if(typeof s.enabled!=='boolean'||!Number.isFinite(s.detections))throw Error('Обнови прошивку для диагностики распознавания.');
+  const errors={1:'Недостаточно памяти',2:'Ошибка модели',3:'Ошибка памяти модели',4:'Ошибка распознавания',5:'Не удалось включить микрофон'};
+  const voiceStates={1:'Услышал! Готовлюсь — дождись реплики и точки в глазу',2:'Слушаю вопрос — говори',3:'Готовлю ответ / говорю'};
+  const state=s.error?(errors[s.error]||'Ошибка детектора'):!s.enabled?'Выключено':voiceStates[s.voice_state]||(!s.ready?'Подготовка модели':s.listening?(s.diagnostic===false?'Жду обращения':'Слушаю — только проверка'):'Пауза / подготовка микрофона');
+  const timing=s.decision_ms?` / ${s.decision_ms} мс` : '';
+  status.textContent=`${state}. Обращений: ${s.detections}. Оценка: ${Math.round(s.score*100)}%. Обработка: ${(s.processing_us/1000).toFixed(1)} мс${timing}. Пропусков звука: ${s.dropped}.`;
+  if(s.enabled&&s.decision_ms&&s.processing_us>=s.decision_ms*1000)status.textContent+=' Обработка не успевает за звуком.';
+  start.disabled=(s.enabled&&s.diagnostic!==false)||!!s.error;voice.disabled=(s.enabled&&s.diagnostic===false)||!!s.error;stop.disabled=!s.enabled;
+  if(saving&&Number(follow.value)===followSeconds)wakeFollowDirty=false;
+  if(!wakeFollowDirty&&Number.isFinite(s.follow_up_seconds)){follow.value=s.follow_up_seconds;wakeFollowLabel();}
+  if(saving)status.textContent+=' Время ожидания сохранено.';
+ }catch(error){status.textContent=error.message;start.disabled=voice.disabled=stop.disabled=false;}
+ finally{wakeDiagPending=false;saveFollow.disabled=false;}
+}
+document.getElementById('wake-diag-start').addEventListener('click',()=>wakeDiagnostic(true));
+document.getElementById('wake-voice-start').addEventListener('click',()=>wakeDiagnostic(true,'voice'));
+document.getElementById('wake-diag-stop').addEventListener('click',()=>wakeDiagnostic(false));
+document.getElementById('wake-follow-up').addEventListener('input',()=>{wakeFollowDirty=true;wakeFollowLabel();});
+document.getElementById('wake-follow-save').addEventListener('click',()=>wakeDiagnostic(undefined,'settings',Number(document.getElementById('wake-follow-up').value)));
+document.getElementById('wake-sample-section').addEventListener('toggle',()=>{
+ clearInterval(wakeDiagTimer);
+ if(document.getElementById('wake-sample-section').open){
+  if(!sampleBusy)samplePoolRefresh();wakeDiagnostic();
+  wakeDiagTimer=setInterval(()=>{if(!document.hidden&&!sampleBusy)wakeDiagnostic();},2000);
+ }
+});
+window.addEventListener('pagehide',()=>{if(sampleBusy&&[1,2].includes(sampleState)&&sampleId)fetch('/wakeword/sample',{method:'POST',headers:{'X-Bender-Record':'1'},body:new URLSearchParams({action:'cancel',id:sampleId}),keepalive:true}).catch(()=>{});});
 const panels=['radio','settings','character'];
 function showPanel(){const key=location.hash.slice(1);const active=panels.includes(key)?key:'radio';document.querySelectorAll('[data-panel]').forEach(p=>p.hidden=p.dataset.panel!==active);document.querySelectorAll('[data-nav]').forEach(a=>{if(a.dataset.nav===active)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current');});}
 window.addEventListener('hashchange',()=>{showPanel();window.scrollTo(0,0);});showPanel();
