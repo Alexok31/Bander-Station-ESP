@@ -99,7 +99,11 @@ def load_config() -> dict:
         "ollama_model": "aya-expanse:8b",
         "grok_model": "grok-4.3",
         "xai_api_key": "",
-        "piper_length": 0.77,
+        "piper_length": 0.90,
+        "piper_uk_voice": "ukrainian_tts-medium",
+        "tts_backend": "piper",
+        "holos_speaker": "Speaker_84",
+        "holos_speed": 1.0,
         "bender_level": 5,
         "history_turns": 40,
         "summary_chars": 2000,
@@ -133,9 +137,9 @@ def load_config() -> dict:
     except (TypeError, ValueError):
         cfg["history_turns"] = 40
     try:
-        cfg["piper_length"] = float(cfg.get("piper_length") or 0.77)
+        cfg["piper_length"] = float(cfg.get("piper_length") or 0.90)
     except (TypeError, ValueError):
-        cfg["piper_length"] = 0.77
+        cfg["piper_length"] = 0.90
     try:
         cfg["summary_chars"] = max(400, int(cfg.get("summary_chars") or 2000))
     except (TypeError, ValueError):
@@ -169,11 +173,21 @@ CHAT_GROK_RESP_ID = ""
 GROK_PROMPT_REV = 13
 DEVICE_STATIONS: list[dict] = []
 
-VOICE_ONNX = MODELS / "uk_UA-ukrainian_tts-medium.onnx"
-VOICE_JSON = MODELS / "uk_UA-ukrainian_tts-medium.onnx.json"
+PIPER_UK_VOICES = {
+    "ukrainian_tts-medium": ("ukrainian_tts/medium", "uk_UA-ukrainian_tts-medium.onnx"),
+    "mykyta-high": ("mykyta/high", "uk_UA-mykyta-high.onnx"),
+}
+PIPER_UK_VOICE = os.environ.get(
+    "PIPER_UK_VOICE", str(CFG.get("piper_uk_voice") or "ukrainian_tts-medium")
+).strip()
+if PIPER_UK_VOICE not in PIPER_UK_VOICES:
+    raise ValueError(f"Unknown piper_uk_voice: {PIPER_UK_VOICE}")
+voice_dir, voice_file = PIPER_UK_VOICES[PIPER_UK_VOICE]
+VOICE_ONNX = MODELS / voice_file
+VOICE_JSON = MODELS / f"{voice_file}.json"
 VOICE_BASE = (
-    "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/"
-    "uk/uk_UA/ukrainian_tts/medium/uk_UA-ukrainian_tts-medium.onnx"
+    "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+    f"uk/uk_UA/{voice_dir}/{voice_file}"
 )
 VOICE_EN_ONNX = MODELS / "en_US-ryan-medium.onnx"
 VOICE_EN_JSON = MODELS / "en_US-ryan-medium.onnx.json"
@@ -185,6 +199,11 @@ VOICE_EN_BASE = (
 PIPER_SPEAKER = int(os.environ.get("PIPER_SPEAKER", "1"))
 # >1 повільніше, <1 швидше.
 PIPER_LENGTH = float(os.environ.get("PIPER_LENGTH", str(CFG["piper_length"])))
+TTS_BACKEND = os.environ.get("BENDER_TTS", str(CFG.get("tts_backend") or "piper")).strip().lower()
+if TTS_BACKEND not in ("piper", "holos"):
+    raise ValueError(f"Unknown tts_backend: {TTS_BACKEND}")
+HOLOS_SPEAKER = os.environ.get("HOLOS_SPEAKER", str(CFG.get("holos_speaker") or "Speaker_84"))
+HOLOS_SPEED = float(os.environ.get("HOLOS_SPEED", str(CFG.get("holos_speed") or 1.0)))
 PIPER_PAUSE_SENT_MS = int(os.environ.get("PIPER_PAUSE_SENT_MS", "120"))
 PIPER_PAUSE_COMMA_MS = int(os.environ.get("PIPER_PAUSE_COMMA_MS", "0"))
 LLM_MAX_SENTS = int(os.environ.get("LLM_MAX_SENTS", "3"))
@@ -356,6 +375,7 @@ piper_voice = None
 piper_syn = None
 piper_voice_en = None
 piper_syn_en = None
+holos_voice = None
 
 
 def log(msg: str) -> None:
@@ -622,14 +642,15 @@ def load_piper():
     download(VOICE_BASE + ".json", VOICE_JSON)
     piper_voice = PiperVoice.load(str(VOICE_ONNX))
     names = {int(i): n for n, i in (piper_voice.config.speaker_id_map or {}).items()}
-    who = names.get(PIPER_SPEAKER, f"id{PIPER_SPEAKER}")
+    speaker_id = PIPER_SPEAKER if PIPER_UK_VOICE == "ukrainian_tts-medium" else None
+    who = names.get(speaker_id, PIPER_UK_VOICE)
     piper_syn = SynthesisConfig(
-        speaker_id=PIPER_SPEAKER,
+        speaker_id=speaker_id,
         length_scale=PIPER_LENGTH,
         noise_scale=0.62,
         noise_w_scale=0.80,
     )
-    log(f"Piper OK (uk_UA {who}, length={PIPER_LENGTH})")
+    log(f"Piper OK (uk_UA {who}, model={PIPER_UK_VOICE}, length={PIPER_LENGTH})")
     load_stress_words()
     load_uk_stress()
     try:
@@ -646,6 +667,20 @@ def load_piper():
         piper_voice_en = None
         piper_syn_en = None
         log(f"Piper EN skip: {e}")
+
+
+def load_holos():
+    global holos_voice
+    if TTS_BACKEND != "holos":
+        return
+    try:
+        from holos_tts import HolosVoice
+
+        holos_voice = HolosVoice(speaker=HOLOS_SPEAKER, speed=HOLOS_SPEED)
+        log(f"HolosTTS OK (CPU, {HOLOS_SPEAKER}, speed={HOLOS_SPEED})")
+    except Exception as e:
+        holos_voice = None
+        log(f"HolosTTS unavailable — Piper fallback: {e}")
 
 
 _UK_ONES = (
@@ -2204,6 +2239,7 @@ def synth(text: str) -> bytes:
     if not text.strip():
         text = "Нічого не розчув. Повтори, м'ясний мішок."
     use_en = piper_voice_en is not None and _latin_letter_share(text) > 0.55
+    use_holos = not use_en and TTS_BACKEND == "holos" and holos_voice is not None
     if use_en:
         voice, syn, ready = piper_voice_en, piper_syn_en, piper_ready_en
     else:
@@ -2214,21 +2250,28 @@ def synth(text: str) -> bytes:
     q_flags: list[bool] = []
     sr = 22050
     for i, unit in enumerate(units):
-        pcm, sr = _piper_pcm(voice, syn, unit)
+        if use_holos:
+            try:
+                pcm, sr = holos_voice.synthesize(unit), OUT_RATE
+            except Exception as e:
+                log(f"HolosTTS synth fail — Piper fallback: {e}")
+                use_holos = False
+                pcm, sr = _piper_pcm(piper_voice, piper_syn, unit)
+        else:
+            pcm, sr = _piper_pcm(voice, syn, unit)
         if pcm.size:
-            pieces.append(pcm)
+            pieces.append(resample_int16(pcm, sr, OUT_RATE))
             q_flags.append(_is_question(unit))
         if i < len(units) - 1:
-            gap = _pause_samples(unit, sr)
+            gap = _pause_samples(unit, OUT_RATE)
             if gap:
                 pieces.append(np.zeros(gap, dtype=np.int16))
                 q_flags.append(False)
     if not pieces:
         return b""
     pcm = np.concatenate(pieces)
-    piper_ms = (perf_counter() - voice_started) * 1000
+    synth_ms = (perf_counter() - voice_started) * 1000
     n_q = sum(q_flags)
-    pcm = resample_int16(pcm, sr, OUT_RATE)
     out = pcm.tobytes()
     rvc_ms = 0.0
     if rvc_convert.enabled():
@@ -2237,7 +2280,7 @@ def synth(text: str) -> bytes:
             out = rvc_convert.convert_pcm(out, OUT_RATE)
             log("RVC ok")
         except Exception as e:
-            log(f"RVC fail (Piper raw): {e}")
+            log(f"RVC fail (TTS raw): {e}")
         finally:
             rvc_ms = (perf_counter() - rvc_started) * 1000
     # Keep the voice model's question prosody. Post-RVC tail resampling raised
@@ -2248,7 +2291,7 @@ def synth(text: str) -> bytes:
         f"pauses={max(0, len(units) - 1)} q={n_q}"
     )
     out = _trim_pcm_silence(out, OUT_RATE)
-    log(f"[Latency] voice chars={len(text)} piper={piper_ms:.0f}ms "
+    log(f"[Latency] voice chars={len(text)} tts={synth_ms:.0f}ms "
         f"rvc={rvc_ms:.0f}ms total={(perf_counter() - voice_started) * 1000:.0f}ms")
     return out
 
@@ -2837,6 +2880,7 @@ async def main() -> None:
     log("loading models (первый раз — скачивание, жди)…")
     load_whisper()
     load_piper()
+    load_holos()
     if rvc_convert.enabled():
         ok, msg = rvc_convert.ready()
         log(f"RVC {'OK' if ok else 'skip'}: {msg}")

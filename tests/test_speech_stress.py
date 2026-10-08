@@ -112,6 +112,7 @@ class SynthesisPreparationTests(unittest.TestCase):
         voice.synthesize.side_effect = RuntimeError("stop at voice boundary")
         ns.update({
             "perf_counter": lambda: 0, "piper_voice_en": None,
+            "TTS_BACKEND": "piper", "holos_voice": None,
             "piper_voice": voice, "piper_syn": object(), "piper_ready_uk": ready,
             "_clause_units": lambda text: [text],
         })

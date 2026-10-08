@@ -3,7 +3,11 @@
   "ollama_model": "aya-expanse:8b",
   "grok_model": "grok-4.3",
   "xai_api_key": "",
-  "piper_length": 0.84,
+  "piper_length": 0.9,
+  "piper_uk_voice": "ukrainian_tts-medium",
+  "tts_backend": "piper",
+  "holos_speaker": "Speaker_84",
+  "holos_speed": 1.0,
   "history_turns": 40,
   "summary_chars": 2000
 }

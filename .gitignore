@@ -1,5 +1,13 @@
 # Local builds, training recordings, downloaded tools and model environments.
 /artifacts/
+/BendeRadio/examples/BenderRealtime/local_server/models/uk_UA-mykyta-high.onnx
+/BendeRadio/examples/BenderRealtime/local_server/models/uk_UA-mykyta-high.onnx.json
+/BendeRadio/examples/BenderRealtime/local_server/models/uk_UA-oleksa-high.onnx
+/BendeRadio/examples/BenderRealtime/local_server/models/uk_UA-oleksa-high.onnx.json
+/BendeRadio/examples/BenderRealtime/local_server/models/uk_UA-tetiana-high.onnx
+/BendeRadio/examples/BenderRealtime/local_server/models/uk_UA-tetiana-high.onnx.json
+/BendeRadio/examples/BenderRealtime/local_server/models/holos/*.onnx
+/BendeRadio/examples/BenderRealtime/local_server/models/holos/*.pt
 __pycache__/
 *.py[cod]
 .venv/
