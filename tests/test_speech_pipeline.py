@@ -167,10 +167,12 @@ def load_server_functions():
     # Importing server.py itself creates model folders and loads local settings.
     functions = {
         "_iter_checked_reply", "run_turn", "send_pcm_deltas", "_is_canned",
-        "_strip_loop_sents", "_content_words", "_too_like_last", "_reply_head",
-        "_same_frame", "_too_like_any", "_too_like_user", "_join_reply",
+        "_strip_loop_sents", "_reply_words", "_too_like_last",
+        "_too_like_any", "_too_like_user", "_join_reply",
+        "_trim_reply_filler",
+        "_repeats_expletive_opening",
     }
-    constants = {"_CANNED_RE", "_LOOP_SENT_RE", "_SIM_STOP"}
+    constants = {"_CANNED_RE", "_LOOP_SENT_RE", "_ACK_OPENING_RE", "_RUDE_ACK_OPENING_RE", "_SOCIAL_ECHO_RE", "_EMPTY_INVITATION_RE"}
     tree = ast.parse((SERVER_DIR / "server.py").read_text(encoding="utf-8"))
     body = [node for node in tree.body if
             isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in functions
@@ -207,7 +209,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self.timing = TurnTiming(self.logs.append)
         self.history = [{"role": "user", "content": "Розкажи щось."}]
 
-    async def test_only_wake_name_requests_local_cue_without_llm_tts_or_history(self):
+    async def test_only_wake_name_opens_followup_without_llm_tts_or_history(self):
         import voice_commands
         self.ns['voice_commands'] = voice_commands
         self.ns['transcribe'] = lambda pcm: ('Привет, Бендер!', 'ru', 1, True)
@@ -293,6 +295,130 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self.ns["iter_llm_sentences"] = lambda *args: sentences(
             "Мідний чайник кипить.", "Мідний чайник кипить.")
         self.assertEqual(await self.collect(), ["Мідний чайник кипить."])
+
+    async def test_joke_can_develop_same_opening_and_vocabulary(self):
+        self.history = [
+            {'role': 'user', 'content': 'Що робиш?'},
+            {'role': 'assistant', 'content': 'Я продав холодильник Фраю за сто доларів.'},
+            {'role': 'user', 'content': 'А що було в холодильнику?'}]
+        reply = ['Я продав холодильник з інструкцією шукати їжу в сусідів.',
+                 'Фрай уже вимагає гарантію на сусідів.']
+        self.ns['iter_llm_sentences'] = lambda *args: sentences(*reply)
+        result = [s async for s in self.ns['_iter_checked_reply'](
+            self.history[-1]['content'], 'uk', 1., self.history, self.timing)]
+        self.assertEqual(result, reply)
+
+    async def test_topic_words_do_not_make_a_real_answer_an_echo(self):
+        user = 'Навіщо тобі гайковий ключ?'
+        answer = 'Гайковий ключ — мій аргумент на переговорах із холодильником.'
+        self.ns['iter_llm_sentences'] = lambda *args: sentences(answer)
+        result = [s async for s in self.ns['_iter_checked_reply'](
+            user, 'uk', 1., [{'role': 'user', 'content': user}], self.timing)]
+        self.assertEqual(result, [answer])
+
+    async def test_verbatim_old_reply_still_retries(self):
+        old = 'Я продав холодильник Фраю за сто доларів.'
+        self.history = [{'role': 'assistant', 'content': old}, {'role': 'user', 'content': 'А далі?'}]
+        calls = []
+        async def model(*args):
+            calls.append(1)
+            yield old.upper() if len(calls) == 1 else 'Фрай уже вимагає гарантію на сусідів.'
+        self.ns['iter_llm_sentences'] = model
+        self.assertEqual(await self.collect(), ['Фрай уже вимагає гарантію на сусідів.'])
+        self.assertEqual(len(calls), 2)
+
+    async def test_reused_long_ending_retries_even_with_new_opening(self):
+        old = 'Пацани, спокійної ночі — спіть, поки я не вирішив, що ви мені заважаєте.'
+        repeated = 'Заважаєте — то йдіть спати, поки я не вирішив, що ви мені заважаєте.'
+        self.history = [{'role': 'assistant', 'content': old}, {'role': 'user', 'content': 'А ще?'}]
+        calls = []
+        async def model(*args):
+            calls.append(1)
+            yield repeated if len(calls) == 1 else 'Нехай будильник завтра теж візьме вихідний.'
+        self.ns['iter_llm_sentences'] = model
+        self.assertEqual(await self.collect(), ['Нехай будильник завтра теж візьме вихідний.'])
+        self.assertEqual(len(calls), 2)
+
+    async def test_third_identical_swear_opening_retries_but_new_opening_is_allowed(self):
+        self.history = [
+            {'role': 'assistant', 'content': 'Блядь, це перша відповідь.'},
+            {'role': 'user', 'content': 'Далі?'},
+            {'role': 'assistant', 'content': 'Блядь, це друга відповідь.'},
+            {'role': 'user', 'content': 'А ще?'}]
+        calls = []
+        async def model(*args):
+            calls.append(1)
+            yield 'Блядь, вже ранок.' if len(calls) == 1 else 'Будильник знову охуїв: вимагає підвищення.'
+        self.ns['iter_llm_sentences'] = model
+        self.assertEqual(await self.collect(), ['Будильник знову охуїв: вимагає підвищення.'])
+        self.assertEqual(len(calls), 2)
+
+    def test_swapping_profane_adjective_does_not_hide_same_joke(self):
+        old = 'Сані, Андрюсі та Боді — щоб сон був такий пиздатий, ніби ви виграли в лотерею, а на ранок прокинулися з повідомленням від шефа.'
+        new = 'Тим, хто завтра на роботу: щоб сон був такий охуєнний, ніби ви виграли в лотерею, а будильник заткнувся до понеділка.'
+        self.assertTrue(self.ns['_too_like_last']([new], old))
+
+    async def test_empty_ack_does_not_consume_sentence_limit_or_request_a_retry(self):
+        self.ns['LLM_MAX_SENTS'] = 1
+        calls, resets = [], []
+        async def model(*args):
+            calls.append(1)
+            yield 'Гаразд, чув.'
+            yield 'Мідний чайник кипить.'
+        self.ns['iter_llm_sentences'] = model
+        self.ns['grok_break_chain'] = resets.append
+        self.assertEqual(await self.collect(), ['Мідний чайник кипить.'])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(resets, ['filler removed from spoken reply'])
+
+    async def test_local_ack_is_skipped_before_actual_answer(self):
+        self.ns['LLM_MAX_SENTS'] = 1
+        self.ns['iter_llm_sentences'] = lambda *args: sentences(
+            'Слухай, чув.', 'Я сховав пиво за капустою.')
+        self.assertEqual(await self.collect(), ['Я сховав пиво за капустою.'])
+
+    async def test_ack_followed_by_rejected_tail_retries_instead_of_speaking_ack(self):
+        calls = []
+        async def model(*args):
+            calls.append(1)
+            if len(calls) == 1:
+                yield 'Гаразд, чув.'
+                yield 'Дякую за перегляд.'
+            else:
+                yield 'Мідний чайник кипить.'
+        self.ns['iter_llm_sentences'] = model
+        self.assertEqual(await self.collect(), ['Мідний чайник кипить.'])
+        self.assertEqual(len(calls), 2)
+
+    async def test_only_filler_retries_once_without_claiming_asr_failed(self):
+        calls = []
+        async def model(*args):
+            calls.append(1)
+            yield 'Гаразд, чув.'
+            yield 'Кажи, що треба.'
+        self.ns['iter_llm_sentences'] = model
+        result = await self.collect()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(result), 1)
+        self.assertIn('Платівка', result[0])
+
+    async def test_filler_filter_preserves_content_and_short_answers(self):
+        trim = self.ns['_trim_reply_filler']
+        self.assertEqual(trim('Гаразд, чув, вода кипить при ста градусах.', opening=True, greet=False),
+                         'вода кипить при ста градусах.')
+        self.assertEqual(trim('Спокійно, чув.', opening=True, greet=False), '')
+        self.assertEqual(trim('Спокійно, чув. Пиво за капустою.', opening=True, greet=False),
+                         'Пиво за капустою.')
+        for filler in ('Слухай, чув.', 'Слухаю.', 'Чув.', 'Блядь, чув — як справи?'):
+            self.assertEqual(trim(filler, opening=True, greet=False), '')
+        self.assertEqual(trim('Блядь, чув — пиво зникло.', opening=True, greet=False),
+                         'Блядь, пиво зникло.')
+        for text in ('Так.', 'Ні.', 'Київ.', '42.', 'Чую музику.', 'Добре, зроблю.',
+                     'Ти сказав «Гаразд, чув», і я засміявся.'):
+            self.assertEqual(trim(text, opening=True, greet=False), text)
+        self.assertEqual(trim('Кажи, що треба.', opening=False, greet=True), 'Кажи, що треба.')
+        self.ns['iter_llm_sentences'] = lambda *args: sentences('Так.')
+        self.assertEqual(await self.collect(), ['Так.'])
 
     async def test_limit_drains_provider_but_does_not_voice_extra_sentences(self):
         self.ns["LLM_MAX_SENTS"] = 1

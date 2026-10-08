@@ -12,6 +12,7 @@
 #include <EncButton.h>
 #include <FastLED.h>
 #include <GyverMAX7219.h>
+#include "MatrixRecovery.h"
 
 #include "battery.h"
 #include "battery_matrix.h"
@@ -200,6 +201,7 @@ static inline bool matrix_display_ready() {
 }
 
 static uint32_t s_matrix_last_flush_ms = 0;
+static MatrixRecoverySchedule s_matrix_recovery;
 
 static void matrix_flush(bool force = false) {
     const uint32_t now = millis();
@@ -252,6 +254,24 @@ void upd_bright() {
     radioState.bright_mouth = (int8_t)v;
     radioState.bright_eyes = (int8_t)v;
     matrix_apply_brightness(v);
+}
+
+static void matrix_write_register_all(uint8_t reg, uint8_t value) {
+    // All five chained drivers receive a complete 16-bit command. Keep this
+    // on core0, alongside every other matrix write, to avoid interleaved SPI.
+    digitalWrite(RadioConfig::mtrxCs, HIGH);
+    digitalWrite(RadioConfig::mtrxClk, LOW);
+    digitalWrite(RadioConfig::mtrxCs, LOW);
+    for (uint8_t i = 0; i < RadioConfig::matrixModuleCount; ++i) {
+        shiftOut(RadioConfig::mtrxDat, RadioConfig::mtrxClk, MSBFIRST, reg);
+        shiftOut(RadioConfig::mtrxDat, RadioConfig::mtrxClk, MSBFIRST, value);
+    }
+    digitalWrite(RadioConfig::mtrxCs, HIGH);
+}
+
+static void matrix_reassert_configuration() {
+    // Unlike begin(), this does not clear the framebuffer or reset brightness.
+    matrix_restore_registers(matrix_write_register_all, [] { upd_bright(); }, [] { mtrx.update(); });
 }
 
 uint8_t matrix_get_base_brightness() {
@@ -1717,6 +1737,9 @@ void core0(void* p) {
     draw_eyes_radio_idle_off();
     matrix_flush(true);
     s_matrix_ui_started = true;
+    matrix_reassert_configuration();
+    s_matrix_recovery.start(millis());
+    Serial.println(F("[Matrix] register recovery: 500ms during startup, then 15s"));
 
     audio_hw_init(true);
     apply_output_volume();
@@ -1788,6 +1811,9 @@ void core0(void* p) {
         if (s_matrix_brightness_trim_dirty && matrix_display_ready()) {
             s_matrix_brightness_trim_dirty = false;
             upd_bright();
+        }
+        if (matrix_display_ready() && s_matrix_recovery.due(millis())) {
+            matrix_reassert_configuration();
         }
         battery_update();
         // Also consumes a shutdown decision from a manual gauge sample.

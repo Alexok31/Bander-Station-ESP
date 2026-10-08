@@ -18,9 +18,12 @@ def server_namespace():
     # Use production protocol/prompt functions without loading speech models or secrets.
     names = {'set_device_character', 'grok_break_chain', 'bender_prompt',
              'grok_turn_text', '_llm_payload', 'handle', '_grok_pieces',
-             'character_preview_text', 'run_character_preview'}
+             'character_preview_text', 'run_character_preview', '_model_context', '_is_social_checkin',
+             '_trim_reply_filler', '_reply_words'}
     tree = ast.parse((SERVER / 'server.py').read_text(encoding='utf-8'))
     nodes = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names]
+    nodes += [n for n in tree.body if isinstance(n, ast.Assign) and any(
+        isinstance(t, ast.Name) and t.id in {'_ACK_OPENING_RE', '_EMPTY_INVITATION_RE'} for t in n.targets)]
     ns = dict(asyncio=asyncio, aclosing=aclosing, re=re,
               DEVICE_CHARACTER=None, CHAT_GROK_RESP_ID='old-chain', BENDER_LEVEL=10,
               validate_character=validate_character, character_rules=character_rules,
@@ -38,6 +41,29 @@ def server_namespace():
 
 
 class CharacterTests(unittest.TestCase):
+    def test_context_drops_empty_training_examples_without_mutating_chat(self):
+        ns = server_namespace()
+        history = [
+            {'role': 'user', 'content': 'Как дела?'},
+            {'role': 'assistant', 'content': 'Гаразд, чув. Нормально. Кажи, що треба.'},
+            {'role': 'user', 'content': 'Скільки буде 7 на 8?'},
+            {'role': 'assistant', 'content': '56.'},
+            {'role': 'user', 'content': 'Що робиш?'},
+            {'role': 'assistant', 'content': 'Гаразд, чув. Продаю Фраю його ж капці.'},
+            {'role': 'user', 'content': 'А далі?'}]
+        original = copy.deepcopy(history)
+        result = ns['_model_context'](history)
+        self.assertEqual(result, history[2:5] + [
+            {'role': 'assistant', 'content': 'Продаю Фраю його ж капці.'}, history[-1]])
+        self.assertEqual(history, original)
+
+    def test_context_keeps_short_factual_and_non_social_confirmations(self):
+        ns = server_namespace()
+        for answer in ('Так.', 'Ні.', 'Нормально.', 'Київ.'):
+            history = [{'role': 'user', 'content': 'Перевір результат.'},
+                       {'role': 'assistant', 'content': answer}]
+            self.assertEqual(ns['_model_context'](history), history)
+
     def test_legacy_profile_retains_traits_and_adds_new_defaults(self):
         old = dict(zip(KEYS[:5], (3, 7, 11, 91, 100)))
         self.assertEqual(validate_character(old), {**old, 'roughness': 45, 'profanity': 35})
@@ -122,6 +148,13 @@ class CharacterTests(unittest.TestCase):
         self.assertNotIn('Різкість і мат', turn)
         for required in ('Не вигадуй спогади', 'За замовчуванням українська', 'перше речення дає відповідь'):
             self.assertIn(required, prompt)
+
+    def test_turn_keeps_question_without_repeated_service_instructions(self):
+        ns = server_namespace()
+        self.assertEqual(ns['grok_turn_text']('А що було далі?'), 'А що було далі?')
+        ns['MEMORY'] = SimpleNamespace(context=lambda *args: 'Saved context')
+        self.assertEqual(ns['grok_turn_text']('А далі?', nudge='Try again'),
+                         'Saved context\n\nА далі?\n\nTry again')
 
     def test_each_slider_changes_real_model_payload(self):
         ns = server_namespace()
@@ -240,7 +273,9 @@ class CharacterProtocolTests(unittest.IsolatedAsyncioTestCase):
         _ = [part async for part in ns['_grok_pieces'](history, 140, .68)]
         self.assertEqual(requests[1]['previous_response_id'], 'fresh-chain')
         self.assertNotIn('instructions', requests[1])
-        self.assertEqual(len(requests[1]['input']), 1)
+        self.assertEqual(len(requests[1]['input']), 2)
+        self.assertEqual(requests[1]['input'][0], {'role': 'system', 'content': ns['bender_prompt']()})
+        self.assertEqual(requests[1]['input'][1]['role'], 'user')
 
     async def test_grok_chain_recovery_preserves_history_and_reports_stream_errors(self):
         for case in ('expired', 'fallback_error', 'partial_error', 'new_legacy'):

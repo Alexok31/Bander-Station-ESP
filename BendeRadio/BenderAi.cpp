@@ -20,8 +20,6 @@
 #include "Pcm16.h"
 #include "WakeRuntime.h"
 #include "WakeVoice.h"
-#include "WakeReply.h"
-#include "WakeReplyAudio.h"
 #include "PlaybackCompletion.h"
 #include "secrets.h"
 
@@ -234,7 +232,6 @@ static volatile bool s_ptt_armed = false;
 // Voice lifecycle is owned by wsTask. PTT callbacks ignore an active voice turn.
 static std::atomic<uint8_t> s_wake_voice{0}; // 0 idle, 1 connecting, 2 recording, 3 answer
 static std::atomic<uint32_t> s_wake_warmup{0};
-static std::atomic<bool> s_wake_cue{false};
 static uint32_t s_wake_since = 0;
 static WakeVoice::Endpoint s_wake_endpoint;
 static bool s_wake_followup = false; // wsTask only; controls the no-question timeout.
@@ -650,34 +647,6 @@ static void micDump() {
     for (int i = 0; i < 8; i++) {
         i2sMic.readBytes((char*)dump, sizeof(dump));
     }
-}
-
-static void playWakeReadyCue() {
-    // Only acknowledge a fresh wake phrase. Follow-up listening is silent.
-    if (s_wake_followup) return;
-    // Bender's pre-rendered voice lives in flash; no server request at runtime.
-    // Keep recording in preparation until both the reply and microphone echo drain.
-    static uint8_t previous = 255;
-    static_assert(WakeReplyAudio::count == 12, "Wake reply banks must match the audio pack");
-    const auto traits = nvsLoadCharacter();
-    const uint8_t selected = WakeReply::choose(traits, s_wake_followup, esp_random(), previous);
-    previous = selected;
-    const auto& clip = WakeReplyAudio::clips[selected];
-    ALOG("[WakeVoice] local reply=%u followup=%u\n",unsigned(selected),unsigned(s_wake_followup));
-    s_wake_cue.store(true);
-    {
-        AirPlayAudioGuard guard;
-        int16_t pcm[CHUNK];
-        for(size_t offset=0;offset<clip.bytes;offset+=sizeof(pcm)) {
-            const size_t bytes=minOf(sizeof(pcm),clip.bytes-offset);
-            // spkWrite applies volume in place; never modify the flash asset.
-            memcpy(pcm,clip.data+offset,bytes);
-            spkWrite(reinterpret_cast<uint8_t*>(pcm),bytes,true);
-        }
-        i2sWriteSilenceChunks(4);
-        ampMuteHw(true);
-    }
-    s_wake_cue.store(false);
 }
 
 static bool readMicChunk16(uint8_t* mic16, int32_t* chunkPeak, bool countStats,
@@ -1137,7 +1106,7 @@ static void onMessage(websockets::WebsocketsMessage m) {
         if (providerIsLocal() && s_wake_invocation && (j["wake_only"] | false) &&
             s_wake_voice.load() == 3 && WakeRuntime::voiceEnabled()) {
             s_wake_prompt_pending.store(true);
-            ALOGLN(F("[WakeVoice] name only — local acknowledgement requested"));
+            ALOGLN(F("[WakeVoice] name only — listen for follow-up silently"));
         }
         s_event_reply = false;
         speaking = false;
@@ -1212,7 +1181,7 @@ static void speakerTask(void*) {
             // Інакше тиша/unmute дає тріск у колонку і він лізе в мікрофон.
             primed = false;
             quietSince = 0;
-            { AirPlayAudioGuard guard; if (!s_wake_cue.load()) ampMuteHw(true); }
+            { AirPlayAudioGuard guard; ampMuteHw(true); }
             vTaskDelay(5 / portTICK_PERIOD_MS);
             continue;
         }
@@ -1734,11 +1703,9 @@ static void wsTask(void*) {
                         if(remaining<=50) s_wake_endpoint.observeBackground(reinterpret_cast<const int16_t*>(mic16),CHUNK);
                         if (remaining == 1) {
                             s_wake_endpoint.finishCalibration();
-                            playWakeReadyCue();
-                            micDump(); // Discard buffered cue audio, before exposing Listening.
                             resetRecStats();
                             s_wake_warmup.store(0);
-                            ALOG("[WakeVoice] listening cue=ready noise=%u threshold=%u followup=%u — speak your question\n",
+                            ALOG("[WakeVoice] listening ready noise=%u threshold=%u followup=%u — speak your question\n",
                                  unsigned(s_wake_endpoint.noise()),unsigned(s_wake_endpoint.threshold()),unsigned(s_wake_followup));
                         } else s_wake_warmup.store(remaining-1);
                         continue;
@@ -2035,7 +2002,6 @@ bool bender_ai_tts_playing() {
 
 BenderFaceState bender_ai_face_state() {
     if (s_sample_state.load() == WakeSample::Recording) return BenderFaceState::Listening;
-    if (s_wake_cue.load()) return BenderFaceState::Speaking;
     if (s_wake_recorded.load()) return BenderFaceState::Thinking;
     if (s_wake_voice.load() == 1 || (s_wake_voice.load() == 2 && s_wake_warmup.load()))
         return BenderFaceState::Curious;

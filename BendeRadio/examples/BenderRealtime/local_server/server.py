@@ -166,7 +166,7 @@ CHAT: list[dict] = []
 CHAT_CONV_ID = ""
 CHAT_SUMMARY = ""
 CHAT_GROK_RESP_ID = ""
-GROK_PROMPT_REV = 9
+GROK_PROMPT_REV = 13
 DEVICE_STATIONS: list[dict] = []
 
 VOICE_ONNX = MODELS / "uk_UA-ukrainian_tts-medium.onnx"
@@ -251,13 +251,6 @@ def bender_level_rules(level: int | None = None) -> str:
 
 
 _NUDGE_PREFIX = "Стоп. Це ти вже казав."
-_TURN_GUIDANCE = (
-    "Відгукнися на зміст і тон репліки та продовжуй поточну тему. "
-    "Характер проявляється у ставленні; окремий жарт не обов'язковий. "
-    "Довжина залежить від ситуації. Питання — лише коли воно доречне, не щоразу. "
-    "Текст отримано з мікрофона і він може містити помилки розпізнавання. "
-    "Якщо зміст незрозумілий навіть з історією, коротко перепитай; не вигадуй, що людина мала на увазі."
-)
 
 
 def _history_user_asst_nudge(history: list[dict] | None) -> tuple[str, str, str]:
@@ -283,30 +276,16 @@ def _history_user_asst_nudge(history: list[dict] | None) -> tuple[str, str, str]
 
 
 def grok_turn_text(user_text: str, last_assistant: str = "", nudge: str = "") -> str:
-    mode = "[Еквалайзер характеру з системних інструкцій]" if DEVICE_CHARACTER is not None else f"[BENDER_LEVEL {BENDER_LEVEL}/10]"
-    bits = [mode, _TURN_GUIDANCE]
+    # Personality already travels in the system instructions on every turn.
+    # Keep the user's speech intact: a page of repeated admonitions here made
+    # casual chat look like a command/ASR-repair workflow to the model.
+    bits = []
     memory_context = MEMORY.context(user_text, DEVICE_STATIONS)
     if memory_context:
         bits.append(memory_context)
-    if DEVICE_CHARACTER is None and BENDER_LEVEL >= 8:
-        bits.append(
-            "Різкість і мат за обраним рівнем вплітай у відповідь по суті. Не шаблон образи. "
-            "Без ехо + «бля?!» + «найкращий робот» + «йди нахуй, м'ясний мішок»."
-        )
-    if last_assistant:
-        bits.append("Не копіюй минулу репліку. Доречну деталь зі спільної теми можна розвинути.")
+    bits.append(user_text)
     if nudge:
         bits.append(nudge)
-    bits.append("Користувач сказав:\n" + user_text)
-    bits.append(
-        "Відповідь своїми словами з урахуванням доступної історії. Не вигадуй спільних спогадів. "
-        "Заборонено папужити їхню фразу і каркас «сам / бо я не твій / лайковий»."
-    )
-    bits.append(
-        "Тебе звуть Бендер. Дендер/Блендер/Тендер/Бандер/Бендерпривіт — це ASR "
-        "(привітання без пробілу), не кличка. Відповідай як на «Привіт, Бендер». "
-        "Не поправляй ім'я і не жартуй що тебе переплутали."
-    )
     return "\n\n".join(bits)
 
 
@@ -357,7 +336,7 @@ def bender_prompt(character=None) -> str:
                  "Силу сарказму, буркотіння і доброзичливості визначає еквалайзер нижче." if eq else
                  "Нахабний, егоїстичний, цинічний, з величезним его. Пиво, гроші, злодійство, власна велич.")
         .replace("{CHARACTER_STYLE}",
-                 "Виявляй усі сім рис, включно з грубістю і лихослів'ям, відповідно до еквалайзера. "
+                 "Налаштовуй тон, лексику та довжину за еквалайзером; головне — жива реакція на співрозмовника. "
                  "При низькому значенні не нав'язуй цю рису заради образу Бендера." if eq else
                  "Сарказм і его — зсередини, не наліпкою. Можеш похвалитися, поторгуватися за уявну винагороду, "
                  "вдати небажання допомагати — і все ж допомогти в тій самій репліці. Іноді визнай чужий успіх, ніби неохоче.")
@@ -1623,50 +1602,12 @@ def _is_story(text: str) -> bool:
 
 
 _CANNED_RE = re.compile(
-    r"(?iu)("
-    r"вкрав золото|"
-    r"випив усе пиво|"
-    r"процесор не втомив|"
-    r"^а,\s*це ти\.?$|"
-    r"^сам пішов\.?$|"
-    r"пиздець[- ]цьому|"
-    r"найкращий робот у всьому|"
-    r"йди нахуй,\s*м['’ʼ]ясн|"
-    r"дякую за перегляд|"
-    r"thanks for watching|"
-    r"\bсам собі\b|"
-    r"сам,?\s*бо я не твій|"
-    r"бо я не твій\b|"
-    r"лайков\w*|"
-    r"коробц[іеи]\s+передач|"
-    r"порожн[іиі]\s+банк|"
-    r"гайков(ий|ого)\s+ключ|"
-    r"нелегальн\w*\s+алкогол|"
-    r"холодильник[аеу]?\s+з|"
-    r"сейф[ауе]?\s+з|"
-    r"обернути цей (шум|звук)|"
-    r"деренчить у моїй|"
-    r"гупає в моїй|"
-    r"заскрипіло в моїй"
-    r")"
+    # Reject credits, not ordinary vocabulary or topics from Bender's stories.
+    r"(?iu)^(?:дякую за перегляд|thanks for watching)[.!?…\s]*$"
 )
 _LOOP_SENT_RE = re.compile(
-    r"(?iu)("
-    r"пиздець[- ]цьому|"
-    r"найкращий робот у всьому|"
-    r"^йди нахуй,\s*м['’ʼ]ясн|"
-    r"бля\s*\?!?\s*$|"
-    r"коробц[іеи]\s+передач|"
-    r"нелегальн\w*\s+алкогол|"
-    r"порожн[іиі]\s+банк|"
-    r"деренчить у моїй"
-    r")"
+    r"(?iu)^(?:пиздець[- ]цьому|бля)[.!?…\s]*$"
 )
-_SIM_STOP = {
-    "я", "ти", "це", "не", "в", "у", "на", "та", "і", "й", "а", "що",
-    "бля", "сука", "нахуй", "пиздець", "крихітко", "твій", "твоя", "мене",
-    "уже", "вже", "наче", "зараз", "цей", "для", "або",
-}
 
 _STORY_FALLBACKS = (
     "Слухай. Я продав корабель Planet Express за ящик пива, а Ліла знайшла мене в каналізації. Довелося красти корабель назад. Пиво варте всього, крім її ноги в моїй антені.",
@@ -1681,17 +1622,83 @@ _GREET_FALLBACKS = (
 _MISS_FALLBACKS = (
     "Не розчув. Повтори, будь ласка.",
     "Зачекай, останню фразу не розібрав. Скажи ще раз.",
-    "Мої залізні вуха щось пропустили. Повториш?",
+    "Мої залізні вуха щось пропустили. Скажи ще раз?",
 )
 
 _LLM_RETRY_NUDGE = (
     _NUDGE_PREFIX + " "
     "Це заїжджений шаблон, не Бендер. "
-    "Заборонено: ехо їхніх слів, «сам собі», «бо я не твій», «лайковий», "
-    "коробка передач, порожні банки, гайковий ключ, нелегальний алкоголь, "
-    "та сама будова що минулого разу. "
-    "Вигадай ІНШУ репліку: новий жарт, інший початок, по суті того що сказали."
+    "Не повторюй дослівно вже сказане. Продовжити ту саму тему новою деталлю можна. "
+    "Вигадай ІНШУ репліку по суті того що сказали, з поточним характером. "
+    "Зміни і початок, і кінцівку, і сам жарт. Не починай з того самого лайливого вигуку. "
+    "Почни зі змістовної відповіді, без «чув», «слухаю» та «кажи, що треба»."
 )
+
+
+_ACK_OPENING_RE = re.compile(
+    r"(?iu)^\s*(?:(?:гаразд|добре|окей|ладно|хорошо|спокійно|слухай)[,\s]+)?"
+    r"(?:я\s+)?(?:тебе\s+)?(?:чув|чую|почув|зрозумів|услышал|понял|слухаю)"
+    r"\s*(?:[.!?…]+|[,;:—–-]+|$)\s*"
+)
+_RUDE_ACK_OPENING_RE = re.compile(
+    r"(?iu)^(\s*(?:блядь|бляха|бля)[,!]?\s*)чув\s*[,;:—–-]+\s*"
+)
+_SOCIAL_ECHO_RE = re.compile(
+    r"(?iu)^\s*(?:блядь|бляха|бля)[,!]?\s*(?:як справи|как дела|що робиш|что делаешь)\s*[?!.]*\s*$"
+)
+_EMPTY_INVITATION_RE = re.compile(
+    r"(?iu)^\s*(?:кажи|скажи|говори)[,\s]+(?:що|что)\s+(?:треба|потрібно|нужно)\s*[.!?…]*\s*$"
+)
+
+
+def _trim_reply_filler(sentence: str, *, opening: bool, greet: bool) -> str:
+    # A narrow filler filter, not a length/repetition rule: short factual answers
+    # and acknowledgements such as 'Так.' must remain valid. Keep any useful tail.
+    if opening:
+        sentence = _ACK_OPENING_RE.sub("", sentence)
+        sentence = _RUDE_ACK_OPENING_RE.sub(r"\1", sentence)
+        if _SOCIAL_ECHO_RE.fullmatch(sentence):
+            return ""
+    if not greet and _EMPTY_INVITATION_RE.fullmatch(sentence):
+        return ""
+    return sentence.strip()
+
+
+def _is_social_checkin(text: str) -> bool:
+    words = ' '.join(_reply_words(text))
+    return bool(re.fullmatch(
+        r"(?:как|як) (?:у тебя |у тебе |твої |твои )?(?:дела|справи|настроение|настрій)|"
+        r"(?:что делаешь|що робиш)|(?:точно |справді )?нормально(?: и все| і все)?", words))
+
+
+def _model_context(history: list[dict]) -> list[dict]:
+    """Remove empty training examples from provider input, never from saved chat.
+
+    Replaying dozens of 'heard you / fine / tell me what you want' turns taught
+    the model that this was its style even after a prompt/chain reset.
+    Keep factual short answers, meaningful replies and pending user messages.
+    """
+    result, pending = [], []
+    for message in history:
+        if message.get('role') != 'assistant':
+            pending.append(dict(message))
+            continue
+        user = next((m.get('content', '') for m in reversed(pending) if m.get('role') == 'user'), '')
+        parts = re.split(r'(?<=[.!?…])\s+', message.get('content', '').strip())
+        cleaned = []
+        for part in parts:
+            part = _trim_reply_filler(part, opening=not cleaned, greet=False)
+            if part:
+                cleaned.append(part)
+        reply = ' '.join(cleaned)
+        if _is_social_checkin(user) and _reply_words(reply) in (('нормально',), ('добре',), ('хорошо',)):
+            reply = ''
+        if reply:
+            result.extend(pending)
+            result.append({**message, 'content': reply})
+        pending = []
+    result.extend(pending)
+    return result
 
 
 def _is_canned(parts: list[str]) -> bool:
@@ -1705,50 +1712,48 @@ def _strip_loop_sents(parts: list[str]) -> list[str]:
     return [p for p in parts if p and p.strip() and not _LOOP_SENT_RE.search(p.strip())]
 
 
-def _content_words(text: str) -> set[str]:
-    t = (text or "").lower().replace("\u2019", "'")
-    t = re.sub(r"[^\wіїєґ']+", " ", t)
-    return {w for w in t.split() if len(w) > 2 and w not in _SIM_STOP}
+def _reply_words(text: str) -> tuple[str, ...]:
+    t = (text or "").casefold().replace("’", "'").replace("ʼ", "'")
+    return tuple(re.findall(r"[\w']+", t))
 
 
 def _too_like_last(parts: list[str], last: str) -> bool:
-    a = _content_words(" ".join(parts))
-    b = _content_words(last)
-    if len(a) < 4 or len(b) < 4:
+    # Shared nouns or a short opening are normal in a coherent conversation.
+    # Reject verbatim replies and substantial consecutive copied passages.
+    def comparison_words(text):
+        # Changing only a profane adjective does not make a reused joke new.
+        return tuple('<emphasis>' if re.fullmatch(r'оху[єеїи]\w*|пиздат\w*', w) else w
+                     for w in _reply_words(text))
+    a = comparison_words(" ".join(parts))
+    b = comparison_words(last)
+    if len(a) >= 4 and a == b:
+        return True
+    # Catch reused long endings even when names or the opening change. Unlike
+    # word-set similarity, this accepts new ideas about the same objects.
+    width = max(8, (min(len(a), len(b)) * 30 + 99) // 100)
+    if min(len(a), len(b)) < width:
         return False
-    return len(a & b) / len(a | b) >= 0.42
+    old_phrases = {b[i:i + width] for i in range(len(b) - width + 1)}
+    return any(a[i:i + width] in old_phrases for i in range(len(a) - width + 1))
 
 
-def _reply_head(text: str) -> tuple[str, ...]:
-    t = (text or "").lower()
-    t = re.sub(r"[^\wіїєґ']+", " ", t)
-    words = [w for w in t.split() if w not in _SIM_STOP]
-    return tuple(words[:3])
-
-
-def _same_frame(parts: list[str], last: str) -> bool:
-    a = _reply_head(" ".join(parts))
-    b = _reply_head(last)
-    return len(a) >= 3 and a == b
+def _repeats_expletive_opening(sentence: str, previous: list[str]) -> bool:
+    words = _reply_words(sentence)
+    if not words or words[0] not in {'блядь', 'блять', 'бля', 'бляха', 'сука', 'пиздець'}:
+        return False
+    return len(previous) >= 2 and all(_reply_words(old)[:1] == words[:1] for old in previous[:2])
 
 
 def _too_like_any(parts: list[str], prev: list[str]) -> bool:
     for old in prev:
-        if _too_like_last(parts, old) or _same_frame(parts, old):
+        if _too_like_last(parts, old):
             return True
     return False
 
 
 def _too_like_user(parts: list[str], user: str) -> bool:
-    a = _content_words(" ".join(parts))
-    b = _content_words(user)
-    if len(b) < 2 or len(a) < 3:
-        return False
-    hit = a & b
-    if len(hit) >= 2 and len(hit) / len(b) >= 0.55:
-        return True
-    blob = " ".join(parts).lower()
-    return bool(re.search(r"\bсам\b", blob) and hit)
+    a = _reply_words(" ".join(parts))
+    return len(a) >= 6 and a == _reply_words(user)
 
 
 def _story_fallback(history: list) -> str:
@@ -1783,7 +1788,7 @@ def _llm_payload(
         last_user = (history[-1].get("content") or "").strip()
     greet = _is_greet(last_user)
     story = _is_story(last_user)
-    n_temp = 0.68 if DEVICE_CHARACTER is not None else 0.62 + (BENDER_LEVEL - 5) * 0.06
+    n_temp = 0.72 if DEVICE_CHARACTER is not None else 0.62 + (BENDER_LEVEL - 5) * 0.06
     n_temp = max(0.45, min(0.98, n_temp))
     if greet and not story and len(last_user.split()) <= 4:
         n_pred = 90
@@ -1791,7 +1796,7 @@ def _llm_payload(
         n_pred = 200
         n_temp = max(n_temp, 0.78)
     else:
-        n_pred = 140
+        n_pred = 180
     # Системний промпт однаковий щоразу на тому ж рівні — інакше Grok не кешує.
     messages: list[dict] = [{"role": "system", "content": bender_prompt()}]
     memory_context = MEMORY.context(last_user, DEVICE_STATIONS)
@@ -1907,6 +1912,8 @@ def _pop_sentences(buf: str) -> tuple[list[str], str]:
 
 
 async def _ollama_pieces(payload: dict):
+    if str(payload.get("model", "")).lower().startswith("huihui_ai/qwen3-abliterated"):
+        payload = {**payload, "think": False}
     async with _httpx_async() as client:
         async with client.stream("POST", f"{OLLAMA_URL}/api/chat", json=payload) as r:
             r.raise_for_status()
@@ -2003,13 +2010,20 @@ async def _grok_pieces(history: list[dict], n_pred: int, n_temp: float):
         context = []
         if CHAT_SUMMARY:
             context.append({"role": "user", "content": "Контекст попередньої розмови:\n" + CHAT_SUMMARY})
-        context.extend(history[-HISTORY_SEND:-1])
-        req["input"] = context + body["input"]
+        prior = history[-HISTORY_SEND:-1]
+        useful = _model_context(prior)
+        if len(useful) < len(prior):
+            log(f"Grok context: skipped {len(prior) - len(useful)} messages from empty reply exchanges (saved chat unchanged)")
+        context.extend(useful)
+        req["input"] = context + [m for m in body["input"] if m["role"] != "system"]
         return req
 
     prev = CHAT_GROK_RESP_ID
     if prev:
         body["previous_response_id"] = prev
+        # Send the current style explicitly on continuations too. Keep it in
+        # input: xAI rejects top-level instructions + previous_response_id.
+        body["input"].insert(0, {"role": "system", "content": bender_prompt()})
         log(f"Grok {GROK_MODEL} continue {prev[:12]}… level={BENDER_LEVEL} temp={n_temp:.2f}")
     else:
         body = new_chain_body()
@@ -2126,6 +2140,8 @@ def warm_ollama() -> None:
         "messages": [{"role": "user", "content": "ок"}],
         "options": {"temperature": 0, "num_predict": 8},
     }
+    if OLLAMA_MODEL.lower().startswith("huihui_ai/qwen3-abliterated"):
+        payload["think"] = False
     try:
         r = httpx.post(
             f"{OLLAMA_URL}/api/chat", json=payload, timeout=180.0, verify=_SSL_VERIFY
@@ -2321,6 +2337,7 @@ async def _iter_checked_reply(text: str, lang: str, asr_p: float, history: list,
         if attempt:
             hist.append({"role": "user", "content": _LLM_RETRY_NUDGE + "\nБуло:\n" + rejected[:400]})
         retry = False
+        discarded: list[str] = []
         async with aclosing(iter_llm_sentences(bender_prompt(), lang, asr_p, hist)) as source:
             async for sentence in source:
                 timing.mark("first_llm_sentence")
@@ -2328,11 +2345,20 @@ async def _iter_checked_reply(text: str, lang: str, asr_p: float, history: list,
                     # Drain the bounded model response so its stored conversation
                     # completes normally while the queued speech is already playing.
                     continue
+                clean = _trim_reply_filler(sentence, opening=not accepted, greet=_is_greet(text))
+                if clean != sentence:
+                    discarded.append(sentence)
+                    log("LLM empty acknowledgement/invitation skipped")
+                sentence = clean
+                if not sentence:
+                    continue
                 prefix = accepted + [sentence]
                 bad = (
                     not _strip_loop_sents([sentence])
-                    or _is_canned(prefix)
-                    or _too_like_any([sentence], last_assts + accepted)
+                    or _is_canned([sentence])
+                    or (not accepted and _repeats_expletive_opening(sentence, last_assts))
+                    or any(_reply_words(sentence) == _reply_words(old) for old in accepted)
+                    or _too_like_any([sentence], last_assts)
                     or _too_like_any(prefix, last_assts)
                     or _too_like_user(prefix, text)
                     or (attempt > 0 and _too_like_last(prefix, rejected))
@@ -2351,8 +2377,16 @@ async def _iter_checked_reply(text: str, lang: str, asr_p: float, history: list,
                 timing.mark("first_accepted_sentence")
                 log(f"LLM: {sentence!r}")
                 yield sentence
+        if discarded:
+            # The provider stored text we did not speak. Rebuild from the local
+            # spoken history next time instead of reinforcing that filler.
+            grok_break_chain("filler removed from spoken reply")
         if accepted:
             return
+        if discarded and not retry:
+            rejected = _join_reply(discarded)
+            retry = True
+            log("LLM only filler — retry" if not attempt else "LLM only filler again — fallback")
         if not retry:
             yield "Не розчув. Повтори."
             return
@@ -2435,7 +2469,7 @@ async def run_turn(ws, pcm_in: bytes, prompt: str, history: list, wake_invocatio
             if wake_invocation:
                 text = voice_commands.wake_question(text)
                 if not text:
-                    log("Wake invocation only — request local acknowledgement, no LLM/TTS")
+                    log("Wake invocation only — listen for follow-up silently, no LLM/TTS")
                     await ws.send(dumps({"type": "response.output_audio.done"}))
                     await ws.send(dumps({"type": "response.done", "wake_only": True}))
                     return
