@@ -9,6 +9,22 @@ import voice_commands
 
 
 class FarewellTests(unittest.TestCase):
+    def test_validated_wake_requires_invocation_at_start(self):
+        valid = {
+            'Привет, Бендер! Как дела?': 'Как дела?',
+            'Привіт Бендер': '',
+            'Эй, Бендер, пока': 'пока',
+            'Бендер расскажи историю': 'расскажи историю',
+            'ПриветБендер, ты тут?': 'ты тут?',
+        }
+        for phrase, question in valid.items():
+            with self.subTest(phrase=phrase):
+                self.assertEqual(voice_commands.validated_wake_question(phrase), question)
+        for phrase in ('', 'щелчок', 'Бам-бам', 'бардак', 'Привет, блендер',
+                       'Расскажи про Бендера', 'Как дела, Бендер?', 'Привет всем'):
+            with self.subTest(phrase=phrase):
+                self.assertIsNone(voice_commands.validated_wake_question(phrase))
+
     def test_wake_prefix_keeps_immediate_question_and_only_trims_at_start(self):
         cases = {
             'Привет, Бендер! Как дела?': 'Как дела?',

@@ -1,6 +1,7 @@
 """ASR regressions without loading models or contacting a voice/LLM server."""
 import ast
 from pathlib import Path
+import re
 import sys
 import unittest
 from unittest.mock import Mock
@@ -18,11 +19,11 @@ def tone(hz=1000, rate=24000, seconds=1):
 
 
 def server_functions():
-    wanted = {"_asr_ok", "_asr_enhance", "_pcm_for_whisper", "_pcm_rms", "transcribe"}
+    wanted = {"_asr_ok", "_asr_enhance", "_pcm_for_whisper", "_pcm_rms", "_norm_asr_blob", "transcribe"}
     tree = ast.parse((SERVER_DIR / "server.py").read_text(encoding="utf-8"))
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
-    ns = dict(np=np, IN_RATE=24000, ASR_RATE=ASR_RATE, pcm16_for_asr=pcm16_for_asr,
-              ASR_LANGS=("ru", "uk"), ASR_MIN_RMS=900, ASR_MIN_LOGPROB=-0.55,
+    ns = dict(np=np, re=re, IN_RATE=24000, ASR_RATE=ASR_RATE, pcm16_for_asr=pcm16_for_asr,
+              ASR_LANGS=("ru", "uk"), ASR_MIN_RMS=900,
               ASR_MAX_NO_SPEECH=0.4, _is_hallucination=lambda *args: False,
               _looks_like_credits=lambda text: False, _note_hallucination=Mock(), log=Mock())
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "asr-server-functions", "exec"), ns)
@@ -87,11 +88,33 @@ class AsrAudioTests(unittest.TestCase):
                 expected = [(16000, True), (16000, False)] if fail_vad else [(16000, True)]
                 self.assertEqual(seen, expected)
 
-    def test_loudness_cannot_override_poor_recognition(self):
+    def test_low_logprob_is_accepted_but_silence_is_not(self):
         ok = server_functions()["_asr_ok"]
-        self.assertFalse(ok("А то я буду взять рапунт на верхнюю школу", -0.8, 0.1, 8000))
+        self.assertTrue(ok("Как дела?", -0.8, 0.1, 8000))
         self.assertTrue(ok("Расскажи что-нибудь интересное", -0.2, 0.1, 2000))
         self.assertFalse(ok("Расскажи что-нибудь интересное", -0.2, 0.7, 8000))
+        self.assertFalse(ok("Как дела?", -0.2, 0.1, 100))
+
+    def test_low_logprob_question_finishes_after_first_asr_pass(self):
+        ns = server_functions()
+        calls = []
+
+        def recognize(audio, lang, *, use_vad, rms):
+            calls.append(use_vad)
+            return "Как дела?", lang, 1.0, -0.8, 0.1, ns["_asr_ok"]("Как дела?", -0.8, 0.1, rms)
+
+        ns["_asr_pass"] = recognize
+        self.assertEqual(ns["transcribe"](tone())[-2:], (1.0, True))
+        self.assertEqual(calls, [True])
+
+    def test_high_no_speech_remains_untrusted(self):
+        ns = server_functions()
+
+        def recognize(audio, lang, *, use_vad, rms):
+            return "Как дела?", lang, 1.0, -0.2, 0.7, False
+
+        ns["_asr_pass"] = recognize
+        self.assertFalse(ns["transcribe"](tone())[-1])
 
 
 if __name__ == "__main__":

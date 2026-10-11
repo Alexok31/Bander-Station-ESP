@@ -668,38 +668,32 @@ static void draw_battery_sad_eyes_both() {
     draw_eyeb(1, px, py, 2);
 }
 
-// Pong: на табло счёт на глазах (левый — игрок, правый — ИИ). В розыгрыше — зрачок следует за мячом.
-static void draw_eyes_follow_ball(int8_t ball_x, int8_t ball_y) {
-    if (pong_mouth_tablo_mode()) {
-        const uint8_t bx = RadioConfig::analyzWidth;
-        mtrx.rect(bx, 0, bx + 16 - 1, 7, GFX_CLEAR);
-        mtrx.setCursor(bx + 2, 1);
-        mtrx.print((char)('0' + (pong_score_player() % 10)));
-        mtrx.setCursor(bx + 8 + 2, 1);
-        mtrx.print((char)('0' + (pong_score_ai() % 10)));
-        return;
+// Each 8x8 eye holds a two-digit score: record on the left, current run on the right.
+static void draw_game_number(uint8_t x, uint16_t value) {
+    static constexpr uint8_t digits[10][5] = {
+        {7, 5, 5, 5, 7}, {2, 6, 2, 2, 7}, {7, 1, 7, 4, 7},
+        {7, 1, 7, 1, 7}, {5, 5, 7, 1, 1}, {7, 4, 7, 1, 7},
+        {7, 4, 7, 5, 7}, {7, 1, 1, 1, 1}, {7, 5, 7, 5, 7},
+        {7, 5, 7, 1, 7}
+    };
+    const bool overflow = value > 99;
+    if (overflow) value = 99;
+    const uint8_t count = value >= 10 ? 2 : 1;
+    for (uint8_t digit = 0; digit < count; ++digit) {
+        const uint8_t n = count == 2 && digit == 0 ? value / 10 : value % 10;
+        const uint8_t x0 = x + (count == 1 ? 2 : digit * 4);
+        for (uint8_t row = 0; row < 5; ++row)
+            for (uint8_t col = 0; col < 3; ++col)
+                if (digits[n][row] & (4u >> col)) mtrx.dot(x0 + col, row + 1);
     }
+    if (overflow) mtrx.dot(x + 7, 0);
+}
 
-    if (!radioState.state) {
-        draw_eyes_radio_idle_off();
-        return;
-    }
-    const int8_t pw = RadioConfig::analyzWidth;
-
-    for (uint8_t i = 0; i < 2; i++) {
-        draw_eye(i);
-        const uint8_t base = RadioConfig::analyzWidth + i * 8;
-        const uint8_t pup_x = (uint8_t)map(ball_x, 0, pw - 1, 2, 4);
-        const uint8_t pup_y = (uint8_t)map(ball_y, 0, 7, 2, 4);
-        int16_t dx = 0;
-        if (ball_x < pw / 2) {
-            dx = (i == 0) ? -1 : 0;
-        } else if (ball_x > pw / 2) {
-            dx = (i == 0) ? 0 : 1;
-        }
-        const uint8_t px = (uint8_t)constrain((int)pup_x + dx, 2, 4);
-        mtrx.rect(base + px, pup_y, base + px + 1, pup_y + 1, GFX_CLEAR);
-    }
+static void draw_eyes_follow_ball(int8_t, int8_t) {
+    const uint8_t x = RadioConfig::analyzWidth;
+    mtrx.rect(x, 0, x + 15, 7, GFX_CLEAR);
+    draw_game_number(x, pong_record());
+    draw_game_number(x + 8, pong_score());
 }
 
 void anim_search() {
@@ -1981,6 +1975,7 @@ void core0(void* p) {
         } else if (pong_active()) {
             if (pong_tmr.tick()) {
                 pong_step();
+                pong_tmr.start(pong_step_interval_ms());
                 (void)pong_goal_fx_active();
                 pong_draw();
                 draw_eyes_follow_ball(pong_ball_x(), pong_ball_y());
@@ -2005,9 +2000,16 @@ void core0(void* p) {
                     const uint8_t n = eb.getClicks();
                     if (n == 1 && pong_serve_waiting()) {
                         pong_resume_after_goal();
+                        pong_tmr.start(pong_step_interval_ms());
                         pong_draw();
                         draw_eyes_follow_ball(pong_ball_x(), pong_ball_y());
                         pong_sync_matrix_brightness();
+                        matrix_flush();
+                    } else if (n == 2 && !pong_menu_active()) {
+                        pong_open_menu();
+                        pong_tmr.start(pong_step_interval_ms());
+                        pong_draw();
+                        draw_eyes_follow_ball(pong_ball_x(), pong_ball_y());
                         matrix_flush();
                     } else if (n == RadioConfig::encoderPongClicks) {
                         pong_set_active(false);
@@ -2309,7 +2311,7 @@ void core0(void* p) {
                             break;
                         case RadioConfig::encoderPongClicks:
                             pong_start();
-                            pong_tmr.start();
+                            pong_tmr.start(pong_step_interval_ms());
                             pong_draw();
                             draw_eyes_follow_ball(pong_ball_x(), pong_ball_y());
                             pong_sync_matrix_brightness();

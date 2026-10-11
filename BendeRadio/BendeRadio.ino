@@ -210,7 +210,7 @@ void setup() {
     if (WiFi.status() == WL_CONNECTED) {
         Serial.println(WiFi.localIP());
         Serial.println(F("SoftAP: 6 clicks | offline WiFi+radio: 1 click play when offline"));
-        Serial.println(F("Battery %: 5 | Pong: 7 | Sleep: 8 | Restart: 9"));
+        Serial.println(F("Battery %: 5 | Games: 7 | Sleep: 8 | Restart: 9"));
     } else {
         Serial.println(F("STA: not connected (use SoftAP for setup)"));
     }
@@ -227,7 +227,8 @@ void setup() {
     Serial.println(F("Mode: 4 clicks = FM / AIR"));
     Serial.println(F("FM: 2 clicks=next station, 3=prev"));
     Serial.println(F("AirPlay: 1 click=pause, 2=next, 3=prev"));
-    Serial.println(F("5=battery  6=SoftAP  7=pong  8=sleep  9=restart"));
+    Serial.println(F("5=battery  6=SoftAP  7=games  8=sleep  9=restart"));
+    Serial.println(F("Games: turn=select/move  1 click=start/retry  2=menu  7=exit"));
     Serial.println(F("Offline: 1 click play = reconnect WiFi then radio"));
     if (RadioConfig::pololuOffPin != 255) {
         Serial.printf("Pololu OFF: GPIO%u (8 clicks / low batt)\n", (unsigned)RadioConfig::pololuOffPin);

@@ -97,7 +97,7 @@ class RadioConfig {
     // Включение — железом (энкодер → PNP → ON). 255 = не использовать.
     static constexpr uint8_t pololuOffPin = 7;
     static constexpr uint16_t pololuOffPulseMs = 200;
-    // 5 — % АКБ; 6 — SoftAP; 7 — Pong; 8 — сон; 9 — restart.
+    // 5 — % АКБ; 6 — SoftAP; 7 — меню игр; 8 — сон; 9 — restart.
     static constexpr uint16_t encoderPttHoldMs = 520;
     static constexpr uint16_t micDemoMs = 3000;
     static constexpr uint8_t encoderBatteryClicks = 5;

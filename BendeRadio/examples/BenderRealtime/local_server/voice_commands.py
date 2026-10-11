@@ -131,6 +131,23 @@ def wake_question(text: str) -> str:
     return prefix.sub('', text, count=1).strip()
 
 
+_VALID_WAKE_PREFIX = re.compile(
+    r'^\s*["«“]*(?:(?:прив[еі]т|эй|ей|гей|hey)'
+    r'[\s,!.:;—–-]*)?(?:бендере?|bender)(?!\w)'
+    r'[\s,!.?:;—–\-"»”]*', re.IGNORECASE
+)
+
+
+def validated_wake_question(text: str) -> str | None:
+    """Return the first wake turn's question, or None if ASR missed the name.
+
+    A local keyword score is only a candidate: unrelated noise/speech must
+    never become a normal conversation merely because the board woke up.
+    """
+    match = _VALID_WAKE_PREFIX.match(text or '')
+    return (text[match.end():].strip() if match else None)
+
+
 def catalog(stations: list[dict] | None) -> list[dict]:
     by_id: dict[int, dict] = {}
     for s in STATIONS_DEFAULT:

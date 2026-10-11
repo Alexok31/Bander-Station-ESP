@@ -19,13 +19,13 @@ int main() {
     endpoint.reset();
     for (int i=0;i<599;++i) assert(endpoint.push(i%30==0?speech:quiet,240)==WakeVoice::Continue);
     assert(endpoint.push(quiet,240)==WakeVoice::Cancel);
-    // Question with a short internal pause: only a full second of silence ends it.
+    // Question with a short internal pause: 800 ms of silence ends it.
     endpoint.reset();
     for (int i=0;i<40;++i) assert(endpoint.push(speech,240)==WakeVoice::Continue);
     for (int i=0;i<50;++i) assert(endpoint.push(quiet,240)==WakeVoice::Continue);
     for (int i=0;i<30;++i) assert(endpoint.push(speech,240)==WakeVoice::Continue);
     assert(endpoint.heardSpeech() && endpoint.voicedMs()==700);
-    for (int i=0;i<99;++i) assert(endpoint.push(quiet,240)==WakeVoice::Continue);
+    for (int i=0;i<79;++i) assert(endpoint.push(quiet,240)==WakeVoice::Continue);
     assert(endpoint.push(quiet,240)==WakeVoice::Finish);
     // Continuous sound is bounded; no unbounded recording/PSRAM accumulation.
     endpoint.reset();
@@ -49,7 +49,7 @@ int main() {
     };
     endpoint.reset();calibrate();
     for(int i=0;i<80;++i)assert(endpoint.push(loud,240)==WakeVoice::Continue);
-    for(int i=0;i<99;++i){noise(300+(i%5)*150);assert(endpoint.push(background,240)==WakeVoice::Continue);}
+    for(int i=0;i<79;++i){noise(300+(i%5)*150);assert(endpoint.push(background,240)==WakeVoice::Continue);}
     noise(600);assert(endpoint.push(background,240)==WakeVoice::Finish);
     endpoint.reset();calibrate();
     for(int i=0;i<599;++i){noise(300+(i%5)*150);assert(endpoint.push(background,240)==WakeVoice::Continue);}

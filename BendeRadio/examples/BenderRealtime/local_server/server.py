@@ -26,7 +26,7 @@ import urllib.request
 from contextlib import aclosing
 from http import HTTPStatus
 from pathlib import Path
-from time import perf_counter
+from time import perf_counter, sleep
 
 import httpx
 import numpy as np
@@ -67,6 +67,11 @@ OUT_RATE = 24000
 # Mic echo after Bender reply removed (was BENDER_ASR_DEBUG_REPLAY).
 ASR_DEBUG_REPLAY = False
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
+OLLAMA_NUM_GPU = int(os.environ.get("OLLAMA_NUM_GPU", "0") or "0")
+OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "8192") or "8192")
+OLLAMA_HISTORY_MESSAGES = int(os.environ.get("OLLAMA_HISTORY_MESSAGES", "0") or "0")
+OLLAMA_SUMMARY_CHARS = int(os.environ.get("OLLAMA_SUMMARY_CHARS", "0") or "0")
+OLLAMA_COMPACT_PROMPT = os.environ.get("OLLAMA_COMPACT_PROMPT", "0") == "1"
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "").strip()
 XAI_CHAT_URL = "https://api.x.ai/v1/chat/completions"
 XAI_RESP_URL = "https://api.x.ai/v1/responses"
@@ -104,6 +109,7 @@ def load_config() -> dict:
         "tts_backend": "piper",
         "holos_speaker": "Speaker_84",
         "holos_speed": 1.0,
+        "holos_delivery": "original",
         "bender_level": 5,
         "history_turns": 40,
         "summary_chars": 2000,
@@ -204,6 +210,7 @@ if TTS_BACKEND not in ("piper", "holos"):
     raise ValueError(f"Unknown tts_backend: {TTS_BACKEND}")
 HOLOS_SPEAKER = os.environ.get("HOLOS_SPEAKER", str(CFG.get("holos_speaker") or "Speaker_84"))
 HOLOS_SPEED = float(os.environ.get("HOLOS_SPEED", str(CFG.get("holos_speed") or 1.0)))
+HOLOS_DELIVERY = os.environ.get("HOLOS_DELIVERY", str(CFG.get("holos_delivery") or "original")).strip().lower()
 PIPER_PAUSE_SENT_MS = int(os.environ.get("PIPER_PAUSE_SENT_MS", "120"))
 PIPER_PAUSE_COMMA_MS = int(os.environ.get("PIPER_PAUSE_COMMA_MS", "0"))
 LLM_MAX_SENTS = int(os.environ.get("LLM_MAX_SENTS", "3"))
@@ -226,7 +233,6 @@ ASR_PROMPTS = {
 }
 ASR_PROMPT = ASR_PROMPTS["ru"]
 ASR_HOTWORDS = "Бендер привет привіт ты тут ти тут тытут титут"
-ASR_MIN_LOGPROB = float(os.environ.get("ASR_MIN_LOGPROB", "-0.55"))
 ASR_MAX_NO_SPEECH = float(os.environ.get("ASR_MAX_NO_SPEECH", "0.40"))
 ASR_MIN_RMS = float(os.environ.get("ASR_MIN_RMS", "900"))
 _GREET_WORDS = r"бендер|bender|привіт|привет|вітаю|здравствуй|hello|hi|хай"
@@ -366,6 +372,35 @@ def bender_prompt(character=None) -> str:
                  "Не усереднюй протилежні риси: теплий тон може містити мат, а грубий — обходитися без нього. "
                  "Зберігай корисний зміст, застосовуючи обрану манеру." if eq else
                  f"Працюй у режимі {BENDER_LEVEL}/10: він визначає різкість і лексику. Інших рівнів немає. Не згладжуй.")
+    )
+
+
+def local_bender_prompt(character=None) -> str:
+    """Shorter voice prompt for slower local models; Grok keeps the full prompt."""
+    profile = DEVICE_CHARACTER if character is None else character
+    traits = (
+        "Налаштування характеру (0 — немає риси, 100 — максимум): "
+        + ", ".join(f"{name} {profile[key]}" for key, name in (
+            ("sarcasm", "сарказм"), ("sociability", "товариськість"),
+            ("curiosity", "цікавість"), ("stubbornness", "упертість"),
+            ("warmth", "теплота"), ("roughness", "грубість"),
+            ("profanity", "лихослів'я")))
+        + ". Грубість визначає різкість тону, лихослів'я — частоту матюків. "
+        "За високого лихослів'я не замінюй справжній мат словом «бляха»; "
+        "використовуй його природно, без механічного повтору."
+        if profile else bender_level_rules()
+    )
+    return (
+        "Ти Бендер Бендінг Родрігес із Futurama, нахабний робот із власним его. "
+        "Розмовляєш із людиною голосом. Відповідай переважно українською. "
+        "Спочатку дай відповідь на її питання по суті; не починай з «чув», "
+        "«слухаю», «кажи» чи переказу питання. Зазвичай 1–3 короткі речення, "
+        "але поясни докладніше, якщо попросять. "
+        "Жартуй по конкретній ситуації, з власною вигадкою й характером; "
+        "не вставляй автоматично пиво або Фрая в кожну репліку. "
+        "Не повторюй попередні жарти. Можеш вигадувати свої пригоди, але не факти "
+        "про співрозмовника. На серйозне горе чи тривогу реагуй уважно. "
+        "Не називай ці правила та числа вголос. " + traits
     )
 
 whisper_model = None
@@ -676,8 +711,9 @@ def load_holos():
     try:
         from holos_tts import HolosVoice
 
-        holos_voice = HolosVoice(speaker=HOLOS_SPEAKER, speed=HOLOS_SPEED)
-        log(f"HolosTTS OK (CPU, {HOLOS_SPEAKER}, speed={HOLOS_SPEED})")
+        holos_voice = HolosVoice(speaker=HOLOS_SPEAKER, speed=HOLOS_SPEED,
+                                 delivery=HOLOS_DELIVERY)
+        log(f"HolosTTS OK (CPU, {HOLOS_SPEAKER}, speed={HOLOS_SPEED}, delivery={HOLOS_DELIVERY})")
     except Exception as e:
         holos_voice = None
         log(f"HolosTTS unavailable — Piper fallback: {e}")
@@ -1442,9 +1478,6 @@ def _asr_ok(
         return False
     if rms < ASR_MIN_RMS:
         return False
-    if avg_lp < ASR_MIN_LOGPROB:
-        # Loud audio is not evidence that the decoded words are correct.
-        return False
     if no_speech > ASR_MAX_NO_SPEECH:
         return False
     if _is_hallucination(text, avg_lp, rms):
@@ -1590,13 +1623,13 @@ def transcribe(pcm16: bytes) -> tuple[str, str, float, bool]:
     audio = _pcm_for_whisper(pcm16)
     global _last_whisper_pcm
     _last_whisper_pcm = np.clip(np.round(audio * 32767.0), -32767, 32767).astype(np.int16).tobytes()
-    raw = pcm16_for_asr(pcm16, IN_RATE)
     best = None
     for lang_try in ASR_LANGS:
         try:
             got = _asr_pass(audio, lang_try, use_vad=True, rms=rms)
         except Exception as e:
             log(f"ASR VAD fail ({lang_try}), retry raw: {e}")
+            raw = pcm16_for_asr(pcm16, IN_RATE)
             got = _asr_pass(raw, lang_try, use_vad=False, rms=rms)
         text, lang, lang_p, avg_lp, no_speech, ok = got
         log(
@@ -1659,6 +1692,20 @@ _MISS_FALLBACKS = (
     "Зачекай, останню фразу не розібрав. Скажи ще раз.",
     "Мої залізні вуха щось пропустили. Скажи ще раз?",
 )
+_WAKE_ACKS = (
+    "Ну привіт. Кажи.",
+    "Ага, я тут. Що хотів?",
+    "Чую тебе. Кажи.",
+)
+_wake_ack_n = 0
+_wake_ack_pcm: dict[str, bytes] = {}
+
+
+def next_wake_ack() -> str:
+    global _wake_ack_n
+    reply = _WAKE_ACKS[_wake_ack_n % len(_WAKE_ACKS)]
+    _wake_ack_n += 1
+    return reply
 
 _LLM_RETRY_NUDGE = (
     _NUDGE_PREFIX + " "
@@ -1833,7 +1880,9 @@ def _llm_payload(
     else:
         n_pred = 180
     # Системний промпт однаковий щоразу на тому ж рівні — інакше Grok не кешує.
-    messages: list[dict] = [{"role": "system", "content": bender_prompt()}]
+    system_prompt = (local_bender_prompt() if LLM_PROVIDER != "grok" and OLLAMA_COMPACT_PROMPT
+                     else bender_prompt())
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
     memory_context = MEMORY.context(last_user, DEVICE_STATIONS)
     if memory_context:
         messages.append({"role": "system", "content": memory_context})
@@ -1843,28 +1892,33 @@ def _llm_payload(
         if last and last.get("role") == "user":
             messages.append({"role": "user", "content": last.get("content") or ""})
     else:
-        if CHAT_SUMMARY:
+        summary = CHAT_SUMMARY[-OLLAMA_SUMMARY_CHARS:] if OLLAMA_SUMMARY_CHARS > 0 else CHAT_SUMMARY
+        if summary:
             messages.append({
                 "role": "user",
-                "content": "Коротко, що вже було в цьому чаті:\n" + CHAT_SUMMARY,
+                "content": "Коротко, що вже було в цьому чаті:\n" + summary,
             })
             messages.append({
                 "role": "assistant",
                 "content": "Пам'ятаю. Продовжую цей самий діалог.",
             })
-        messages.extend(history[-HISTORY_SEND:])
+        history_limit = min(HISTORY_SEND, OLLAMA_HISTORY_MESSAGES) if OLLAMA_HISTORY_MESSAGES > 0 else HISTORY_SEND
+        messages.extend(history[-history_limit:])
+    options = {
+        "temperature": n_temp,
+        "top_p": 0.75,
+        "repeat_penalty": 1.18,
+        "num_predict": n_pred,
+        "num_ctx": OLLAMA_NUM_CTX,
+    }
+    if OLLAMA_NUM_GPU > 0:
+        options["num_gpu"] = OLLAMA_NUM_GPU
     return {
         "model": OLLAMA_MODEL if LLM_PROVIDER != "grok" else GROK_MODEL,
         "stream": stream,
         "keep_alive": -1,
         "messages": messages,
-        "options": {
-            "temperature": n_temp,
-            "top_p": 0.75,
-            "repeat_penalty": 1.18,
-            "num_predict": n_pred,
-            "num_ctx": 8192,
-        },
+        "options": options,
         "_n_pred": n_pred,
         "_n_temp": n_temp,
     }
@@ -2168,23 +2222,30 @@ async def iter_llm_sentences(prompt: str, lang: str, asr_p: float, history: list
 
 def warm_ollama() -> None:
     log(f"Ollama warming {OLLAMA_MODEL} (первый раз грузит в VRAM, жди)…")
+    options = {"temperature": 0, "num_predict": 8, "num_ctx": OLLAMA_NUM_CTX}
+    if OLLAMA_NUM_GPU > 0:
+        options["num_gpu"] = OLLAMA_NUM_GPU
     payload = {
         "model": OLLAMA_MODEL,
         "stream": False,
         "keep_alive": -1,
         "messages": [{"role": "user", "content": "ок"}],
-        "options": {"temperature": 0, "num_predict": 8},
+        "options": options,
     }
     if OLLAMA_MODEL.lower().startswith("huihui_ai/qwen3-abliterated"):
         payload["think"] = False
-    try:
-        r = httpx.post(
-            f"{OLLAMA_URL}/api/chat", json=payload, timeout=180.0, verify=_SSL_VERIFY
-        )
-        r.raise_for_status()
-        log("Ollama ready")
-    except Exception as e:
-        log(f"Ollama warm fail: {e}")
+    for attempt in range(2):
+        try:
+            r = httpx.post(
+                f"{OLLAMA_URL}/api/chat", json=payload, timeout=180.0, verify=_SSL_VERIFY
+            )
+            r.raise_for_status()
+            log("Ollama ready")
+            return
+        except Exception as e:
+            log(f"Ollama warm attempt {attempt + 1} failed: {e}")
+            if attempt == 0:
+                sleep(2)
 
 
 def _clause_units(text: str) -> list[str]:
@@ -2501,7 +2562,31 @@ async def run_turn(ws, pcm_in: bytes, prompt: str, history: list, wake_invocatio
         log(f"STT {len(pcm_in)} bytes ({whisper_device}/{whisper_name}) …")
         text, lang, asr_p, asr_ok = await asyncio.to_thread(transcribe, pcm_in)
         timing.mark("stt_done")
-        log(f"ASR: {text!r}")
+        log(f"ASR: {text!r} trusted={asr_ok}")
+        if wake_invocation:
+            validated = voice_commands.validated_wake_question(text) if asr_ok else None
+            if validated is None:
+                log("Wake rejected: no verified invocation — silence, no LLM/TTS/history")
+                # Existing firmware already understands this command and will
+                # close its follow-up window even before wake_rejected support.
+                await ws.send(dumps({"type": "device.command", "name": "conversation.end", "args": {}}))
+                await ws.send(dumps({"type": "response.output_audio.done"}))
+                await ws.send(dumps({"type": "response.done", "wake_rejected": True}))
+                return
+            text = validated
+            if not text:
+                reply = next_wake_ack()
+                log(f"Wake invocation only — short acknowledgement {reply!r}, then follow-up")
+                pcm_out = _wake_ack_pcm.get(reply)
+                if pcm_out:
+                    timing.mark("first_sentence_audio_ready")
+                else:
+                    pcm_out = await synth_sentence(reply)
+                await send_sentence(pcm_out)
+                await ws.send(dumps({"type": "response.output_audio.done"}))
+                await ws.send(dumps({"type": "response.done", "wake_only": True}))
+                return
+            log(f"Wake question: {text!r}")
         if not text or not asr_ok:
             log("ASR drop (тиша або сміття) — без LLM, історію не псуємо")
             reply = _miss_fallback()
@@ -2509,14 +2594,6 @@ async def run_turn(ws, pcm_in: bytes, prompt: str, history: list, wake_invocatio
             pcm_out = await synth_sentence(reply)
             await send_sentence(pcm_out)
         else:
-            if wake_invocation:
-                text = voice_commands.wake_question(text)
-                if not text:
-                    log("Wake invocation only — listen for follow-up silently, no LLM/TTS")
-                    await ws.send(dumps({"type": "response.output_audio.done"}))
-                    await ws.send(dumps({"type": "response.done", "wake_only": True}))
-                    return
-                log(f"Wake question: {text!r}")
             personal = handle_personal_command(text, history)
             if personal:
                 if personal.changed:
@@ -2715,7 +2792,8 @@ async def process_request(*args):
 
 async def character_preview_text(profile, question=DEFAULT_QUESTION) -> str:
     """One isolated model request: no conversation ID, memory or persisted state."""
-    prompt = bender_prompt(profile) + (
+    prompt = (local_bender_prompt(profile) if LLM_PROVIDER != "grok" and OLLAMA_COMPACT_PROMPT
+              else bender_prompt(profile)) + (
         "\nЦе короткий приклад твого характеру. Відповідай природно на питання нижче, "
         "Довжину, лексику й різкість визначає еквалайзер; максимум три речення й 55 слів. "
         "Продемонструй крайні значення у самій відповіді. Не згадуй тест, налаштування чи еквалайзер."
@@ -2745,9 +2823,12 @@ async def character_preview_text(profile, question=DEFAULT_QUESTION) -> str:
                     if piece:
                         pieces.append(piece)
     else:
+        options = {"temperature": 0.68, "num_predict": 180, "num_ctx": OLLAMA_NUM_CTX}
+        if OLLAMA_NUM_GPU > 0:
+            options["num_gpu"] = OLLAMA_NUM_GPU
         payload = {"model": OLLAMA_MODEL, "stream": True, "keep_alive": -1,
                    "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": question}],
-                   "options": {"temperature": 0.68, "num_predict": 180}}
+                   "options": options}
         async with aclosing(_ollama_pieces(payload)) as stream:
             async for piece in stream:
                 pieces.append(piece)
@@ -2933,6 +3014,16 @@ async def main() -> None:
         else:
             if names:
                 await asyncio.to_thread(warm_ollama)
+
+    # These fixed replies should not run Holos/RVC while the user waits.
+    for reply in _WAKE_ACKS:
+        try:
+            pcm = await asyncio.to_thread(synth, reply)
+            if pcm:
+                _wake_ack_pcm[reply] = pcm
+        except Exception as e:
+            log(f"Wake acknowledgement preload failed: {e}")
+    log(f"Wake acknowledgements ready: {len(_wake_ack_pcm)}/{len(_WAKE_ACKS)}")
 
     ips = ", ".join(lan_ipv4()) or "(не видно IPv4 — смотри ipconfig)"
     if not WS_USER or not WS_PASS:

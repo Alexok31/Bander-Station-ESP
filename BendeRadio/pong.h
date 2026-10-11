@@ -4,9 +4,15 @@
 
 bool pong_active();
 void pong_set_active(bool on);
+bool pong_menu_active();
+void pong_open_menu();
 void pong_start();
 void pong_reset();
 void pong_step();
+uint16_t pong_step_interval_ms();
+uint16_t pong_score();
+uint16_t pong_record();
+void pong_save_records();
 void pong_draw();
 void pong_paddle_nudge(int8_t enc_dir);
 int8_t pong_ball_x();

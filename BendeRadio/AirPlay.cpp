@@ -71,6 +71,11 @@ static AirPlayPrebuffer s_prebuffer;
 static AirPlayRtpOrder s_rtp_order;
 static portMUX_TYPE s_pkt_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_under_n = 0;
+static bool s_first_rtp_logged = false;
+static bool s_first_audio_logged = false;
+static bool s_prebuffer_stall_logged = false;
+static bool s_i2s_short_logged = false;
+static uint32_t s_play_wait_since_ms = 0;
 
 static uint32_t ring_count() {
     return s_ring_w - s_ring_r;
@@ -86,6 +91,11 @@ static void ring_reset() {
     portEXIT_CRITICAL(&s_pkt_mux);
     s_prebuffer.reset();
     s_rtp_order.reset();
+    s_first_rtp_logged = false;
+    s_first_audio_logged = false;
+    s_prebuffer_stall_logged = false;
+    s_i2s_short_logged = false;
+    s_play_wait_since_ms = 0;
 }
 
 static void audio_recv_cb(void*, struct udp_pcb*, struct pbuf* p, const ip_addr_t*, u16_t) {
@@ -240,6 +250,7 @@ void airplay_release_speaker() {
 }
 
 static void i2s_feed(const uint8_t* p, size_t left) {
+    const size_t requested = left;
     const uint32_t started = millis();
     size_t off = 0;
     uint8_t spins = 0;
@@ -254,6 +265,11 @@ static void i2s_feed(const uint8_t* p, size_t left) {
         }
         spins = 0;
         off += w;
+    }
+    if (off != requested && !s_i2s_short_logged) {
+        s_i2s_short_logged = true;
+        Serial.printf("[AirPlay] I2S short write %u/%u bytes\n",
+                      (unsigned)off, (unsigned)requested);
     }
 }
 
@@ -380,6 +396,11 @@ static void play_rtp_audio(uint8_t* pkt, int n, uint8_t* dec, int16_t* pcm) {
         g_ap.playing = true;
         airplay_meta_on_play();
         ring_push(pcm, outn / 4);
+        if (!s_first_rtp_logged) {
+            s_first_rtp_logged = true;
+            Serial.printf("[AirPlay] RTP decoded frames=%d ring=%u\n", outn / 4,
+                          (unsigned)ring_count());
+        }
     }
 }
 
@@ -392,13 +413,34 @@ static void play_task(void*) {
             active = g_ap_owns;
             if (!active) {
                 s_prebuffer.reset();
+                s_play_wait_since_ms = 0;
             } else if (g_ap.session && !g_ap.paused &&
                        s_prebuffer.ready(ring_count(), kApPrebuf) && ring_pop(pcm)) {
                 // Silence the amplifier at zero without waiting for queued DMA audio.
                 airplay_hw_mute(g_ap.vol_gain.load() <= 0.0f);
                 airplay_write_pcm(pcm, kApFrameSamp);
+                s_play_wait_since_ms = 0;
+                if (!s_first_audio_logged) {
+                    s_first_audio_logged = true;
+                    Serial.printf("[AirPlay] PCM output ring=%u gain=%.3f\n",
+                                  (unsigned)ring_count(), (double)g_ap.vol_gain.load());
+                }
             } else {
                 ++s_under_n;
+                if (g_ap.session && g_ap.playing && !g_ap.paused && !s_first_audio_logged) {
+                    if (!s_play_wait_since_ms) s_play_wait_since_ms = millis();
+                    if (!s_prebuffer_stall_logged &&
+                        (uint32_t)(millis() - s_play_wait_since_ms) >= 4000u) {
+                        s_prebuffer_stall_logged = true;
+                        Serial.printf("[AirPlay] PCM waiting ring=%u/%d udp_q=%u rtp_age=%ums gain=%.3f\n",
+                                      (unsigned)ring_count(), kApPrebuf,
+                                      (unsigned)(s_pq_w - s_pq_r),
+                                      (unsigned)(millis() - g_ap.last_rtp_ms),
+                                      (double)g_ap.vol_gain.load());
+                    }
+                } else {
+                    s_play_wait_since_ms = 0;
+                }
                 memset(pcm, 0, (size_t)kApFrameBytes);
                 i2s_feed(reinterpret_cast<const uint8_t*>(pcm), (size_t)kApFrameBytes);
             }
@@ -645,6 +687,13 @@ void airplay_set_accept(bool on) {
 
 bool airplay_owns_speaker() {
     return g_ap_owns;
+}
+
+bool airplay_allows_ai() {
+    // In AirPlay mode the mic is free before a phone connects and after
+    // teardown. Keep it off while SETUP owns I2S and while music plays.
+    return !s_ap_accept || (!g_ap.session && !g_ap_owns) ||
+           (g_ap.session && g_ap_owns && g_ap.paused);
 }
 
 bool airplay_playing() {

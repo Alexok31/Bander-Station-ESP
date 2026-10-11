@@ -15,7 +15,8 @@ SAMPLE_RATE = 24000
 
 
 class HolosVoice:
-    def __init__(self, speaker: str = "Speaker_84", speed: float = 1.0):
+    def __init__(self, speaker: str = "Speaker_84", speed: float = 1.0,
+                 delivery: str = "original"):
         if not 0.5 <= speed <= 1.5:
             raise ValueError("HolosTTS speed must be between 0.5 and 1.5")
         model = MODELS / "holos_cpu_int8.onnx"
@@ -31,8 +32,22 @@ class HolosVoice:
             if speaker not in voices:
                 raise ValueError(f"HolosTTS speaker unavailable: {speaker}")
             self.voice = voices[speaker].reshape(1, 256).astype(np.float32)
+        if delivery != "original":
+            if speaker != "Speaker_84":
+                raise ValueError("HolosTTS delivery profiles require Speaker_84")
+            profiles_path = MODELS / "voice_profiles.npz"
+            if not profiles_path.is_file():
+                raise FileNotFoundError(f"HolosTTS delivery profiles missing: {profiles_path}")
+            with np.load(profiles_path, allow_pickle=False) as profiles:
+                if delivery not in profiles:
+                    raise ValueError(f"HolosTTS delivery unavailable: {delivery}")
+                profile = profiles[delivery]
+                if profile.shape != (1, 256) or not np.isfinite(profile).all():
+                    raise ValueError(f"HolosTTS invalid delivery profile: {delivery}")
+                self.voice = profile.astype(np.float32)
         self.speaker = speaker
         self.speed = speed
+        self.delivery = delivery
 
         options = ort.SessionOptions()
         options.intra_op_num_threads = 4

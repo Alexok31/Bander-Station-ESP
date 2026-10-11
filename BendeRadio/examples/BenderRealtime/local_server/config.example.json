@@ -8,6 +8,7 @@
   "tts_backend": "piper",
   "holos_speaker": "Speaker_84",
   "holos_speed": 1.0,
+  "holos_delivery": "original",
   "history_turns": 40,
   "summary_chars": 2000
 }

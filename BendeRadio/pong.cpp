@@ -2,205 +2,201 @@
 
 #include <Arduino.h>
 #include <GyverMAX7219.h>
+#include <Preferences.h>
 
+#include "ArcadeGames.h"
 #include "RadioConfig.h"
 
 extern MAX7219<5, 1, RadioConfig::mtrxCs, RadioConfig::mtrxDat, RadioConfig::mtrxClk> mtrx;
 
-static constexpr uint8_t kPw = RadioConfig::analyzWidth;
-static constexpr uint8_t kPh = 8;
-static constexpr uint8_t kPaddleH = 3;
+namespace {
+constexpr uint8_t width = RadioConfig::analyzWidth;
+constexpr uint8_t gameCount = 3;
+static_assert(width == 24, "Arcade field and snake storage must fit the 24x8 mouth");
+SoloPong::Game tennis(width);
+SoloSnake::Game snake(width);
+SoloDodge::Game dodge(width);
+bool active = false;
+bool menu = true;
+uint8_t selected = 0; // 0 tennis, 1 snake, 2 dodge
+uint16_t records[gameCount] = {};
+bool dirty[gameCount] = {};
+bool recordsLoaded = false;
+uint32_t missStarted = 0;
+bool missEffect = false;
+constexpr const char* recordKeys[gameCount] = {"pong_best", "snake_best", "dodge_best"};
 
-static bool g_active = false;
-static int8_t g_py = 3;
-static int8_t g_aiy = 3;
-static int8_t g_bx = 12;
-static int8_t g_by = 4;
-static int8_t g_vx = 1;
-static int8_t g_vy = 1;
-static uint8_t g_score_pl = 0;
-static uint8_t g_score_ai = 0;
-static uint32_t g_goal_fx_until = 0;
-static int8_t g_goal_fx_side = 0;
-static bool g_serve_wait = false;
-
-static constexpr uint32_t kGoalFxMs = 520;
-
-static void pong_reset_ball() {
-    g_bx = kPw / 2;
-    g_by = kPh / 2;
-    g_vx = (random(0, 2) ? 1 : -1);
-    g_vy = (random(0, 2) ? 1 : -1);
-}
-
-static void register_goal(int8_t side) {
-    g_goal_fx_until = millis() + kGoalFxMs;
-    g_goal_fx_side = side;
-}
-
-static bool mouth_tablo_mode_impl() {
-    if (g_serve_wait) {
-        return true;
+void loadRecords() {
+    if (recordsLoaded) return;
+    Preferences prefs;
+    if (prefs.begin("bende", true)) {
+        for (uint8_t i = 0; i < gameCount; ++i) records[i] = prefs.getUShort(recordKeys[i], 0);
+        prefs.end();
     }
-    if (g_goal_fx_until == 0) {
-        return false;
-    }
-    return (int32_t)(millis() - g_goal_fx_until) < 0;
+    recordsLoaded = true;
 }
 
-// Рот: только «поле» ожидания подачи / после гола — точка в центре и ракетки по краям.
-// Счёт выводится на глазах (см. draw_eyes_follow_ball в core0.cpp).
-static void draw_mouth_tablo() {
-    mtrx.rect(0, 0, kPw - 1, kPh - 1, GFX_CLEAR);
-    mtrx.dot((uint8_t)(kPw / 2), (uint8_t)(kPh / 2));
-    for (uint8_t i = 0; i < kPaddleH; i++) {
-        mtrx.dot(0, (uint8_t)(g_py + i));
-        mtrx.dot(kPw - 1, (uint8_t)(g_aiy + i));
+uint16_t scoreNow() {
+    return selected == 1 ? snake.score() : selected == 2 ? dodge.score : tennis.score;
+}
+
+bool waitingNow() {
+    return selected == 1 ? snake.waiting : selected == 2 ? dodge.waiting : tennis.waiting;
+}
+
+void updateRecord() {
+    if (menu) return;
+    const uint16_t score = scoreNow();
+    if (score > records[selected]) {
+        records[selected] = score;
+        dirty[selected] = true;
     }
 }
 
-bool pong_mouth_tablo_mode() {
-    return mouth_tablo_mode_impl();
-}
+void clearMouth() { mtrx.rect(0, 0, width - 1, 7, GFX_CLEAR); }
 
-bool pong_active() {
-    return g_active;
-}
-
-void pong_set_active(bool on) {
-    g_active = on;
-    if (!on) {
-        g_serve_wait = false;
+void drawTennis() {
+    for (uint8_t y = 0; y < 3; ++y) {
+        mtrx.dot(0, uint8_t(tennis.left + y));
+        mtrx.dot(width - 1, uint8_t(tennis.right + y));
     }
+    mtrx.dot(uint8_t(tennis.x), uint8_t(tennis.y));
 }
 
-void pong_reset() {
-    g_py = (int8_t)((kPh - kPaddleH) / 2);
-    g_aiy = (int8_t)((kPh - kPaddleH) / 2);
-    pong_reset_ball();
+void drawSnake() {
+    for (uint16_t i = 0; i < snake.length; ++i)
+        mtrx.dot(snake.body[i] % width, snake.body[i] / width);
+    if (snake.length < SoloSnake::Game::capacity)
+        mtrx.dot(snake.food % width, snake.food / width);
 }
 
-void pong_start() {
-    g_active = true;
-    g_score_pl = 0;
-    g_score_ai = 0;
-    g_goal_fx_until = 0;
-    g_goal_fx_side = 0;
-    pong_reset();
-    g_serve_wait = true;
+void drawDodge() {
+    for (uint8_t y = 0; y < 8; ++y)
+        for (uint8_t x = 0; x < width; ++x)
+            if (dodge.rows[y] & (uint32_t(1) << x)) mtrx.dot(x, y);
+    mtrx.dot(dodge.player, 7);
+    if (dodge.player > 0) mtrx.dot(dodge.player - 1, 7);
+    if (dodge.player + 1 < width) mtrx.dot(dodge.player + 1, 7);
 }
 
-void pong_step() {
-    if (g_serve_wait) {
-        return;
-    }
-
-    if (random(0, 3) != 0) {
-        const int mid = g_aiy + kPaddleH / 2;
-        if (mid < g_by && g_aiy < (int8_t)(kPh - kPaddleH)) {
-            g_aiy++;
-        } else if (mid > g_by && g_aiy > 0) {
-            g_aiy--;
-        }
-    }
-
-    g_by += g_vy;
-    if (g_by < 0) {
-        g_by = 0;
-        g_vy = 1;
-    } else if (g_by >= (int8_t)kPh) {
-        g_by = kPh - 1;
-        g_vy = -1;
-    }
-
-    // Ракетка в колонках 0 и kPw-1; мяч не должен в них «залипать» — отражаем в 1 и kPw-2.
-    const int16_t next_bx = (int16_t)g_bx + g_vx;
-
-    if (g_vx < 0 && next_bx <= 0) {
-        const bool hit = (g_by >= g_py && g_by < g_py + (int8_t)kPaddleH);
-        if (hit) {
-            g_bx = 1;
-            g_vx = 1;
-        } else {
-            if (g_score_ai < 9) {
-                g_score_ai++;
-            }
-            pong_reset_ball();
-            register_goal(-1);
-            g_serve_wait = true;
-        }
-    } else if (g_vx > 0 && next_bx >= (int16_t)kPw - 1) {
-        const bool hit = (g_by >= g_aiy && g_by < g_aiy + (int8_t)kPaddleH);
-        if (hit) {
-            g_bx = (int8_t)(kPw - 2);
-            g_vx = -1;
-        } else {
-            if (g_score_pl < 9) {
-                g_score_pl++;
-            }
-            pong_reset_ball();
-            register_goal(1);
-            g_serve_wait = true;
-        }
+void drawMenu() {
+    // Turning the encoder previews one of three games on the mouth.
+    if (selected == 0) {
+        for (uint8_t y = 2; y <= 4; ++y) { mtrx.dot(3, y); mtrx.dot(width - 4, y); }
+        mtrx.dot(width / 2, 3);
+    } else if (selected == 1) {
+        for (uint8_t x = 7; x <= 14; ++x) mtrx.dot(x, uint8_t(3 + ((x / 2) & 1)));
+        mtrx.dot(18, 3);
     } else {
-        g_bx = (int8_t)next_bx;
+        mtrx.dot(width / 2, 7);
+        mtrx.dot(width / 2 - 1, 7);
+        mtrx.dot(width / 2 + 1, 7);
+        mtrx.dot(7, 1); mtrx.dot(8, 1);
+        mtrx.dot(17, 3); mtrx.dot(18, 3);
     }
 }
+}
 
-void pong_draw() {
-    if (mouth_tablo_mode_impl()) {
-        draw_mouth_tablo();
+void pong_save_records() {
+    updateRecord();
+    bool any = false;
+    for (bool value : dirty) any |= value;
+    if (!any) return;
+    Preferences prefs;
+    if (!prefs.begin("bende", false)) {
+        Serial.println(F("[Game] record save failed"));
         return;
     }
-    mtrx.rect(0, 0, kPw - 1, kPh - 1, GFX_CLEAR);
-    for (uint8_t i = 0; i < kPaddleH; i++) {
-        mtrx.dot(0, (uint8_t)(g_py + i));
-        mtrx.dot(kPw - 1, (uint8_t)(g_aiy + i));
+    for (uint8_t i = 0; i < gameCount; ++i) if (dirty[i]) {
+        if (prefs.putUShort(recordKeys[i], records[i]) == sizeof(uint16_t)) dirty[i] = false;
+        else Serial.println(F("[Game] record write failed"));
     }
-    mtrx.dot((uint8_t)constrain(g_bx, 0, kPw - 1), (uint8_t)constrain(g_by, 0, kPh - 1));
+    prefs.end();
 }
 
-int8_t pong_ball_x() {
-    return constrain(g_bx, 0, kPw - 1);
+bool pong_active() { return active; }
+void pong_set_active(bool on) {
+    if (!on) pong_save_records();
+    active = on;
 }
-
-int8_t pong_ball_y() {
-    return constrain(g_by, 0, kPh - 1);
+bool pong_menu_active() { return menu; }
+void pong_open_menu() {
+    pong_save_records();
+    menu = true;
+    missEffect = false;
 }
-
-uint8_t pong_score_player() {
-    return g_score_pl;
+void pong_start() {
+    loadRecords();
+    menu = true;
+    selected = 0;
+    tennis.reset(); snake.reset(); dodge.reset();
+    missEffect = false;
+    active = true;
 }
-
-uint8_t pong_score_ai() {
-    return g_score_ai;
+void pong_reset() {
+    pong_save_records();
+    tennis.reset(); snake.reset(); dodge.reset();
+    missEffect = false;
 }
-
-bool pong_goal_fx_active() {
-    if (g_goal_fx_until == 0) {
-        return false;
+void pong_step() {
+    if (!active || menu || waitingNow()) return;
+    const uint32_t seed = esp_random();
+    const bool missed = selected == 1 ? snake.step(seed)
+                      : selected == 2 ? dodge.step(seed) : tennis.step(seed);
+    updateRecord();
+    if (missed) {
+        missStarted = millis();
+        missEffect = true;
+        pong_save_records();
     }
-    if ((int32_t)(millis() - g_goal_fx_until) >= 0) {
-        g_goal_fx_until = 0;
-        g_goal_fx_side = 0;
-        return false;
-    }
-    return true;
 }
-
-int8_t pong_goal_fx_side() {
-    return g_goal_fx_side;
+uint16_t pong_step_interval_ms() {
+    return menu ? 100u : selected == 1 ? snake.intervalMs()
+           : selected == 2 ? dodge.intervalMs() : tennis.intervalMs();
 }
-
-bool pong_serve_waiting() {
-    return g_serve_wait;
-}
-
+uint16_t pong_score() { return menu ? 0 : scoreNow(); }
+uint16_t pong_record() { loadRecords(); return records[selected]; }
+bool pong_serve_waiting() { return menu || waitingNow(); }
 void pong_resume_after_goal() {
-    g_serve_wait = false;
+    if (!active || !pong_serve_waiting()) return;
+    pong_save_records();
+    menu = false;
+    const uint32_t seed = esp_random();
+    if (selected == 1) snake.serve(seed);
+    else if (selected == 2) dodge.serve(seed);
+    else tennis.serve(seed);
+    missEffect = false;
 }
-
-void pong_paddle_nudge(int8_t enc_dir) {
-    g_py += enc_dir;
-    g_py = constrain(g_py, 0, (int8_t)(kPh - kPaddleH));
+void pong_paddle_nudge(int8_t dir) {
+    if (!active || !dir) return;
+    if (menu) selected = uint8_t((selected + (dir > 0 ? 1 : gameCount - 1)) % gameCount);
+    else if (selected == 1) snake.turn(dir);
+    else if (selected == 2 && dodge.nudge(dir)) {
+        missStarted = millis();
+        missEffect = true;
+        pong_save_records();
+    }
 }
+void pong_draw() {
+    clearMouth();
+    if (!active) return;
+    if (menu) drawMenu();
+    else if (selected == 1) drawSnake();
+    else if (selected == 2) drawDodge();
+    else drawTennis();
+    if (missEffect && uint32_t(millis() - missStarted) < 520u) {
+        mtrx.dot(width / 2 - 1, 3);
+        mtrx.dot(width / 2 + 1, 3);
+        mtrx.dot(width / 2, 4);
+    }
+}
+int8_t pong_ball_x() { return tennis.x; }
+int8_t pong_ball_y() { return tennis.y; }
+uint8_t pong_score_player() { return uint8_t(scoreNow() % 10u); }
+uint8_t pong_score_ai() { return uint8_t(pong_record() % 10u); }
+bool pong_goal_fx_active() {
+    if (missEffect && uint32_t(millis() - missStarted) >= 520u) missEffect = false;
+    return missEffect;
+}
+int8_t pong_goal_fx_side() { return 0; }
+bool pong_mouth_tablo_mode() { return menu || waitingNow(); }

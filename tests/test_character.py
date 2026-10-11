@@ -16,14 +16,16 @@ from character import KEYS, validate_character, character_rules, validate_previe
 
 def server_namespace():
     # Use production protocol/prompt functions without loading speech models or secrets.
-    names = {'set_device_character', 'grok_break_chain', 'bender_prompt',
+    names = {'set_device_character', 'grok_break_chain', 'bender_prompt', 'local_bender_prompt',
              'grok_turn_text', '_llm_payload', 'handle', '_grok_pieces',
              'character_preview_text', 'run_character_preview', '_model_context', '_is_social_checkin',
              '_trim_reply_filler', '_reply_words'}
     tree = ast.parse((SERVER / 'server.py').read_text(encoding='utf-8'))
     nodes = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names]
     nodes += [n for n in tree.body if isinstance(n, ast.Assign) and any(
-        isinstance(t, ast.Name) and t.id in {'_ACK_OPENING_RE', '_EMPTY_INVITATION_RE'} for t in n.targets)]
+        isinstance(t, ast.Name) and t.id in {
+            '_ACK_OPENING_RE', '_RUDE_ACK_OPENING_RE', '_SOCIAL_ECHO_RE', '_EMPTY_INVITATION_RE'
+        } for t in n.targets)]
     ns = dict(asyncio=asyncio, aclosing=aclosing, re=re,
               DEVICE_CHARACTER=None, CHAT_GROK_RESP_ID='old-chain', BENDER_LEVEL=10,
               validate_character=validate_character, character_rules=character_rules,
@@ -33,7 +35,9 @@ def server_namespace():
               MEMORY=SimpleNamespace(context=lambda *args: '', profile=lambda *args: {'type': 'device.profile'}),
               DEVICE_STATIONS=[], _TURN_GUIDANCE='continue the conversation',
               _is_greet=lambda text: False, _is_story=lambda text: False,
-              LLM_PROVIDER='ollama', OLLAMA_MODEL='test', GROK_MODEL='test',
+              LLM_PROVIDER='ollama', OLLAMA_MODEL='test', GROK_MODEL='test', OLLAMA_NUM_GPU=0,
+              OLLAMA_NUM_CTX=8192, OLLAMA_HISTORY_MESSAGES=0, OLLAMA_SUMMARY_CHARS=0,
+              OLLAMA_COMPACT_PROMPT=False,
               CHAT_SUMMARY='', HISTORY_SEND=10, json=json, dumps=json.dumps,
               websockets=SimpleNamespace(exceptions=SimpleNamespace(ConnectionClosed=ConnectionError)))
     exec(compile(ast.Module(body=nodes, type_ignores=[]), 'character-server', 'exec'), ns)
@@ -41,6 +45,39 @@ def server_namespace():
 
 
 class CharacterTests(unittest.TestCase):
+    def test_local_gpu_layer_limit_is_sent_with_chat_requests(self):
+        ns = server_namespace()
+        ns['OLLAMA_NUM_GPU'] = 36
+        payload = ns['_llm_payload']('', 'uk', 1, True,
+                                     [{'role': 'user', 'content': 'Привіт, Бендер'}])
+        self.assertEqual(payload['options']['num_gpu'], 36)
+        ns['OLLAMA_NUM_GPU'] = 0
+        payload = ns['_llm_payload']('', 'uk', 1, True,
+                                     [{'role': 'user', 'content': 'Привіт, Бендер'}])
+        self.assertNotIn('num_gpu', payload['options'])
+
+    def test_local_context_limit_preserves_recent_dialogue(self):
+        ns = server_namespace()
+        ns.update(OLLAMA_NUM_CTX=4096, OLLAMA_HISTORY_MESSAGES=3,
+                  OLLAMA_SUMMARY_CHARS=7, CHAT_SUMMARY='old newer')
+        history = [{'role': 'user', 'content': f'question {i}'} for i in range(5)]
+        payload = ns['_llm_payload']('', 'uk', 1, True, history)
+        self.assertEqual(payload['options']['num_ctx'], 4096)
+        self.assertEqual(payload['messages'][-3:], history[-3:])
+        self.assertTrue(any('newer' in m['content'] for m in payload['messages']))
+        self.assertFalse(any('old newer' in m['content'] for m in payload['messages']))
+
+    def test_compact_local_prompt_keeps_character_values(self):
+        ns = server_namespace()
+        ns['OLLAMA_COMPACT_PROMPT'] = True
+        ns['DEVICE_CHARACTER'] = dict.fromkeys(KEYS, 100)
+        payload = ns['_llm_payload']('', 'uk', 1, True,
+                                     [{'role': 'user', 'content': 'Як справи?'}])
+        prompt = payload['messages'][0]['content']
+        self.assertIn('Бендер', prompt)
+        self.assertIn("лихослів'я 100", prompt)
+        self.assertLess(len(prompt), 2000)
+
     def test_context_drops_empty_training_examples_without_mutating_chat(self):
         ns = server_namespace()
         history = [

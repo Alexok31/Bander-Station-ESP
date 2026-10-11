@@ -13,7 +13,7 @@ struct AirPlaySess {
     std::atomic<bool> advertised{false};
     std::atomic<bool> session{false};
     std::atomic<bool> playing{false};
-    bool paused = false;  // guarded, PAUSE/FLUSH may outlive the RTP timeout
+    std::atomic<bool> paused{false};  // Also read by the AI task when deciding whether listening is safe.
     bool encrypted = false;
     uint8_t aes_key[16]{};
     uint8_t aes_iv[16]{};

@@ -188,6 +188,8 @@ def load_server_functions():
         "_story_fallback": lambda history: "story fallback",
         "_greet_fallback": lambda history: "greeting fallback",
         "_miss_fallback": lambda: "Не розчув.",
+        "next_wake_ack": lambda: "Ну привіт. Кажи.",
+        "_wake_ack_pcm": {},
         "bender_prompt": lambda: "character prompt", "log": logs.append,
         "grok_break_chain": lambda reason: None,
         "transcribe": lambda pcm: ("Розкажи щось.", "uk", 1.0, True),
@@ -209,19 +211,59 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self.timing = TurnTiming(self.logs.append)
         self.history = [{"role": "user", "content": "Розкажи щось."}]
 
-    async def test_only_wake_name_opens_followup_without_llm_tts_or_history(self):
+    async def test_only_wake_name_plays_short_ack_then_opens_followup(self):
         import voice_commands
         self.ns['voice_commands'] = voice_commands
         self.ns['transcribe'] = lambda pcm: ('Привет, Бендер!', 'ru', 1, True)
-        def forbidden(*args): self.fail('Wake name alone must not reach LLM, TTS or memory')
-        self.ns['synth'] = self.ns['handle_personal_command'] = forbidden
+        def forbidden(*args): self.fail('Wake name alone must not reach LLM or memory')
+        self.ns['handle_personal_command'] = forbidden
+        spoken=[]
+        self.ns['synth'] = lambda sentence: (spoken.append(sentence), b'\x01\x00' * 300)[1]
         wire=[]
         async def send(raw): wire.append(json.loads(raw))
         history=list(self.history)
         await self.ns['run_turn'](SimpleNamespace(send=send), b'input', '', history, wake_invocation=True)
         self.assertEqual(history, self.history)
-        self.assertEqual(wire, [{'type':'response.created'}, {'type':'response.output_audio.done'},
-                                {'type':'response.done', 'wake_only':True}])
+        self.assertEqual(spoken, ['Ну привіт. Кажи.'])
+        self.assertEqual(wire[0], {'type':'response.created'})
+        self.assertTrue(any(m['type']=='response.output_audio.delta' for m in wire))
+        self.assertEqual(wire[-2:], [{'type':'response.output_audio.done'},
+                                     {'type':'response.done', 'wake_only':True}])
+
+    async def test_wake_ack_uses_prepared_audio(self):
+        import voice_commands
+        self.ns['voice_commands'] = voice_commands
+        self.ns['transcribe'] = lambda pcm: ('Привет, Бендер!', 'ru', 1, True)
+        self.ns['next_wake_ack'] = lambda: 'ready'
+        self.ns['_wake_ack_pcm'] = {'ready': b'\x01\x00' * 300}
+        self.ns['synth'] = lambda text: self.fail('Cached acknowledgement must skip TTS/RVC')
+        wire = []
+        async def send(raw): wire.append(json.loads(raw))
+        await self.ns['run_turn'](SimpleNamespace(send=send), b'input', '', [], wake_invocation=True)
+        self.assertTrue(any(m['type'] == 'response.output_audio.delta' for m in wire))
+        self.assertEqual(wire[-1], {'type': 'response.done', 'wake_only': True})
+        self.assertTrue(any('first_sentence_audio_ready' in line for line in self.logs))
+
+    async def test_false_wake_is_silent_and_does_not_start_followup_or_history(self):
+        import voice_commands
+        self.ns['voice_commands'] = voice_commands
+        def forbidden(*args): self.fail('Rejected wake must not reach LLM, TTS or memory')
+        self.ns['synth'] = self.ns['handle_personal_command'] = forbidden
+        for text, ok in (('щелчок', True), ('Бам-бам', True), ('Привет, блендер', True),
+                         ('Бендер', False)):
+            with self.subTest(text=text, asr_ok=ok):
+                self.ns['transcribe'] = lambda pcm, text=text, ok=ok: (text, 'ru', 1, ok)
+                wire=[]
+                async def send(raw): wire.append(json.loads(raw))
+                history=list(self.history)
+                await self.ns['run_turn'](SimpleNamespace(send=send), b'input', '', history,
+                                          wake_invocation=True)
+                self.assertEqual(history, self.history)
+                self.assertEqual(wire, [
+                    {'type':'response.created'},
+                    {'type':'device.command', 'name':'conversation.end', 'args':{}},
+                    {'type':'response.output_audio.done'},
+                    {'type':'response.done', 'wake_rejected':True}])
 
     async def test_continuous_question_is_answered_without_greeting(self):
         import voice_commands
@@ -231,6 +273,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 ns['voice_commands']=voice_commands
                 text='Привіт, Бендер, як справи?'
                 ns['transcribe']=lambda pcm:(text,'uk',1,True)
+                ns['next_wake_ack']=lambda: self.fail('Question must not trigger the greeting')
                 prompts=[]
                 async def model(prompt,lang,prob,history):
                     prompts.append(history[-1]['content'])

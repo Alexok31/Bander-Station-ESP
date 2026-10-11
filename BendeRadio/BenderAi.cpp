@@ -1103,6 +1103,12 @@ static void onMessage(websockets::WebsocketsMessage m) {
         speaking = false;
         noteProgress();
     } else if (!strcmp(t, "response.done")) {
+        if (providerIsLocal() && s_wake_invocation && (j["wake_rejected"] | false) &&
+            s_wake_voice.load() == 3) {
+            s_wake_prompt_pending.store(false);
+            s_dialogue_ending.store(true);
+            ALOGLN(F("[WakeVoice] server rejected wake — return to keyword listening"));
+        }
         if (providerIsLocal() && s_wake_invocation && (j["wake_only"] | false) &&
             s_wake_voice.load() == 3 && WakeRuntime::voiceEnabled()) {
             s_wake_prompt_pending.store(true);
@@ -1371,6 +1377,7 @@ static void wsTask(void*) {
             }
         }
         const bool wakeListen = WakeRuntime::enabled() && WakeRuntime::status().ready &&
+            !radioState.state && airplay_allows_ai() &&
             !s_ai_awake && !wantOnline && !sampleActive() && !bender_ai_busy() && !s_demo;
         if (!wakeListen && wakeMic) {
             WakeRuntime::listening(false);
@@ -1508,7 +1515,8 @@ static void wsTask(void*) {
                     // while offline, busy, or using the external Bluetooth path.
                     if (WakeRuntime::voiceEnabled() && !s_ai_awake && !wantOnline &&
                         WiFi.status() == WL_CONNECTED && !bender_ai_busy() &&
-                        strcmp(g_audio_source, "wifi") == 0 && !s_giveback) {
+                        strcmp(g_audio_source, "wifi") == 0 && !radioState.state &&
+                        airplay_allows_ai() && !s_giveback) {
                         s_face_error_ms.store(0, std::memory_order_relaxed);
                         s_preN_at_arm = 0;
                         wifi_touch_activity();
@@ -1971,7 +1979,8 @@ uint8_t bender_ai_preview_status() {
 bool bender_ai_event(BenderEvent event, int station) {
     AirPlayAudioGuard guard;
     if (!providerIsLocal() || !s_started || !s_event_voice_enabled.load() || s_preview_state.load() == 1 ||
-        bender_ai_busy() || airplay_owns_speaker() || s_ptt_armed || WiFi.status() != WL_CONNECTED ||
+        bender_ai_busy() || !airplay_allows_ai() || airplay_owns_speaker() ||
+        s_ptt_armed || WiFi.status() != WL_CONNECTED ||
         s_drop_event_reply || event == BenderEvent::None || event == BenderEvent::NetworkLost) return false;
     // Prepare the socket without turning on the microphone or taking I2S.
     s_pending_event_ms.store(millis());
@@ -2059,6 +2068,7 @@ uint8_t bender_ai_wake_voice_state() {
 void bender_ai_ptt_arm() {
     if (s_wake_voice.load()) return;
     AirPlayAudioGuard guard;
+    if (radioState.state || !airplay_allows_ai()) return;
     if (sampleActive()) { s_sample_cancel.store(true); return; }
     if (s_preview_state.load() >= 1 && s_preview_state.load() <= 3) s_preview_state.store(5);
     s_pending_event.store(0);
@@ -2104,6 +2114,7 @@ void bender_ai_yield_radio() {
 
 void bender_ai_ptt_down() {
     if (s_wake_voice.load()) return;
+    if (radioState.state || !airplay_allows_ai()) return;
     if (sampleActive()) { s_sample_cancel.store(true); return; }
     if (s_demo) {
         ALOGLN(F("[PTT] wait answer"));

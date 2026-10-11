@@ -29,6 +29,8 @@ void airplay_tick();
 void airplay_interrupt();
 
 bool airplay_owns_speaker();
+// AI may listen while AirPlay is idle or paused, but not during setup/playback.
+bool airplay_allows_ai();
 bool airplay_playing();
 bool airplay_accepts();
 void airplay_set_accept(bool on);
