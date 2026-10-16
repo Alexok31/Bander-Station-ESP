@@ -13,6 +13,9 @@
 #include <FastLED.h>
 #include <GyverMAX7219.h>
 #include "MatrixRecovery.h"
+#include "LiquidMouth.h"
+#include "TiltEyes.h"
+#include "CountdownFace.h"
 
 #include "battery.h"
 #include "battery_matrix.h"
@@ -20,6 +23,7 @@
 #include "AudioMux.h"
 #include "BtAudio.h"
 #include "NvsConfig.h"
+#include "Reminders.h"
 #include "pong.h"
 #include "tmr.h"
 #include "BenderAi.h"
@@ -35,6 +39,9 @@ static inline uint8_t mouth_gfx_off(bool invert) {
 
 static uint32_t s_face_last_live_ms = 0;
 static bool s_wake_on_shake = true;
+static bool s_tilt_eyes_enabled = true;
+// Shared with the liquid mouth; calibration updates both in one atomic write.
+static std::atomic<uint32_t> s_liquid_reference{0x40000000u};
 static uint32_t s_face_calm_after_ms = RadioConfig::benderFaceCalmAfterMs;
 static bool matrix_face_awake();
 static BenderLife s_life;
@@ -52,7 +59,8 @@ static void react_to_life(BenderEvent event) {
     // Direct physical interactions can speak while radio playback is paused.
     if (!bender_event_radio_allows_voice(event, radioState.state) ||
         strcmp(g_audio_source, "wifi") != 0 || airplay_owns_speaker() ||
-        radioState.vol <= 0 || WiFi.status() != WL_CONNECTED || !bender_ai_event_voice_enabled()) return;
+        radioState.vol <= 0 || (!bender_event_has_local_voice(event) && WiFi.status() != WL_CONNECTED) ||
+        !bender_ai_event_voice_enabled()) return;
     if (s_life.allowVoice(event, now, false) && bender_ai_event(event, (int)radioState.station))
         s_life.allowVoice(event, now);
 }
@@ -63,6 +71,11 @@ static bool matrix_face_awake() {
         return true;
     }
     return BenderBehavior::faceAwake(millis(), s_face_last_live_ms, s_face_calm_after_ms);
+}
+
+bool matrix_face_is_awake() {
+    return radioState.state || bender_ai_busy() || airplay_playing() ||
+        BenderBehavior::faceAwake(millis(), s_face_last_live_ms, s_face_calm_after_ms);
 }
 
 // Встроенные станции (0…1). Дополнительные — только через Web UI → NVS.
@@ -202,6 +215,9 @@ static inline bool matrix_display_ready() {
 
 static uint32_t s_matrix_last_flush_ms = 0;
 static MatrixRecoverySchedule s_matrix_recovery;
+static bool s_countdown_visible = false;
+static uint32_t s_countdown_seconds = 0;
+static Tmr* s_countdown_overlay_timer = nullptr;
 
 static void matrix_flush(bool force = false) {
     const uint32_t now = millis();
@@ -215,6 +231,19 @@ static void matrix_flush(bool force = false) {
         }
     }
     s_matrix_last_flush_ms = now;
+    // Compose only for transmission, then restore the underlying face frame.
+    // Volume, battery, games and AI faces retain their own framebuffer.
+    if (!force && s_countdown_visible && !pong_active() && !s_mode_pick_active &&
+        !bender_ai_busy() && bender_ai_face_state() == BenderFaceState::Idle &&
+        !(s_countdown_overlay_timer && s_countdown_overlay_timer->state())) {
+        uint8_t saved[sizeof(mtrx.buffer)];
+        memcpy(saved, mtrx.buffer, sizeof(saved));
+        mtrx.rect(0, 0, RadioConfig::analyzWidth - 1, 7, GFX_CLEAR);
+        CountdownFace::draw(s_countdown_seconds, [](uint8_t x, uint8_t y) { mtrx.dot(x, y); });
+        mtrx.update();
+        memcpy(mtrx.buffer, saved, sizeof(saved));
+        return;
+    }
     mtrx.update();
 }
 
@@ -373,6 +402,7 @@ void matrix_show_volume(int8_t vol) {
 }
 
 void print_val(char c, uint8_t v) {
+    s_countdown_visible = false;
     if (!matrix_display_ready()) {
         return;
     }
@@ -405,6 +435,7 @@ static uint32_t s_batt_charge_frame;
 static bool s_batt_overlay_prev_chg;
 
 static void print_batt_overlay(uint8_t pct) {
+    s_countdown_visible = false;
     if (!matrix_display_ready()) {
         return;
     }
@@ -441,6 +472,24 @@ void draw_eye(uint8_t i) {
 void draw_eyeb(uint8_t i, int x, int y, int w = 2) {
     x += RadioConfig::analyzWidth + i * 8;
     mtrx.rect(x, y, x + w - 1, y + w - 1, GFX_CLEAR);
+}
+
+static bool draw_tilt_eyes() {
+    if (!s_tilt_eyes_enabled) return false;
+    static TiltEyes::Gaze gaze;
+    const auto accel = mpu6050_acceleration();
+    const int32_t x = int32_t(RadioConfig::liquidTiltUseY ? accel.y : accel.x) * RadioConfig::liquidTiltSign;
+    gaze.step(millis(), x, accel.z, accel.valid, accel.change, s_liquid_reference.load());
+    if (!gaze.active()) return false; // Keep the usual wandering gaze at rest.
+    for (uint8_t i = 0; i < 2; ++i) {
+        draw_eyeb(i, 3 + gaze.offset(), 3);
+        if (gaze.squint) {
+            const uint8_t eye = RadioConfig::analyzWidth + i * 8;
+            mtrx.rect(eye, 0, eye + 7, 1, GFX_CLEAR);
+            mtrx.lineH(7, eye, eye + 7, GFX_CLEAR);
+        }
+    }
+    return true;
 }
 
 // Радио выкл.: статичные «спящие» глаза (тот же вид, что в change_state при !radioState.state).
@@ -1171,10 +1220,71 @@ static void analyz_mouth_robot_backup(uint8_t vol, bool invert, bool animate = t
     mouth_robot_one_frame(vol, invert, animate);
 }
 
-// 0 хвиля; 1 інв.; 2 EQ; 3 рот; 4 рот інв.; 5 прогрес трека (BT / AIR).
+// Q14 sine/cosine packed together so the two cores see one consistent reference.
+const char* liquid_calibrate(bool reset) {
+    uint32_t reference = 0x40000000u;
+    if (!reset) {
+        const auto accel = mpu6050_acceleration();
+        if (!accel.valid) return "Нет свежих данных датчика. Попробуй ещё раз.";
+        if (accel.change > 2500u) return "Поставь колонку неподвижно и нажми ещё раз.";
+        const float x = float(RadioConfig::liquidTiltUseY ? accel.y : accel.x) * RadioConfig::liquidTiltSign;
+        const float z = accel.z;
+        const float length = sqrtf(x * x + z * z);
+        if (length < 3000.0f) return "Поставь колонку вертикальнее: сейчас наклон не определяется.";
+        const int16_t sine = int16_t(lroundf(x * 16384.0f / length));
+        const int16_t cosine = int16_t(lroundf(z * 16384.0f / length));
+        reference = uint32_t(uint16_t(sine)) | (uint32_t(uint16_t(cosine)) << 16);
+    }
+    if (!nvsSaveLiquidReference(reference)) return "Не удалось сохранить калибровку. Попробуй ещё раз.";
+    s_liquid_reference.store(reference);
+    return nullptr;
+}
+
+static void draw_liquid_mouth(uint8_t sound) {
+    static LiquidMouth::Tank tank;
+    static uint32_t lastFrameMs = 0;
+    static bool initialized = false;
+    static uint32_t lastReference = 0;
+    const uint32_t now = millis();
+    const uint32_t elapsed = now - lastFrameMs;
+    if (!initialized || elapsed >= 50u) {
+        const uint32_t reference = s_liquid_reference.load();
+        if (!initialized || elapsed > 1000u || reference != lastReference) tank = LiquidMouth::Tank{};
+        lastReference = reference;
+        initialized = true;
+        lastFrameMs = now;
+        const auto accel = mpu6050_acceleration();
+        const int32_t horizontal = RadioConfig::liquidTiltUseY ? accel.y : accel.x;
+        const int32_t x = horizontal * RadioConfig::liquidTiltSign;
+        const int16_t sine = int16_t(reference & 0xffffu), cosine = int16_t(reference >> 16);
+        const int16_t ax = LiquidMouth::Tank::clamp((x * cosine - int32_t(accel.z) * sine) / 16384, -32767, 32767);
+        const int16_t az = LiquidMouth::Tank::clamp((x * sine + int32_t(accel.z) * cosine) / 16384, -32767, 32767);
+        tank.step(ax, az, accel.valid, sound, accel.change);
+        tank.rasterize();
+    }
+    for (uint8_t x = 0; x < LiquidMouth::Tank::width; ++x)
+        for (uint8_t y = 0; y < LiquidMouth::Tank::rows; ++y)
+            if (tank.columns[x] & (1u << y)) mtrx.dot(x, y);
+
+    // A small dark bubble rises through the lit water while sound is present.
+    if (sound > 30) {
+        const uint8_t age = (tank.frame % 12u) / 3u;
+        uint8_t x, y;
+        if (LiquidMouth::Tank::absValue(tank.gravityY) >= LiquidMouth::Tank::absValue(tank.gravityX)) {
+            x = (tank.frame / 12u * 7u + 5u) % LiquidMouth::Tank::width;
+            y = tank.gravityY >= 0 ? 7u - age : age;
+        } else {
+            x = tank.gravityX >= 0 ? 23u - age : age;
+            y = (tank.frame / 12u * 3u + 2u) % 8u;
+        }
+        if (tank.columns[x] & (1u << y)) mtrx.dot(x, y, GFX_CLEAR);
+    }
+}
+
+// 0 wave; 1 inverted; 2 EQ; 3 mouth; 4 inverted mouth; 5 track; 6 liquid.
 static uint8_t mouth_anim_mode() {
     uint8_t m = radioState.mode;
-    if (m > 5) {
+    if (m >= RadioConfig::mouthModeCount) {
         m = 0;
         radioState.mode = 0;
     }
@@ -1183,6 +1293,9 @@ static uint8_t mouth_anim_mode() {
 
 static void draw_mouth_anim(uint8_t v_mouth, bool invert) {
     switch (mouth_anim_mode()) {
+        case RadioConfig::mouthLiquidMode:
+            draw_liquid_mouth(v_mouth);
+            break;
         case 1:
             analyz0(v_mouth, true);
             break;
@@ -1208,6 +1321,9 @@ static void draw_mouth_anim(uint8_t v_mouth, bool invert) {
 static void draw_mouth_anim_rest(bool invert) {
     constexpr uint8_t kRestVis = 42;
     switch (mouth_anim_mode()) {
+        case RadioConfig::mouthLiquidMode:
+            draw_liquid_mouth(0);
+            break;
         case 1:
             analyz0(kRestVis, true, false);
             break;
@@ -1238,6 +1354,12 @@ static void draw_ai_thinking_mouth(uint32_t elapsed, uint32_t started_ms) {
     static uint32_t cached_start_ms = 0;
     const uint8_t mode = mouth_anim_mode();
     const bool invert = mode == 1 || mode == 4;
+
+    if (mode == RadioConfig::mouthLiquidMode) {
+        mtrx.rect(0, 0, W - 1, 7, GFX_CLEAR);
+        draw_liquid_mouth(0);
+        return;
+    }
 
     if (cached_mode != mode || cached_start_ms != started_ms) {
         mtrx.rect(0, 0, W - 1, 7, mouth_gfx_off(invert));
@@ -1632,6 +1754,7 @@ void core0(void* p) {
     Tmr tts_mouth_tmr(RadioConfig::matrixVizTtsRefreshMs);
     Tmr eye_tmr(RadioConfig::matrixEyeRefreshMs);
     Tmr matrix_tmr(1000);
+    s_countdown_overlay_timer = &matrix_tmr;
     Tmr angry_tmr(RadioConfig::mpu6050AngryEyesMs);
     Tmr pong_tmr(145);
     matrix_tmr.timerMode(1);
@@ -1666,6 +1789,8 @@ void core0(void* p) {
     }
     nvsLoadCustomStations(s_custom_stations, RadioConfig::customStationMaxCount, s_custom_station_count);
     nvsLoadMatrixBrightnessTrim(s_matrix_brightness_trim, RadioConfig::matrixModuleCount);
+    s_liquid_reference.store(nvsLoadLiquidReference());
+    s_tilt_eyes_enabled = nvsLoadTiltEyes();
     s_wake_on_shake = nvsLoadWakeOnShake();
     s_face_calm_after_ms = uint32_t(nvsLoadCalmMinutes()) * 60000u;
     Serial.printf("[Motion] calm after %lu min (0=never)\n", (unsigned long)(s_face_calm_after_ms / 60000u));
@@ -1813,6 +1938,18 @@ void core0(void* p) {
         // Also consumes a shutdown decision from a manual gauge sample.
         battery_shutdown_guard_on_sample();
         matrix_tmr.tick();
+        {
+            uint32_t seconds = 0;
+            const bool visible = !matrix_tmr.state() && !pong_active() && !s_mode_pick_active &&
+                !wifiConnecting && !s_pending_change_state_after_wake && !bender_ai_busy() &&
+                bender_ai_face_state() == BenderFaceState::Idle &&
+                !(strcmp(g_audio_source, "bt") == 0 && bt_audio_needs_pairing_ui()) &&
+                Reminders::countdown(seconds);
+            const bool changed = visible != s_countdown_visible || seconds != s_countdown_seconds;
+            s_countdown_visible = visible;
+            s_countdown_seconds = seconds;
+            if (changed) matrix_flush();
+        }
         static bool charge_was_detected = false;
         const bool charge_detected = battery_is_charging();
         if (charge_detected && !charge_was_detected && !pong_active() && !s_mode_pick_active) {
@@ -1833,6 +1970,7 @@ void core0(void* p) {
         }
         if (s_mode_flash_req) {
             s_mode_flash_req = false;
+            s_countdown_visible = false;
             s_batt_matrix_overlay = false;
             draw_current_play_mode_mouth();
             matrix_flush();
@@ -1862,7 +2000,8 @@ void core0(void* p) {
         angry_tmr.tick();
         memory.tick();
 
-        if (mpu6050_poll_shake()) {
+        const bool shook = mpu6050_poll_shake();
+        if (shook && !pong_active()) {
             const bool awake = matrix_face_awake();
             if (bender_event_allows_motion_wake(BenderEvent::Shake, awake, s_wake_on_shake)) {
                 // Wake the idle face explicitly, independently of voice/event availability.
@@ -2109,6 +2248,8 @@ void core0(void* p) {
                             if (eb.pressing()) {
                                 draw_eyeb(0, 4, 3, 3);
                                 draw_eyeb(1, 1, 3, 3);
+                            } else if (draw_tilt_eyes()) {
+                                pulse = 0;
                             } else {
                                 static uint16_t pos;
                                 pos += 15;
@@ -2137,7 +2278,7 @@ void core0(void* p) {
                 if (ai_face_changed || eye_tmr) {
                     upd_bright();
                     // Радио выкл.: рот не визуализируется — после оверлея батареи (matrix_tmr) цифры иначе не снимаются.
-                    if (!matrix_tmr.state()) {
+                    if (!matrix_tmr.state() && radioState.mode != RadioConfig::mouthLiquidMode) {
                         mtrx.rect(0, 0, RadioConfig::analyzWidth - 1, 7, GFX_CLEAR);
                     }
                     if (battery_sad_eyes_wanted()) {
@@ -2149,14 +2290,15 @@ void core0(void* p) {
                 }
             }
 
-            // Режимы рта 0…5: хвиля / інв. / EQ / рот / рот інв. / прогрес трека (BT / AIR).
+            // Mouth modes include liquid, which responds to tilt even at rest.
             (void)mouth_anim_mode();
             if (s_mode_pick_active) {
                 upd_bright();
                 draw_mode_pick_mouth();
                 matrix_flush();
             } else if ((ai_face_changed || viz_tmr || (bender_ai_tts_playing() && tts_mouth_tmr)) && !matrix_tmr.state() &&
-                       radioState.mode <= 5 && matrix_face_awake()) {
+                       radioState.mode < RadioConfig::mouthModeCount &&
+                       (matrix_face_awake() || radioState.mode == RadioConfig::mouthLiquidMode)) {
                 const bool talk = bender_ai_tts_playing() || airplay_playing() ||
                                   (radioState.state && !bender_ai_busy());
                 const uint8_t anim_mode = mouth_anim_mode();
@@ -2186,7 +2328,7 @@ void core0(void* p) {
                 } else {
                     s_bender_live = false;
                     s_bender_quiet_ms = 0;
-                    if (v_mouth < 22) {
+                    if (v_mouth < 22 && anim_mode != RadioConfig::mouthLiquidMode) {
                         v_mouth = 22;
                     }
                     draw_mouth_anim(v_mouth, mouth_invert);
@@ -2361,7 +2503,8 @@ void core0(void* p) {
                             case 1: {
                                 const int8_t d = eb.dir();
                                 int m = (int)radioState.mode + (int)d;
-                                m = (m % 6 + 6) % 6;
+                                const int count = RadioConfig::mouthModeCount;
+                                m = (m % count + count) % count;
                                 radioState.mode = (uint8_t)m;
                                 break;
                             }
@@ -2476,7 +2619,7 @@ void core0(void* p) {
                 charging || (strcmp(g_audio_source, "bt") == 0 && bt_audio_needs_pairing_ui());
             if (stay_awake) {
                 s_wifi_last_activity_ms = millis();
-            } else if (s_face_calm_after_ms > 0 && RadioConfig::benderIdleDeepSleepMs > 0 &&
+            } else if (!Reminders::active() && s_face_calm_after_ms > 0 && RadioConfig::benderIdleDeepSleepMs > 0 &&
                        (uint32_t)(millis() - s_wifi_last_activity_ms) >=
                            RadioConfig::benderIdleDeepSleepMs) {
                 Serial.println(F("[Sleep] idle 30 min"));

@@ -17,10 +17,12 @@
 #include "RadioConfig.h"
 #include "core0.h"
 #include "pcm_analyzer.h"
+#include "EventReplyAudio.h"
 #include "Pcm16.h"
 #include "WakeRuntime.h"
 #include "WakeVoice.h"
 #include "PlaybackCompletion.h"
+#include "Reminders.h"
 #include "secrets.h"
 
 #ifndef BENDER_AI_LOG
@@ -248,10 +250,13 @@ static std::atomic<uint32_t> s_pending_event_ms{0};
 static std::atomic<uint8_t> s_preview_state{0};
 static std::atomic<uint32_t> s_preview_id{0};
 static uint32_t s_preview_queued_ms = 0;
+static std::atomic<uint32_t> s_preview_result_ms{0};
 static BenderCharacter::Settings s_preview_traits;
 static char s_preview_question[BenderCharacter::questionMaxBytes + 1] = {};
 static portMUX_TYPE s_preview_mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool s_event_reply = false;
+static std::atomic<bool> s_local_event_active{false};
+static uint32_t s_local_event_started = 0;
 static volatile bool s_drop_event_reply = false;
 static volatile bool s_need_mic_clear = false;
 static volatile bool s_need_commit = false;
@@ -285,6 +290,17 @@ static volatile bool s_resume_radio = false;
 static volatile bool s_giveback = false;
 static volatile bool s_need_speaker = false;
 static volatile bool s_started = false;
+static char s_last_error[48] = {};
+static uint32_t s_last_error_ms = 0;
+static portMUX_TYPE s_diagnostic_mux = portMUX_INITIALIZER_UNLOCKED;
+static std::atomic<uint32_t> s_reminder_inflight{0};
+static std::atomic<bool> s_reminder_delivered{false};
+static std::atomic<uint32_t> s_reminder_retry_after{0};
+static std::atomic<uint32_t> s_reminder_playback_ms{0};
+static bool reminderRetryReady() {
+    const uint32_t deadline = s_reminder_retry_after.load();
+    return deadline == 0 || int32_t(millis() - deadline) >= 0;
+}
 static volatile uint8_t s_demo = 0;
 static uint8_t* s_demo_pcm = nullptr;
 static size_t s_demo_cap = 0;
@@ -493,6 +509,17 @@ static void noteProgress() {
 static uint32_t s_sock_wait_ms;
 
 static void forceRecover(const char* why, bool show_error = false, bool keep_queued_preview = false) {
+    const bool localEvent = s_local_event_active.exchange(false);
+    s_reminder_playback_ms.store(0);
+    if (s_reminder_inflight.exchange(0)) s_reminder_retry_after.store(millis() + 5000u);
+    s_reminder_delivered.store(false);
+    if (show_error && why) {
+        portENTER_CRITICAL(&s_diagnostic_mux);
+        strncpy(s_last_error, why, sizeof(s_last_error) - 1);
+        s_last_error[sizeof(s_last_error) - 1] = 0;
+        s_last_error_ms = millis();
+        portEXIT_CRITICAL(&s_diagnostic_mux);
+    }
     if (s_wake_voice.load() != 0) {
         s_wake_voice.store(0);
         pttHeld = s_ptt_armed = false;
@@ -514,11 +541,12 @@ static void forceRecover(const char* why, bool show_error = false, bool keep_que
     if (background_event) {
         s_pending_event.store(0);
         s_event_reply = false;
-        s_drop_event_reply = true;
+        s_drop_event_reply = !localEvent; // Local clips have no late server response to discard.
     }
     ALOG("[AI] recover %s heap=%u\n", why ? why : "?", (unsigned)ESP.getFreeHeap());
     waitingACK = false;
     responsePending = false;
+    s_need_speaker = false;
     sessionArmed = false;
     respPlaybackPending = false;
     convState = ST_IDLE;
@@ -851,6 +879,22 @@ static void pttStartCapture() {
     ALOG("[PTT] REC queued=%u ms\n", (unsigned)preN * 10);
 }
 
+static void appendReminderSnapshot(JsonDocument& message) {
+    if (!providerIsLocal()) return;
+    message["reminder_clock_ready"] = Reminders::clockReady();
+    Reminders::Item planned[Reminders::capacity];
+    const size_t count = Reminders::list(planned, Reminders::capacity);
+    JsonArray entries = message["reminders"].to<JsonArray>();
+    for (size_t i = 0; i < count; ++i) {
+        JsonObject entry = entries.add<JsonObject>();
+        entry["text"] = planned[i].text;
+        entry["daily"] = planned[i].daily;
+        entry["today"] = planned[i].today;
+        entry["minute_of_day"] = planned[i].minuteOfDay;
+        entry["remaining_seconds"] = planned[i].remainingSeconds;
+    }
+}
+
 static void tryPttCommit() {
     if (convState != ST_RECORDING) {
         return;
@@ -875,6 +919,8 @@ static void tryPttCommit() {
         if (providerIsLocal()) {
             r["current_station"] = (int)radioState.station;
             r["wake_invocation"] = s_wake_invocation;
+            r["llm_model"] = BenderLlmModel::id(nvsLoadLlmModel());
+            appendReminderSnapshot(r);
         }
         wsSend(r);
         waitingACK = false;
@@ -1034,14 +1080,30 @@ static void onMessage(websockets::WebsocketsMessage m) {
     }
     if (!strcmp(t, "character.preview.result")) {
         if (s_preview_state.load() == 2 && j["request_id"].as<uint32_t>() == s_preview_id.load()) {
-            s_preview_state.store((j["ok"] | false) ? 3 : 5);
+            const bool ok = j["ok"] | false;
+            // The server sends this only after its last audio chunk. Finish the
+            // request here; a lost response.done must not leave us thinking.
+            s_event_reply = false;
+            speaking = false;
+            waitingACK = false;
+            responsePending = false;
+            respPlaybackPending = true; // Let the queued PCM play to the end.
+            convState = ST_IDLE;
+            s_preview_result_ms.store(millis());
+            noteProgress();
+            s_preview_state.store(ok ? 3 : 5);
+            ALOG("[Preview] result ok=%u queued=%u\n", unsigned(ok), unsigned(rbUsed()));
         }
+    } else if (!strcmp(t, "reminder.result")) {
+        s_reminder_delivered.store(j["ok"] | false);
+        if (!(j["ok"] | false)) s_reminder_retry_after.store(millis() + 30000u);
     } else if (strcmp(t, "session.created") == 0) {
         JsonDocument u;
         u["type"] = "session.update";
         JsonObject s = u["session"].to<JsonObject>();
         if (providerIsLocal()) {
             s["current_station"] = (int)radioState.station;
+            s["llm_model"] = BenderLlmModel::id(nvsLoadLlmModel());
             const auto character = nvsLoadCharacter();
             JsonObject traits = s["character"].to<JsonObject>();
             for (uint8_t i = 0; i < BenderCharacter::count; ++i)
@@ -1090,6 +1152,8 @@ static void onMessage(websockets::WebsocketsMessage m) {
             if (providerIsLocal()) {
                 r["current_station"] = (int)radioState.station;
                 r["wake_invocation"] = s_wake_invocation;
+                r["llm_model"] = BenderLlmModel::id(nvsLoadLlmModel());
+                appendReminderSnapshot(r);
             }
             wsSend(r);
         }
@@ -1103,6 +1167,12 @@ static void onMessage(websockets::WebsocketsMessage m) {
         speaking = false;
         noteProgress();
     } else if (!strcmp(t, "response.done")) {
+        const uint32_t reminderId = s_reminder_inflight.exchange(0);
+        if (reminderId && s_reminder_delivered.exchange(false)) {
+            Reminders::complete(reminderId);
+            s_reminder_retry_after.store(0);
+        }
+        if (reminderId) s_reminder_playback_ms.store(millis());
         if (providerIsLocal() && s_wake_invocation && (j["wake_rejected"] | false) &&
             s_wake_voice.load() == 3) {
             s_wake_prompt_pending.store(false);
@@ -1114,7 +1184,7 @@ static void onMessage(websockets::WebsocketsMessage m) {
             s_wake_prompt_pending.store(true);
             ALOGLN(F("[WakeVoice] name only — listen for follow-up silently"));
         }
-        s_event_reply = false;
+        s_event_reply = reminderId != 0;
         speaking = false;
         waitingACK = false;
         responsePending = false;
@@ -1143,6 +1213,28 @@ static void onMessage(websockets::WebsocketsMessage m) {
         if (providerIsLocal() && !strcmp(name, "conversation.end")) {
             s_dialogue_ending.store(true);
             ALOGLN(F("[WakeVoice] goodbye — finish playback, no follow-up"));
+            return;
+        }
+        if (providerIsLocal() && !strcmp(name, "reminder.add")) {
+            const int minutes = j["args"]["minutes"] | 0;
+            const int seconds = j["args"]["seconds"] | 0;
+            const char* reminder = j["args"]["text"] | "";
+            const uint32_t delaySeconds = seconds ? uint32_t(seconds) :
+                (minutes > 0 ? uint32_t(minutes) * 60u : 0u);
+            if (delaySeconds >= 5 && delaySeconds <= 86400u &&
+                Reminders::addSeconds(delaySeconds, reminder))
+                ALOG("[Reminder] scheduled in %u sec\n", unsigned(delaySeconds));
+            else ALOGLN(F("[Reminder] rejected (invalid or full)"));
+            return;
+        }
+        if (providerIsLocal() && !strcmp(name, "reminder.daily.add")) {
+            const int hour = j["args"]["hour"] | -1;
+            const int minute = j["args"]["minute"] | -1;
+            const char* reminder = j["args"]["text"] | "";
+            if (hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59 &&
+                Reminders::addDaily(uint8_t(hour), uint8_t(minute), reminder))
+                ALOG("[Reminder] daily %02d:%02d\n", hour, minute);
+            else ALOGLN(F("[Reminder] daily rejected (invalid, full or NVS error)"));
             return;
         }
         const int st = j["args"]["station"] | -1;
@@ -1353,6 +1445,18 @@ static void wsTask(void*) {
     uint32_t lastPing = millis();
     uint32_t backoff = 0;
     for (;;) {
+        if (s_local_event_active.load()) {
+            // No socket activity or wake-word input while a flash clip is playing.
+            WakeRuntime::listening(false);
+            if (wakeMic) {
+                micSleep();
+                wakeMic = false;
+                WakeRuntime::gap();
+                preN = preHead = 0;
+            }
+            vTaskDelay(10 / portTICK_PERIOD_MS);
+            continue;
+        }
         const uint8_t voice = s_wake_voice.load();
         if (voice == 1 || voice == 2) {
             const uint32_t limit = voice == 1 ? 10000u : s_wake_no_speech_ms+18000u;
@@ -1531,7 +1635,7 @@ static void wsTask(void*) {
                 if (!wakeMic || !s_mic_on) {
                     WakeRuntime::listening(false);
                     AirPlayAudioGuard guard;
-                    if (s_ai_awake || wantOnline || sampleActive()) continue;
+                    if (s_local_event_active.load() || s_ai_awake || wantOnline || sampleActive()) continue;
                     if (!initMic()) { WakeRuntime::micError(); continue; }
                     { MicGuard micGuard; i2sMic.setTimeout(100); }
                     wakeFilter = WakeSample::MicFilter{};
@@ -1539,7 +1643,7 @@ static void wsTask(void*) {
                     wakeWarmup = 0; wakeMic = true;
                 }
                 if (readMicChunk16(mic16, nullptr, false, &wakeFilter, true)) {
-                    if (s_ai_awake || wantOnline || sampleActive() || !WakeRuntime::enabled()) continue;
+                    if (s_local_event_active.load() || s_ai_awake || wantOnline || sampleActive() || !WakeRuntime::enabled()) continue;
                     if (wakeWarmup < WakeSample::rate * WakeSample::warmupMs / 1000) {
                         wakeWarmup += CHUNK;
                     } else {
@@ -1640,6 +1744,7 @@ static void wsTask(void*) {
                 JsonDocument preview;
                 preview["type"] = "character.preview";
                 preview["request_id"] = s_preview_id.load();
+                preview["llm_model"] = BenderLlmModel::id(nvsLoadLlmModel());
                 BenderCharacter::Settings traits;
                 char question[BenderCharacter::questionMaxBytes + 1];
                 portENTER_CRITICAL(&s_preview_mux);
@@ -1657,6 +1762,26 @@ static void wsTask(void*) {
                 stateSinceMs = millis();
                 noteProgress();
                 wsSend(preview);
+            }
+        }
+        if (providerIsLocal() && sessionReady && !bender_ai_busy() &&
+            s_preview_state.load() != 1 && !s_event_reply &&
+            airplay_allows_ai() && strcmp(g_audio_source, "wifi") == 0 && radioState.vol > 0 &&
+            !s_reminder_inflight.load() && reminderRetryReady()) {
+            Reminders::Item reminder;
+            if (Reminders::peekDue(reminder)) {
+                JsonDocument event;
+                event["type"] = "reminder.speak";
+                event["text"] = reminder.text;
+                s_reminder_inflight.store(reminder.id);
+                s_reminder_delivered.store(false);
+                s_event_reply = true;
+                responsePending = true;
+                convState = ST_WAIT_RESP;
+                stateSinceMs = millis();
+                noteProgress();
+                wsSend(event);
+                ALOG("[Reminder] speak id=%u\n", unsigned(reminder.id));
             }
         }
         const uint32_t pendingEvent = s_pending_event.load();
@@ -1854,6 +1979,7 @@ static bool initMic() {
 }
 
 bool bender_ai_busy() {
+    if (s_local_event_active.load()) return true;
     if (s_wake_voice.load() == 1) return true;
     return sampleActive() || s_demo || s_ptt_armed || s_taking || s_owns_spk || convState != ST_IDLE || speaking || waitingACK || responsePending ||
            (respPlaybackPending && rbUsed() > 0) || pttHeld || s_dbg_play;
@@ -1866,6 +1992,19 @@ bool bender_ai_favorite_station(int station) {
 }
 
 bool bender_ai_event_voice_enabled() { return s_event_voice_enabled.load(); }
+
+void bender_ai_diagnostic(BenderAiDiagnostic& out) {
+    out.socketConnected = wsReady;
+    out.sessionReady = sessionReady;
+    out.connecting = wantOnline && !sessionReady;
+    out.microphoneOn = s_mic_on.load();
+    out.conversationState = convState;
+    out.waitSeconds = convState == ST_WAIT_RESP && stateSinceMs ? uint32_t(millis() - stateSinceMs) / 1000u : 0;
+    portENTER_CRITICAL(&s_diagnostic_mux);
+    memcpy(out.lastError, s_last_error, sizeof(out.lastError));
+    out.lastErrorAgoSeconds = s_last_error_ms ? uint32_t(millis() - s_last_error_ms) / 1000u : 0;
+    portEXIT_CRITICAL(&s_diagnostic_mux);
+}
 
 const char* bender_ai_sample_start(const char* label, const char* split) {
     AirPlayAudioGuard guard;
@@ -1956,13 +2095,15 @@ const char* bender_ai_preview_character(const BenderCharacter::Settings& setting
     if (airplay_owns_speaker() || strcmp(g_audio_source, "wifi") != 0)
         return "Заверши AirPlay или Bluetooth и переключи Бендера в режим FM.";
     const uint8_t state = s_preview_state.load();
-    if ((state >= 1 && state <= 3) || bender_ai_busy() || s_drop_event_reply)
+    if ((state >= 1 && state <= 3) || s_wake_voice.load() != 0 ||
+        bender_ai_busy() || s_drop_event_reply)
         return "Бендер сейчас занят. Попробуй после ответа.";
     s_pending_event.store(0);
     portENTER_CRITICAL(&s_preview_mux);
     s_preview_traits = settings;
     strcpy(s_preview_question, question); // Length checked before copying into the queue.
     s_preview_queued_ms = millis();
+    s_preview_result_ms.store(0);
     portEXIT_CRITICAL(&s_preview_mux);
     s_preview_id.fetch_add(1);
     s_ai_last_live_ms = millis();
@@ -1978,6 +2119,46 @@ uint8_t bender_ai_preview_status() {
 
 bool bender_ai_event(BenderEvent event, int station) {
     AirPlayAudioGuard guard;
+    if (bender_event_has_local_voice(event)) {
+        // Local physical reactions never open a socket, even when Wi-Fi is absent.
+        if (!s_started || !ring || !s_event_voice_enabled.load() || bender_ai_busy() ||
+            s_ai_awake || wantOnline || wsReady || s_giveback || s_need_speaker ||
+            s_preview_state.load() == 1 || s_wake_voice.load() || radioState.state ||
+            radioState.vol <= 0 || strcmp(g_audio_source, "wifi") != 0 ||
+            !airplay_allows_ai() || airplay_owns_speaker()) return false;
+        static uint8_t lastCharging = 255, lastShake = 255;
+        const bool charging = event == BenderEvent::Charging;
+        uint8_t& previous = charging ? lastCharging : lastShake;
+        const uint8_t count = charging ? EventReplyAudio::chargingCount : EventReplyAudio::shakeCount;
+        uint8_t choice = esp_random() % count;
+        if (choice == previous) choice = (choice + 1) % count;
+        const auto& clip = EventReplyAudio::clips[(charging ? 0 : EventReplyAudio::chargingCount) + choice];
+        if (!clip.bytes || clip.bytes >= RING_BYTES || clip.bytes % 2) return false;
+        s_local_event_started = millis();
+        s_local_event_active.store(true);
+        s_event_reply = true;
+        s_drop_event_reply = false;
+        s_face_error_ms.store(0);
+        // Prevent the other core's drain check from releasing I2S before enqueue.
+        responsePending = speaking = true;
+        if (!takeSpeaker()) {
+            responsePending = speaking = false;
+            s_event_reply = false;
+            s_local_event_active.store(false);
+            return false;
+        }
+        portENTER_CRITICAL(&mux);
+        head = tail = 0;
+        portEXIT_CRITICAL(&mux);
+        waitingACK = false;
+        convState = ST_IDLE;
+        pushPcmBytes(clip.data, clip.bytes);
+        respPlaybackPending = true;
+        responsePending = false;
+        previous = choice;
+        ALOG("[LifeAudio] local %s clip=%u bytes=%u\n", bender_event_name(event), unsigned(choice), unsigned(clip.bytes));
+        return true;
+    }
     if (!providerIsLocal() || !s_started || !s_event_voice_enabled.load() || s_preview_state.load() == 1 ||
         bender_ai_busy() || !airplay_allows_ai() || airplay_owns_speaker() ||
         s_ptt_armed || WiFi.status() != WL_CONNECTED ||
@@ -2203,6 +2384,56 @@ static BenderPlayback::State playbackState() {
 }
 
 void bender_ai_tick() {
+    if (s_local_event_active.load() && uint32_t(millis() - s_local_event_started) > 12000u)
+        forceRecover("local event playback timeout");
+    if (providerIsLocal() && s_started && Reminders::hasDue() &&
+        WiFi.status() == WL_CONNECTED && !bender_ai_busy() &&
+        airplay_allows_ai() && strcmp(g_audio_source, "wifi") == 0 && radioState.vol > 0 &&
+        s_preview_state.load() != 1 && !s_event_reply && !s_reminder_inflight.load() &&
+        reminderRetryReady()) {
+        s_ai_awake = wantOnline = true;
+        s_ai_last_live_ms = millis();
+    }
+    const uint32_t previewResultMs = s_preview_result_ms.load();
+    const uint32_t reminderPlaybackMs = s_reminder_playback_ms.load();
+    if (reminderPlaybackMs && convState == ST_IDLE && !pttHeld && !s_ptt_armed) {
+        const auto audio = playbackState();
+        const bool drained = !audio.taking && !audio.inFlight && audio.queuedBytes == 0 &&
+            (!audio.lastInputMs || uint32_t(audio.now - audio.lastInputMs) >= 800u) &&
+            (!audio.lastOutputMs || uint32_t(audio.now - audio.lastOutputMs) >= 350u);
+        if (drained) {
+            waitingACK = responsePending = speaking = respPlaybackPending = false;
+            s_need_speaker = false;
+            s_event_reply = false;
+            s_reminder_playback_ms.store(0);
+            if (audio.ownsSpeaker) requestGiveback();
+            ALOGLN(F("[Reminder] playback finished"));
+        } else if (uint32_t(audio.now - reminderPlaybackMs) > 20000u) {
+            ALOG("[Reminder] playback timeout queued=%u in_flight=%u\n",
+                 unsigned(audio.queuedBytes), unsigned(audio.inFlight));
+            forceRecover("reminder playback timeout");
+        }
+    }
+    if (s_preview_state.load() == 3 && previewResultMs && convState == ST_IDLE &&
+        !pttHeld && !s_ptt_armed) {
+        const auto audio = playbackState();
+        const bool drained = !audio.taking && !audio.inFlight && audio.queuedBytes == 0 &&
+            (!audio.lastInputMs || uint32_t(audio.now - audio.lastInputMs) >= 800u) &&
+            (!audio.lastOutputMs || uint32_t(audio.now - audio.lastOutputMs) >= 350u);
+        if (drained) {
+            // A successful preview result is the final server event. Stale
+            // speaker/response flags must not turn its completed audio into a
+            // thinking face followed by a false playback error.
+            waitingACK = responsePending = speaking = respPlaybackPending = false;
+            s_need_speaker = false;
+            if (audio.ownsSpeaker) requestGiveback();
+        } else if (uint32_t(audio.now - previewResultMs) > 20000u) {
+            ALOG("[Preview] playback timeout queued=%u in_flight=%u owns=%u need=%u giveback=%u\n",
+                 unsigned(audio.queuedBytes), unsigned(audio.inFlight),
+                 unsigned(audio.ownsSpeaker), unsigned(s_need_speaker), unsigned(s_giveback));
+            forceRecover("preview playback timeout", true);
+        }
+    }
     // Independent of priming: never leave I2S owned forever after the final
     // buffer drained while response.done / the input freshness timer was pending.
     const bool keepForFollowup = s_wake_voice.load() == 3 && (s_wake_prompt_pending.load() || WakeRuntime::followupEnabled()) &&
@@ -2230,6 +2461,11 @@ void bender_ai_tick() {
         speaking = false;
         const bool had_cmd = applyVoiceCmdState();
         releaseSpeakerFromLoop();
+        if (s_local_event_active.exchange(false)) {
+            s_event_reply = false;
+            s_drop_event_reply = false;
+            ALOGLN(F("[LifeAudio] finished — speaker released"));
+        }
         if (had_cmd) {
             radio_voice_after_speaker();
         }

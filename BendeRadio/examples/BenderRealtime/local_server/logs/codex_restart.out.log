@@ -1,0 +1,42 @@
+
+Stopping old Bender on port 8765 if any...
+
+Bender voice server + RVC
+Funnel: https://desktop-ov51efm.tail2312b4.ts.net
+Python: C:\Users\Admin\AppData\Local\Python\pythoncore-3.14-64\python.exe
+Wait for: RVC OK   and   listen ... auth=basic
+Keep this window open.
+
+loading models (первый раз Ч скачивание, жди)Е
+CUDA DLL PATH: C:\Users\Admin\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\nvidia\cublas\bin; C:\Users\Admin\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\nvidia\cuda_nvrtc\bin; C:\Users\Admin\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\nvidia\cuda_runtime\bin; C:\Users\Admin\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\nvidia\cudnn\bin
+Whisper large-v3-turbo device=cuda
+Whisper CUDA probe (нужен cublas64_12.dll)Е
+Whisper OK (cuda, large-v3-turbo)
+Piper OK (uk_UA mykyta, model=ukrainian_tts-medium, length=0.9)
+stress_words.json 46 words
+UK stress OK (stanza POS)
+Piper OK (en_US ryan)
+HolosTTS OK (CPU, Speaker_84, speed=1.14, delivery=standard)
+RVC OK: pth=bender.pth
+RVC warmup (модель у VRAM, один раз)Е
+RVC worker ready
+BENDER_LEVEL=10/10 (config.json або BENDER_LEVEL)
+LLM=openai gpt-6-luna (Chat Completions API)
+OpenAI: ключ Ї.
+RVC ok
+TTS 35520 samples peak=17197 pauses=0 q=0
+TTS trim silence 0..35520 / 35520 samples
+[Latency] voice chars=16 prepare=36ms tts=182ms rvc=274ms total=493ms
+RVC ok
+TTS 47040 samples peak=16059 pauses=0 q=1
+TTS trim silence 0..47040 / 47040 samples
+[Latency] voice chars=21 prepare=42ms tts=214ms rvc=392ms total=650ms
+RVC ok
+TTS 34560 samples peak=14918 pauses=0 q=0
+TTS trim silence 0..34560 / 34560 samples
+[Latency] voice chars=15 prepare=28ms tts=166ms rvc=173ms total=368ms
+Wake acknowledgements ready: 3/3
+listen ws://0.0.0.0:8765/v1/realtime auth=basic user=bender
+IPv4 этого ѕ : 26.144.255.74, 100.104.180.31, 192.168.0.173
+¬ secrets.h Ч LAN IPv4 (192.168.x.x), не 127.0.0.1 и не Radmin 26.x
+≈сли ESP пишет connect failed ~3с Ч запусти open_firewall.bat от администратора

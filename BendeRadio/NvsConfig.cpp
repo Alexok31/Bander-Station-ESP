@@ -7,6 +7,38 @@
 
 static constexpr char kNs[] = "bende";
 
+bool nvsLoadTiltEyes() {
+    Preferences p;
+    if (!p.begin(kNs, true)) return true;
+    const bool enabled = p.getBool("tilt_eyes", true);
+    p.end();
+    return enabled;
+}
+
+bool nvsSaveTiltEyes(bool enabled) {
+    Preferences p;
+    if (!p.begin(kNs, false)) return false;
+    const bool ok = p.putBool("tilt_eyes", enabled) == sizeof(bool);
+    p.end();
+    return ok;
+}
+
+uint32_t nvsLoadLiquidReference() {
+    Preferences p;
+    if (!p.begin(kNs, true)) return 0x40000000u;
+    const uint32_t value = p.getUInt("liquid_ref", 0x40000000u);
+    p.end();
+    return value;
+}
+
+bool nvsSaveLiquidReference(uint32_t value) {
+    Preferences p;
+    if (!p.begin(kNs, false)) return false;
+    const bool ok = p.putUInt("liquid_ref", value) == sizeof(uint32_t);
+    p.end();
+    return ok;
+}
+
 bool nvsLoadWakeVoiceEnabled() {
     Preferences p;
     if (!p.begin(kNs, true)) return false;
@@ -350,6 +382,24 @@ bool nvsSaveCharacter(const BenderCharacter::Settings& settings) {
     Preferences p;
     if (!p.begin(kNs, false)) return false;
     const bool ok = p.putBytes("character_v2", settings.values, sizeof(settings.values)) == sizeof(settings.values);
+    p.end();
+    return ok;
+}
+
+uint8_t nvsLoadLlmModel() {
+    Preferences p;
+    if (!p.begin(kNs, true)) return BenderLlmModel::Auto;
+    const uint8_t model = p.getUChar("llm_model", BenderLlmModel::Auto);
+    p.end();
+    return model <= BenderLlmModel::Luna ? model : BenderLlmModel::Auto;
+}
+
+bool nvsSaveLlmModel(uint8_t model) {
+    if (model > BenderLlmModel::Luna) return false;
+    Preferences p;
+    if (!p.begin(kNs, false)) return false;
+    const bool ok = p.getUChar("llm_model", BenderLlmModel::Auto) == model ||
+                    p.putUChar("llm_model", model) == 1;
     p.end();
     return ok;
 }

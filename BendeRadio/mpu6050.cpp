@@ -14,6 +14,8 @@ static int16_t s_prev_ax = 0;
 static int16_t s_prev_ay = 0;
 static int16_t s_prev_az = 0;
 static bool s_have_prev = false;
+static uint32_t s_last_change = 0;
+static uint32_t s_last_sample_ms = 0;
 static BenderMotion s_motion;
 static BenderEvent s_motion_event = BenderEvent::None;
 
@@ -51,6 +53,8 @@ void mpu6050_init() {
     s_motion_event = BenderEvent::None;
     s_ok = false;
     s_have_prev = false;
+    s_last_change = 0;
+    s_last_sample_ms = 0;
     s_last_poll_ms = 0;
     s_shake = BenderShake{};
     s_shake_threshold = nvsLoadShakeThreshold();
@@ -92,6 +96,11 @@ bool mpu6050_ok() {
     return s_ok;
 }
 
+MpuAcceleration mpu6050_acceleration() {
+    const bool fresh = s_ok && s_have_prev && uint32_t(millis() - s_last_sample_ms) < 250u;
+    return {s_prev_ax, s_prev_ay, s_prev_az, s_last_change, fresh};
+}
+
 bool mpu6050_poll_shake() {
     if (!RadioConfig::mpu6050Enable || !s_ok) {
         return false;
@@ -109,6 +118,7 @@ bool mpu6050_poll_shake() {
     const int16_t ax = (int16_t)((raw[0] << 8) | raw[1]);
     const int16_t ay = (int16_t)((raw[2] << 8) | raw[3]);
     const int16_t az = (int16_t)((raw[4] << 8) | raw[5]);
+    s_last_sample_ms = now;
 
     if (!s_have_prev) {
         s_prev_ax = ax;
@@ -127,6 +137,7 @@ bool mpu6050_poll_shake() {
 
     const uint32_t sum =
         (uint32_t)((dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy) + (dz < 0 ? -dz : dz));
+    s_last_change = sum;
     const auto motion = s_motion.sample(sum, now);
     if (motion != BenderEvent::None) s_motion_event = motion;
     if (!s_shake.sample(sum, now, s_shake_threshold, RadioConfig::mpu6050ShakeCooldownMs)) {

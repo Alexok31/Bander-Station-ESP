@@ -16,6 +16,17 @@ void bender_ai_wake();
 void bender_ai_sleep();
 bool bender_ai_awake();
 uint8_t bender_ai_wake_voice_state(); // 0 idle, 1 connecting, 2 question, 3 answer
+struct BenderAiDiagnostic {
+    bool socketConnected;
+    bool sessionReady;
+    bool connecting;
+    bool microphoneOn;
+    uint8_t conversationState;
+    uint32_t waitSeconds;
+    uint32_t lastErrorAgoSeconds;
+    char lastError[48];
+};
+void bender_ai_diagnostic(BenderAiDiagnostic& out);
 
 bool bender_ai_busy();
 bool bender_ai_recording();
@@ -24,7 +35,8 @@ bool bender_ai_tts_playing();
 BenderFaceState bender_ai_face_state();
 bool bender_ai_favorite_station(int station);
 bool bender_ai_event_voice_enabled();
-// Best effort: stale/busy/offline events are dropped, never queued for later.
+// Shake/charging play flash clips offline; other events use the server.
+// Busy events are dropped, never queued for later.
 bool bender_ai_event(BenderEvent event, int station);
 // Preview never persists traits. Status: 0 idle, 1 connecting, 2 generating,
 // 3 draining playback, 4 done, 5 failed/cancelled. Called from WebUI/core0.

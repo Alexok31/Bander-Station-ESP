@@ -13,7 +13,7 @@ struct Data {
     int8_t bright_mouth = RadioConfig::matrixBrightnessDefaultBase;
     // Порог «тишины» для PCM-метра (после смены с АЦП сделайте 3 клика на тихой паузе).
     uint16_t trsh = 24;
-    // 0 волна; 1 волна інверсія; 2 EQ; 3 рот; 4 рот інверсія; 5 прогресс трека (низ рта, BT AVRCP). Інше → 0.
+    // 0 волна; 1 инверсия; 2 EQ; 3 рот; 4 рот инверсия; 5 прогресс трека; 6 жидкость.
     uint8_t mode = 0;
     int8_t station = 0;
 };
@@ -29,6 +29,7 @@ void change_state();
 void audio_hw_init(bool log_serial = false);
 void apply_output_volume();
 void matrix_show_volume(int8_t vol);
+bool matrix_face_is_awake();
 void amp_force_mute();
 // ESP32-S3: UART0 по умолчанию на 43/44, у нас BCLK=44 — без этого при USB динамик молчит.
 void free_uart0_from_i2s_pins();
@@ -45,6 +46,7 @@ bool wifi_sta_connect(const String& ssid, const String& pass, uint32_t timeout_m
 void matrix_get_brightness_trim(int8_t* outTrim, uint8_t count);
 void matrix_set_brightness_trim(const int8_t* trim, uint8_t count, bool persist);
 uint8_t matrix_get_base_brightness();
+const char* liquid_calibrate(bool reset);
 
 uint8_t radio_station_count();
 const char* radio_station_name(uint8_t idx);

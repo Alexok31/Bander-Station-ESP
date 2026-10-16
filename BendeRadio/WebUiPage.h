@@ -19,6 +19,7 @@ details{border:1px solid var(--line);border-radius:16px;background:var(--panel);
 @media(max-width:1000px){.eq-channel .trait-full{display:none}.eq-channel .trait-short{display:inline}.shell{grid-template-columns:190px 1fr}.sidebar{padding:28px 15px}main{padding:28px}.grid{grid-template-columns:1fr}.radio-aside{display:grid;grid-template-columns:1fr 1fr;gap:22px}.aside-note{padding:12px 0}.topline{margin-bottom:30px}}
 @media(max-width:700px){.shell{display:block}.sidebar{height:auto;position:static;padding:20px 18px 0;border:0}.brand-icon{width:32px;height:37px}.brand strong{font-size:18px}.brand small{font-size:9px}.sidebar-foot{display:none}.nav{display:flex;gap:6px;margin-top:22px;border-bottom:1px solid var(--line);padding-bottom:13px}.nav a{flex:1;padding:11px 8px;justify-content:center;gap:8px;font-size:12px;min-height:44px}.nav svg{width:17px;height:17px}.nav .soon{display:none}main{padding:22px 18px 35px}.topline{margin-bottom:26px;font-size:9px;gap:9px}.connection{font-size:10px;max-width:67%;padding:6px 9px}.page-title{margin-bottom:25px}h1{font-size:34px}.intro{font-size:13px}.card{padding:21px;border-radius:17px}.station-hero{min-height:183px;padding:23px}.station-hero h2{font-size:25px}.radio-aside{display:block}.aside-note{padding:25px 2px 0}.actions{align-items:stretch;flex-direction:column;gap:12px}.actions .btn{width:100%}.actions p{max-width:none}.field-grid{grid-template-columns:1fr;gap:20px}summary{padding:19px 18px;gap:12px}.details-body{padding:0 18px 21px}summary h2{font-size:17px}summary .sub{font-size:11px}.head-row{gap:8px}.mx{padding:12px 4px;min-width:0}.mx-buttons{gap:4px;flex-direction:column}.mx-buttons button{min-width:32px;min-height:40px}.eq-wrap{padding:23px 17px}.eq-title{display:block}.eq-title .tag{display:inline-block;margin-bottom:17px}.eq-board{gap:2px;margin:18px 0 10px;padding:14px 0}.eq-channel label{font-size:10px}.eq-channel input[type=range]{height:108px;width:100%;max-width:36px}.eq-channel output{font-size:17px}.eq-help{grid-template-columns:1fr}.preset{font-size:12px;padding:10px 12px}.character-foot{align-items:flex-start;flex-direction:column;gap:2px}.footer{font-size:10px}.section-head{gap:10px}.section-head h2{font-size:18px}}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
+.live-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.live-item{padding:16px;border:1px solid var(--line);border-radius:13px;background:var(--field)}.live-item span{display:block;color:var(--muted);font-size:12px}.live-item strong{display:block;margin-top:4px;font-weight:600;overflow-wrap:anywhere}.reminder-row{display:flex;align-items:center;justify-content:space-between;gap:15px;padding:14px 0;border-top:1px solid var(--line)}.reminder-row strong{display:block;overflow-wrap:anywhere}.reminder-row small{display:block;color:var(--muted);margin-top:4px}.reminder-row button{flex-shrink:0}@media(max-width:700px){.nav{overflow-x:auto;gap:3px}.nav a{flex:0 0 auto;font-size:11px;padding:11px 8px}.live-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -29,6 +30,8 @@ details{border:1px solid var(--line);border-radius:16px;background:var(--panel);
 <a href="#radio" data-nav="radio" aria-current="page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="8" width="18" height="13" rx="3"/><path d="M6 8l12-5M6 12h12m-2 5h2"/><circle cx="8" cy="17" r="2"/></svg>FM / Радио</a>
 <a href="#settings" data-nav="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 3v18M12 3v18M19 3v18"/><path d="M2 8h6m1 8h6m1-10h6" stroke-width="4"/></svg>Настройки</a>
 <a href="#character" data-nav="character"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="6" width="18" height="15" rx="5"/><path d="M12 2v4M7 11h3m4 0h3m-9 5h8"/></svg>Характер</a>
+<a href="#reminders" data-nav="reminders">⏱ Напоминания</a>
+<a href="#status" data-nav="status">● Состояние</a>
 </nav>
 <div class="sidebar-foot"><span class="status-dot"></span>Твой робот. Твои правила.<b>Bender Station</b>Локальная панель управления</div>
 </aside>
@@ -57,7 +60,7 @@ details{border:1px solid var(--line);border-radius:16px;background:var(--panel);
 </div>
 </section>
 <section id="panel-settings" data-panel="settings" aria-labelledby="settings-title" hidden>
-<div class="page-title"><p class="eyebrow">02 / Всё под контролем</p><h1 id="settings-title">Как тебе удобно.</h1><p class="intro">Пробуждение, свет и подключения. У каждой группы — своё сохранение.</p></div>
+<div class="page-title"><p class="eyebrow">02 / Всё под контролем</p><h1 id="settings-title">Как тебе удобно.</h1><p class="intro">Пробуждение, свет, подключения и модель Бендера. У каждой группы — своё сохранение.</p></div>
 <details open><summary><span class="group-number">01</span><div><h2>Поведение и покой</h2><div class="sub">Тряска, пробуждение и время до сна</div></div><span class="chevron" aria-hidden="true">⌄</span></summary>
 <form class="details-body" method="post" action="/save" data-save-form><input type="hidden" name="section" value="behavior"><input type="hidden" name="motion_settings" value="1">
 <div class="switch-row"><div class="switch-copy"><label for="wake_on_shake">Будить тряской</label><p class="hint">Встряхни — и Бендер откроет глаза.</p></div><input class="switch" id="wake_on_shake" name="wake_on_shake" type="checkbox" value="1" {{WAKE_CHECKED}}></div>
@@ -67,8 +70,13 @@ details{border:1px solid var(--line);border-radius:16px;background:var(--panel);
 <details><summary><span class="group-number">02</span><div><h2>Глаза и рот</h2><div class="sub">Яркость каждого модуля</div></div><span class="chevron" aria-hidden="true">⌄</span></summary>
 <form class="details-body" method="post" action="/save" data-save-form id="display-form"><input type="hidden" name="section" value="display"><p class="hint">Подстрой модули кнопками −/+. Яркость меняется сразу; «Сохранить» оставит её после перезапуска.</p>
 {{MATRIX_CONTROLS}}
+<input type="hidden" name="eye_motion_settings" value="1">
+<div class="switch-row"><div class="switch-copy"><label for="tilt_eyes">Глаза реагируют на наклон</label><p class="hint">Взгляд следует за наклоном, при сильном наклоне Бендер прищуривается. Во время разговора и игр остаётся обычная мимика.</p></div><input class="switch" id="tilt_eyes" name="tilt_eyes" type="checkbox" value="1" {{TILT_EYES_CHECKED}}></div>
 <button class="btn secondary small" type="button" id="start-calib">Начать с минимальной яркости</button><p class="calib-status" id="calib-status" role="status" aria-live="polite"></p>
-<div class="actions"><p>Сохранение перезапустит колонку.</p><button class="btn" type="submit">Сохранить яркость</button></div></form></details>
+<div class="actions"><p>Сохранение перезапустит колонку.</p><button class="btn" type="submit">Сохранить настройки</button></div></form>
+<div class="details-body"><h3>Центр волны и взгляда</h3><p class="hint">Поставь колонку неподвижно в привычном положении и нажми кнопку. Этот наклон станет центром для воды и взгляда и сохранится после выключения.</p>
+<div class="actions"><button class="btn" id="liquid-tare" type="button">Это положение — центр</button><button class="btn secondary" id="liquid-reset" type="button">Сбросить калибровку</button></div>
+<p class="calib-status" id="liquid-status" role="status" aria-live="polite">Сохранение автоматическое, перезагрузка не нужна.</p></div></details>
 <details><summary><span class="group-number">03</span><div><h2>Wi-Fi и подключение</h2><div class="sub">Домашняя сеть и точка доступа Бендера</div></div><span class="chevron" aria-hidden="true">⌄</span></summary>
 <form class="details-body" method="post" action="/save" data-save-form><input type="hidden" name="section" value="wifi"><div class="field-grid"><div class="field"><label for="sta_ssid">Домашняя сеть</label><input id="sta_ssid" name="sta_ssid" maxlength="32" value="{{SSID}}" autocomplete="off" required></div><div class="field"><label for="sta_pass">Новый пароль сети</label><input id="sta_pass" name="sta_pass" type="password" maxlength="64" placeholder="Оставь пустым, чтобы сохранить" autocomplete="new-password"></div></div><p class="hint">Поддерживается Wi-Fi 2,4 ГГц. Для раздачи с iPhone включи «Максимальную совместимость».</p><hr class="rule"><div class="field-grid"><div class="field"><label for="ap_ssid">Точка доступа Бендера</label><input id="ap_ssid" name="ap_ssid" maxlength="32" value="{{AP_SSID}}" autocomplete="off"></div><div class="field"><label for="ap_pass">Новый пароль точки доступа</label><input id="ap_pass" name="ap_pass" type="password" minlength="8" maxlength="64" placeholder="Не менее 8 символов" autocomplete="new-password"></div></div><p class="hint">Пустые поля паролей сохраняют текущие пароли.</p><div class="actions"><p>После перезапуска может понадобиться подключиться к новой сети.</p><button class="btn" type="submit">Сохранить Wi-Fi</button></div></form></details>
 <details><summary><span class="group-number">04</span><div><h2>AI и голос</h2><div class="sub">Адрес сервера Бендера</div></div><span class="chevron" aria-hidden="true">⌄</span></summary>
@@ -91,6 +99,18 @@ details{border:1px solid var(--line);border-radius:16px;background:var(--panel);
 <div class="preset-grid"><button class="btn secondary" id="wake-sample-export" type="button" disabled>Собрать ZIP всего набора</button><a class="btn" id="wake-sample-archive" hidden>Скачать ZIP</a><button class="btn secondary small" id="wake-sample-clear-pool" type="button" disabled>Очистить пул</button></div>
 <div id="wake-sample-list" style="display:grid;gap:10px;margin-top:14px"></div>
 <p class="hint">Запись примеров не меняет установленную модель автоматически. Обучение выполняется отдельно на ПК.</p></div></details>
+<details id="model-settings"><summary><span class="group-number">06</span><div><h2>Модель Бендера</h2><div class="sub">Выбор для обычных разговоров и пробной реплики</div></div><span class="chevron" aria-hidden="true">⌄</span></summary>
+<div class="details-body">
+<div class="field"><label for="debug-model">Модель для диалога</label><select id="debug-model">
+<option value="auto">Как в config.json</option><option value="grok-4.3">Grok 4.3</option><option value="claude-sonnet-5-5">Claude Sonnet 5.5</option><option value="claude-haiku-5-5">Claude Haiku 5.5</option><option value="gpt-6-luna">GPT-6 Luna</option>
+</select><p class="hint">Выбор сохраняется в памяти колонки и действует после перезагрузки. Для каждой модели на ПК нужен ключ её сервиса.</p></div>
+<div class="actions"><p id="debug-model-status" role="status">Текущая модель загружена.</p><button class="btn" id="save-model" type="button">Сохранить модель</button></div>
+<hr class="rule"><h3>Пробная реплика</h3>
+<p class="hint">Те же ситуации, что в разделе «Характер». Ползунки можно <a href="#character">подстроить там</a>; сохранять характер ради пробы не нужно.</p>
+<div class="field"><label for="debug-scenario">Ситуация</label><select id="debug-scenario"></select></div>
+<div class="field"><label for="debug-question">Что сказать Бендеру?</label><textarea id="debug-question" rows="3" maxlength="200">Бендере, як проведемо цей вечір?</textarea></div>
+<div class="actions"><p id="debug-preview-status" role="status">Выбери модель и послушай ответ.</p><button class="btn" id="debug-preview" type="button">Послушать ответ</button></div>
+</div></details>
 <p class="settings-note">Сохраняется только выбранная группа. Изменения в других открытых группах останутся несохранёнными.</p>
 </section>
 <section id="panel-character" data-panel="character" aria-labelledby="character-title" hidden>
@@ -140,6 +160,14 @@ details{border:1px solid var(--line);border-radius:16px;background:var(--panel);
 <div class="actions"><p>После сохранения Бендер перезапустится и заговорит с новым характером.</p><button class="btn" type="submit">Сохранить характер</button></div>
 <p class="hint">Для разговоров через локальный AI сервер. Голос и готовые реплики на зарядку и тряску остаются прежними.</p>
 </form>
+</section>
+<section id="panel-reminders" data-panel="reminders" aria-labelledby="reminders-title" hidden>
+<div class="page-title"><p class="eyebrow">04 / Не забыть</p><h1 id="reminders-title">Мой планер.</h1><p class="intro">«Бендер, напоминай каждый день в 09:00 принять лекарство» или «Какие у меня планы на сегодня?»</p></div>
+<div class="stack"><form class="card" id="reminder-form"><div class="section-head"><h2>Через время</h2><span class="tag">До 24 записей вместе</span></div><div class="field-grid"><div class="field"><label for="reminder-minutes">Через сколько минут</label><input id="reminder-minutes" name="minutes" type="number" min="1" max="1440" value="20" required></div><div class="field"><label for="reminder-text">О чём напомнить</label><input id="reminder-text" name="text" maxlength="160" placeholder="Снять чайник" required></div></div><div class="actions"><p id="reminder-message" role="status">Бендер произнесёт текст через локальный сервер озвучки.</p><button class="btn" type="submit">Добавить</button></div></form><form class="card" id="daily-form"><div class="section-head"><h2>Каждый день</h2><span class="tag">Время Киева</span></div><div class="field-grid"><div class="field"><label for="daily-time">Во сколько</label><input id="daily-time" name="time" type="time" value="09:00" required></div><div class="field"><label for="daily-text">О чём напомнить</label><input id="daily-text" name="text" maxlength="160" placeholder="Принять лекарство" required></div></div><div class="actions"><p>Ежедневные записи сохраняются после перезагрузки. Для точного времени нужен Wi-Fi.</p><button class="btn" type="submit">Добавить ежедневное</button></div></form><div class="card"><div class="section-head"><h2>Запланировано</h2><span class="section-count" id="reminder-count">0 / 24</span></div><p class="hint" id="reminder-clock"></p><div id="reminder-list" aria-live="polite"></div><p class="hint">Планы не дают колонке автоматически выключиться и расходуют батарею. Разовые таймеры сбрасываются после выключения, ежедневные сохраняются. Если динамик или сервер заняты, Бендер напомнит позже.</p></div></div>
+</section>
+<section id="panel-status" data-panel="status" aria-labelledby="status-title" hidden>
+<div class="page-title"><p class="eyebrow">05 / Прямо сейчас</p><h1 id="status-title">Как дела у Бендера.</h1><p class="intro">Состояние сети, звука и голосового вызова обновляется автоматически.</p></div>
+<div class="stack"><div class="card"><div class="section-head"><h2>Текущее состояние</h2><span class="tag" id="live-refresh">Загрузка…</span></div><div class="live-grid"><div class="live-item"><span>Режим и музыка</span><strong id="live-music">—</strong></div><div class="live-item"><span>Wi-Fi</span><strong id="live-wifi">—</strong></div><div class="live-item"><span>Батарея</span><strong id="live-battery">—</strong></div><div class="live-item"><span>AI сервер</span><strong id="live-server">—</strong></div><div class="live-item"><span>Голосовой вызов</span><strong id="live-wake">—</strong></div><div class="live-item"><span>Лицо и ожидание</span><strong id="live-face">—</strong></div></div></div><div class="card"><h2>Почему он может молчать</h2><p id="live-explanation">Проверяю…</p><hr class="rule"><p class="hint" id="live-error">Последних ошибок пока нет.</p><p class="hint" id="live-heap"></p></div></div>
 </section>
 <footer class="footer"><span>BENDER STATION</span><span>Сделан, чтобы быть рядом.</span></footer>
 </main>
@@ -282,9 +310,34 @@ document.getElementById('wake-sample-section').addEventListener('toggle',()=>{
  }
 });
 window.addEventListener('pagehide',()=>{if(sampleBusy&&[1,2].includes(sampleState)&&sampleId)fetch('/wakeword/sample',{method:'POST',headers:{'X-Bender-Record':'1'},body:new URLSearchParams({action:'cancel',id:sampleId}),keepalive:true}).catch(()=>{});});
-const panels=['radio','settings','character'];
-function showPanel(){const key=location.hash.slice(1);const active=panels.includes(key)?key:'radio';document.querySelectorAll('[data-panel]').forEach(p=>p.hidden=p.dataset.panel!==active);document.querySelectorAll('[data-nav]').forEach(a=>{if(a.dataset.nav===active)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current');});}
+const panels=['radio','settings','character','reminders','status'];
+function showPanel(){const key=location.hash.slice(1);const active=key==='debug'?'settings':panels.includes(key)?key:'radio';document.querySelectorAll('[data-panel]').forEach(p=>p.hidden=p.dataset.panel!==active);document.querySelectorAll('[data-nav]').forEach(a=>{if(a.dataset.nav===active)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current');});if(key==='debug')document.getElementById('model-settings').open=true;if(active==='status')loadLiveStatus();if(active==='reminders')loadReminders();}
 window.addEventListener('hashchange',()=>{showPanel();window.scrollTo(0,0);});showPanel();
+async function loadLiveStatus(){
+ try{const response=await fetch('/live/status',{cache:'no-store'});if(!response.ok)throw Error('Нет связи с колонкой');const s=await response.json();const put=(id,value)=>document.getElementById(id).textContent=value;
+  put('live-refresh','Обновлено сейчас');put('live-music',s.mode+' · '+(s.music?'играет':'пауза')+' · громкость '+s.volume);
+  put('live-wifi',s.wifi?'Подключён · '+s.ip+' · '+s.rssi+' dBm':s.wifi_searching?'Ищет сеть · точка доступа '+(s.ap?'включена':'выключена'):'Нет сети · точка доступа '+(s.ap?'включена':'выключена'));
+  put('live-battery',s.battery_ready?s.battery_percent+'% · '+(s.battery_mv/1000).toFixed(2)+' В · '+(s.charging?'заряжается':'без зарядки'):'Ожидание замера');
+  put('live-server',s.ai_session?'Сессия готова':s.ai_connecting?'Подключается':s.ai_socket?'Соединение открыто':s.wifi?'Ожидает обращения':'Нет сети');
+  put('live-wake',!s.wake_enabled?'Выключен':s.wake_error?'Ошибка модели '+s.wake_error:s.wake_listening?'Слушает ключевую фразу':s.wake_ready?'Готов, но сейчас не слушает':'Модель загружается');
+  const face={idle:'спокоен',listening:'слушает',thinking:'думает',speaking:'говорит',error:'ошибка',pleased:'доволен',curious:'заинтересован',tired:'устал',annoyed:'раздражён'};
+  put('live-face',(face[s.face]||s.face)+(s.ai_wait_seconds?' · ждёт '+s.ai_wait_seconds+' с':'')+' · глаза '+(s.eyes_awake?'активны':'в покое'));
+  put('live-explanation',!s.wifi?'Без Wi-Fi сервер и голосовой ответ недоступны.':s.music?'Во время музыки голосовой вызов отключён, чтобы звук не вызывал ложные срабатывания.':!s.wake_enabled?'Включи голосовой вызов в настройках, чтобы Бендер слышал обращение.':s.wake_error?'Локальная модель ключевой фразы сообщает ошибку.':s.ai_wait_seconds>20?'Ответ задерживается на сервере; если ожидание не закончится, защита сбросит диалог.':s.wake_listening?'Бендер слушает ключевую фразу.':'Бендер сейчас занят или переключает микрофон.');
+  put('live-error',s.last_error?'Последняя ошибка: '+s.last_error+' · '+s.last_error_ago_seconds+' с назад':'Последних ошибок пока нет.');
+  put('live-heap','Свободная память: '+Math.round(s.heap/1024)+' КБ · работает '+Math.floor(s.uptime_seconds/60)+' мин');
+ }catch(error){document.getElementById('live-refresh').textContent='Нет связи';document.getElementById('live-explanation').textContent=error.message;}
+}
+function formatRemaining(seconds){if(seconds<=0)return 'Пора напоминать';const min=Math.ceil(seconds/60);return min>=60?Math.floor(min/60)+' ч '+min%60+' мин':'Через '+min+' мин';}
+async function loadReminders(){
+ try{const response=await fetch('/reminders',{cache:'no-store'});if(!response.ok)throw Error(await response.text());const data=await response.json();const list=document.getElementById('reminder-list');list.replaceChildren();document.getElementById('reminder-count').textContent=data.items.length+' / '+data.capacity;document.getElementById('reminder-clock').textContent=data.clock_ready?'Часы синхронизированы · время Киева':'Жду синхронизации часов по Wi-Fi. Ежедневные планы пока не сработают.';
+  if(!data.items.length){const empty=document.createElement('p');empty.className='muted';empty.textContent='Пока ничего нет.';list.append(empty);return;}
+  for(const item of data.items){const row=document.createElement('div');row.className='reminder-row';const info=document.createElement('div');const title=document.createElement('strong');title.textContent=item.text;const left=document.createElement('small');const hh=String(Math.floor(item.minute_of_day/60)).padStart(2,'0');const mm=String(item.minute_of_day%60).padStart(2,'0');left.textContent=item.daily?'Каждый день в '+hh+':'+mm+(data.clock_ready?(item.today?' · сегодня':' · завтра'):' · жду часы'):formatRemaining(item.remaining_seconds);info.append(title,left);const cancel=document.createElement('button');cancel.type='button';cancel.className='btn secondary small';cancel.textContent='Удалить';cancel.addEventListener('click',()=>changeReminder({action:'cancel',id:item.id}));row.append(info,cancel);list.append(row);}
+ }catch(error){document.getElementById('reminder-message').textContent=error.message;}
+}
+async function changeReminder(values){const message=document.getElementById('reminder-message');try{const response=await fetch('/reminders',{method:'POST',body:new URLSearchParams(values)});if(!response.ok)throw Error(await response.text());message.textContent=values.action==='cancel'?'Напоминание удалено.':'Записал напоминание.';if(values.action==='add')document.getElementById('reminder-text').value='';if(values.action==='add_daily')document.getElementById('daily-text').value='';await loadReminders();}catch(error){message.textContent=error.message;}}
+document.getElementById('reminder-form').addEventListener('submit',event=>{event.preventDefault();changeReminder({action:'add',minutes:document.getElementById('reminder-minutes').value,text:document.getElementById('reminder-text').value.trim()});});
+document.getElementById('daily-form').addEventListener('submit',event=>{event.preventDefault();changeReminder({action:'add_daily',time:document.getElementById('daily-time').value,text:document.getElementById('daily-text').value.trim()});});
+setInterval(()=>{if(document.hidden)return;if(location.hash==='#status')loadLiveStatus();if(location.hash==='#reminders')loadReminders();},4000);
 const shake=document.getElementById('shake_delta');const shakeValue=document.getElementById('shake_value');shake.addEventListener('input',()=>shakeValue.value=shake.value);document.getElementById('reset-shake').addEventListener('click',e=>{shake.value=e.currentTarget.dataset.default;shakeValue.value=shake.value;shake.dispatchEvent(new Event('input',{bubbles:true}));});
 const traitInputs=Array.from(document.querySelectorAll('[data-trait]'));
 const characterPresets=Array.from(document.querySelectorAll('[data-preset]'));
@@ -293,6 +346,38 @@ let previewBusy=false;
 const previewButton=document.getElementById('preview-character');
 const previewQuestion=document.getElementById('preview-question');
 const previewScenario=document.getElementById('preview-scenario');
+const debugModel=document.getElementById('debug-model');
+const debugModelStatus=document.getElementById('debug-model-status');
+const saveModelButton=document.getElementById('save-model');
+const debugPreviewButton=document.getElementById('debug-preview');
+const debugPreviewStatus=document.getElementById('debug-preview-status');
+const debugQuestion=document.getElementById('debug-question');
+const debugScenario=document.getElementById('debug-scenario');
+let modelBusy=false;
+let savedModel='{{LLM_MODEL}}';
+debugModel.value=savedModel;
+function modelName(value){return Array.from(debugModel.options).find(o=>o.value===value)?.textContent||value;}
+function modelPending(){return debugModel.value!==savedModel;}
+function updateModelControls(){const pending=modelPending();debugModel.disabled=modelBusy||previewBusy;saveModelButton.disabled=modelBusy||previewBusy||!pending;previewButton.disabled=modelBusy||previewBusy||pending;debugPreviewButton.disabled=modelBusy||previewBusy||pending;}
+debugModelStatus.textContent='Сохранено: '+modelName(savedModel)+'. Эта модель используется в следующих разговорах.';
+updateModelControls();
+debugScenario.innerHTML=previewScenario.innerHTML;
+debugScenario.addEventListener('change',()=>{const option=debugScenario.selectedOptions[0];if(option.dataset.question)debugQuestion.value=option.dataset.question;});
+debugQuestion.addEventListener('input',()=>{const option=Array.from(debugScenario.options).find(o=>o.dataset.question===debugQuestion.value);debugScenario.value=option?option.value:'custom';});
+debugModel.addEventListener('change',()=>{debugModelStatus.textContent=modelPending()?'Выбрана '+modelName(debugModel.value)+'. Нажми «Сохранить модель», чтобы применять её дальше.':'Сохранено: '+modelName(savedModel)+'. Эта модель используется в следующих разговорах.';updateModelControls();});
+saveModelButton.addEventListener('click',async()=>{
+ if(modelBusy||previewBusy||!modelPending())return;
+ modelBusy=true;updateModelControls();
+ debugModelStatus.textContent='Сохраняю модель…';
+ try{
+  const response=await fetch('/debug/model',{method:'POST',body:new URLSearchParams({model:debugModel.value})});
+  if(!response.ok)throw Error((await response.text())||'Не удалось сохранить модель.');
+  const result=await response.json();
+  savedModel=result.model;debugModel.value=savedModel;
+  debugModelStatus.textContent='Сохранено: '+modelName(savedModel)+'. Следующие разговоры и пробные реплики пойдут через неё, в том числе после перезагрузки.';
+ }catch(error){debugModelStatus.textContent='Ошибка: '+error.message+' Модель по-прежнему '+modelName(savedModel)+'.';}
+ finally{modelBusy=false;updateModelControls();}
+});
 function updatePreviewQuestion(){
  const option=Array.from(previewScenario.options).find(o=>o.dataset.question===previewQuestion.value);
  previewScenario.value=option?option.value:'custom';
@@ -330,12 +415,11 @@ async function previewFetch(options){
  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),8000);
  try{return await fetch('/character/preview',{...options,signal:controller.signal,cache:'no-store'});}finally{clearTimeout(timer);}
 }
-async function previewCharacter(){
- if(previewBusy)return;
- const question=previewQuestion.value.trim();
- if(!question||question.length>200){document.getElementById('preview-status').textContent='Напиши вопрос: от 1 до 200 символов.';previewQuestion.focus();return;}
- previewBusy=true;previewButton.disabled=true;previewButton.textContent='Готовлю реплику…';
- const message=document.getElementById('preview-status');
+async function previewCharacter(questionInput, button, message){
+ if(previewBusy||modelBusy||modelPending())return;
+ const question=questionInput.value.trim();
+ if(!question||question.length>200){message.textContent='Напиши вопрос: от 1 до 200 символов.';questionInput.focus();return;}
+ previewBusy=true;updateModelControls();button.textContent='Готовлю реплику…';
  const save=document.querySelector('#character-form button[type=submit]');save.disabled=true;
  message.textContent='Подключаюсь к Бендеру…';
  const body=new URLSearchParams();traitInputs.forEach(i=>body.set(i.name,i.value));body.set('question',question);
@@ -350,17 +434,34 @@ async function previewCharacter(){
    if(result.state===4){message.textContent='Вот так он звучит. Меняй ползунки и сравнивай.';return;}
    if(result.state===5)throw Error('Проба прервана или AI сервер не ответил. Проверь сервер и попробуй ещё раз.');
    if(![1,2,3].includes(result.state))throw Error('Проба не запущена. Обнови прошивку и локальный сервер.');
-   previewButton.textContent=result.state===3?'Бендер говорит…':'Готовлю реплику…';
+   button.textContent=result.state===3?'Бендер говорит…':'Готовлю реплику…';
    message.textContent=result.state===1?'Подключаюсь к AI серверу…':'Пробуем вопрос и настройки, которые были при нажатии. Звук — на колонке.';
    await new Promise(resolve=>setTimeout(resolve,900));
   }
   throw Error('Бендер не успел ответить. Проверь локальный сервер.');
  }catch(error){message.textContent=error.name==='AbortError'?'Бендер не отвечает по сети. Проверь соединение.':error.message;}
- finally{previewBusy=false;previewButton.disabled=false;save.disabled=false;previewButton.textContent=characterTestLabel();}
+ finally{previewBusy=false;updateModelControls();save.disabled=false;previewButton.textContent=characterTestLabel();debugPreviewButton.textContent='Послушать ответ';}
 }
-previewButton.addEventListener('click',previewCharacter);
+previewButton.addEventListener('click',()=>previewCharacter(previewQuestion,previewButton,document.getElementById('preview-status')));
+debugPreviewButton.addEventListener('click',()=>previewCharacter(debugQuestion,debugPreviewButton,debugPreviewStatus));
 let calibTimer=0,calibBusy=false,calibPending=false,leaving=false;
 const status=document.getElementById('calib-status');
+const liquidStatus=document.getElementById('liquid-status');
+const liquidTare=document.getElementById('liquid-tare');
+const liquidReset=document.getElementById('liquid-reset');
+async function calibrateLiquid(action){
+ if(liquidTare.disabled)return;
+ liquidTare.disabled=liquidReset.disabled=true;
+ liquidStatus.textContent='Сохраняю калибровку…';
+ const controller=new AbortController();const timeout=setTimeout(()=>controller.abort(),5000);
+ try{const response=await fetch('/liquid/calibration',{method:'POST',body:new URLSearchParams({action}),signal:controller.signal});
+  if(!response.ok)throw Error(await response.text());
+  liquidStatus.textContent=action==='tare'?'Готово. Это положение теперь центр. Сохранено.':'Калибровка сброшена и сохранена.';
+ }catch(error){liquidStatus.textContent=error.name==='AbortError'?'Нет ответа. Проверь связь и повтори.':error.message;}
+ finally{clearTimeout(timeout);liquidTare.disabled=liquidReset.disabled=false;}
+}
+liquidTare.addEventListener('click',()=>calibrateLiquid('tare'));
+liquidReset.addEventListener('click',()=>calibrateLiquid('reset'));
 function getV(i){return Number(document.getElementById('mbr'+i).value);}
 function setV(i,v){v=Math.max(0,Math.min(15,v));document.getElementById('mbr'+i).value=v;document.getElementById('v'+i).textContent=v;}
 async function postCalib(){if(leaving)return;if(calibBusy){calibPending=true;return;}calibBusy=true;status.textContent='Применяю яркость…';try{const b=new URLSearchParams();for(let i=0;i<5;i++)b.set('mbr'+i,getV(i));const response=await fetch('/calib',{method:'POST',body:b});if(!response.ok)throw Error();status.textContent='Предпросмотр применён. Сохрани, чтобы запомнить.';}catch(e){status.textContent='Не удалось применить яркость. Проверь соединение и попробуй ещё раз.';}finally{calibBusy=false;if(calibPending&&!leaving){calibPending=false;postCalib();}}}

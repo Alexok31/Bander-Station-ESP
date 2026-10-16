@@ -50,16 +50,15 @@ int main(){
     assert(s_wake_endpoint.heardSpeech()&&s_wake_initial_result==WakeVoice::Continue);
     assert(memcmp(before.data(),storage,sizeof(storage))==0);
     for(unsigned i=0;i<60;++i)assert(live(1000)==WakeVoice::Continue);
-    for(unsigned i=0;i<99;++i)assert(live(20)==WakeVoice::Continue);
-    assert(live(20)==WakeVoice::Finish);assert(preN==480);
+    for(unsigned i=0;i<39;++i)assert(live(20)==WakeVoice::Continue);
+    assert(live(20)==WakeVoice::Finish);assert(preN==420);
     // A short complete question is already in pre-roll when a late hit arrives.
     seed(210,70,40);beginWakeInitialCapture();
-    for(unsigned i=0;i<59;++i)assert(live(20)==WakeVoice::Continue);
-    assert(live(20)==WakeVoice::Finish);
+    assert(s_wake_initial_result==WakeVoice::Finish);
     // Calling just the name follows the same path; server decides from ASR text,
     // not guessed timing. No local acknowledgement can interrupt these frames.
     seed(250,40,30);beginWakeInitialCapture();
-    for(unsigned i=0;i<69;++i)assert(live(20)==WakeVoice::Continue);
+    for(unsigned i=0;i<9;++i)assert(live(20)==WakeVoice::Continue);
     assert(live(20)==WakeVoice::Finish);
     // Silence-only false detection is cancelled rather than committed.
     seed(320,0,0);beginWakeInitialCapture();
@@ -77,7 +76,7 @@ int main(){
     chunk(reinterpret_cast<int16_t*>(prebuf+size_t((preHead+5)%PREBUF_N)*CHUNK_BYTES),32767);
     beginWakeInitialCapture();
     assert(s_wake_endpoint.heardSpeech());
-    for(unsigned i=0;i<99;++i)assert(live(20)==WakeVoice::Continue);
+    for(unsigned i=0;i<39;++i)assert(live(20)==WakeVoice::Continue);
     assert(live(20)==WakeVoice::Finish);
     puts("Initial wake capture: late hit, wrapped pre-roll, continuous/short question, name-only, silence, cap passed");
 }

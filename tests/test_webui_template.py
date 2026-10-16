@@ -32,12 +32,14 @@ class WebUiTemplateTests(unittest.TestCase):
         self.doc = Forms()
         self.doc.feed(PAGE)
     def test_forms_are_independent(self):
-        forms = {f['section']: set(f) for f in self.doc.forms}
+        forms = {f['section']: set(f) for f in self.doc.forms if 'section' in f}
         self.assertEqual(set(forms), {'radio', 'wifi', 'behavior', 'display', 'ai', 'character'})
         self.assertEqual(forms['radio'], {'section', 'stations'})
         self.assertEqual(forms['ai'], {'section', 'ai_ws'})
         self.assertEqual(forms['behavior'], {'section', 'motion_settings', 'wake_on_shake', 'shake_delta', 'calm_minutes'})
         self.assertNotIn('sta_ssid', forms['display'])
+        planner = [set(f) for f in self.doc.forms if 'section' not in f]
+        self.assertEqual(planner, [{'minutes', 'text'}, {'time', 'text'}])
     def test_character_has_independent_complete_form(self):
         form = next(f for f in self.doc.forms if f['section'] == 'character')
         self.assertEqual(set(form), {'section', 'sarcasm', 'sociability', 'curiosity', 'stubbornness', 'warmth', 'roughness', 'profanity'})

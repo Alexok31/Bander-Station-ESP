@@ -12,6 +12,7 @@
 #include "WebUi.h"
 #include "core0.h"
 #include "BenderAi.h"
+#include "Reminders.h"
 #include "AirPlay.h"
 
 TaskHandle_t Task0;
@@ -165,6 +166,7 @@ void setup() {
                   (unsigned)ESP.getFreePsram());
     Serial.println(F("REQUIRED: USB CDC On Boot = Enabled (BCLK=GPIO44 clashes UART0 RX)"));
     Serial.println(F("Listen: POWER 5V, USB optional only with CDC"));
+    Reminders::begin();
 
     // Усилители: GPIO41 — либо mute, либо постоянно «play» (ampUseHardwareMute=false).
     amp_force_mute();

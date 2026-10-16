@@ -16,9 +16,9 @@ from character import KEYS, validate_character, character_rules, validate_previe
 
 def server_namespace():
     # Use production protocol/prompt functions without loading speech models or secrets.
-    names = {'set_device_character', 'grok_break_chain', 'bender_prompt', 'local_bender_prompt',
+    names = {'set_device_character', 'grok_break_chain', 'select_runtime_model', 'bender_prompt', 'local_bender_prompt',
              'grok_turn_text', '_llm_payload', 'handle', '_grok_pieces',
-             'character_preview_text', 'run_character_preview', '_model_context', '_is_social_checkin',
+             'character_preview_text', 'run_character_preview', '_openai_pieces', '_model_context', '_is_social_checkin',
              '_trim_reply_filler', '_reply_words'}
     tree = ast.parse((SERVER / 'server.py').read_text(encoding='utf-8'))
     nodes = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names]
@@ -35,7 +35,12 @@ def server_namespace():
               MEMORY=SimpleNamespace(context=lambda *args: '', profile=lambda *args: {'type': 'device.profile'}),
               DEVICE_STATIONS=[], _TURN_GUIDANCE='continue the conversation',
               _is_greet=lambda text: False, _is_story=lambda text: False,
-              LLM_PROVIDER='ollama', OLLAMA_MODEL='test', GROK_MODEL='test', OLLAMA_NUM_GPU=0,
+              CFG={'llm': 'ollama', 'ollama_model': 'test', 'grok_model': 'test',
+                   'openai_model': 'gpt-6-luna',
+                   'anthropic_model': 'claude-sonnet-5-5'},
+              LLM_PROVIDER='ollama', OLLAMA_MODEL='test', GROK_MODEL='test',
+              ANTHROPIC_MODEL='claude-sonnet-5-5', OPENAI_MODEL='gpt-6-luna',
+              _OPENAI_SSL_VERIFY=True, OLLAMA_NUM_GPU=0,
               OLLAMA_NUM_CTX=8192, OLLAMA_HISTORY_MESSAGES=0, OLLAMA_SUMMARY_CHARS=0,
               OLLAMA_COMPACT_PROMPT=False,
               CHAT_SUMMARY='', HISTORY_SEND=10, json=json, dumps=json.dumps,
@@ -45,6 +50,22 @@ def server_namespace():
 
 
 class CharacterTests(unittest.TestCase):
+    def test_live_timer_snapshot_reaches_provider_without_polluting_history(self):
+        import voice_commands
+        ns = server_namespace()
+        ns['anthropic_bender_prompt'] = lambda: 'character'
+        history = [{'role': 'user', 'content': 'Ти пам’ятаєш, що поставив?'}]
+        original = copy.deepcopy(history)
+        context = voice_commands.reminder_model_context([
+            {'text': 'вимкнути плиту', 'remaining_seconds': 43, 'daily': False}], True)
+        for provider in ('openai', 'anthropic', 'ollama'):
+            ns['LLM_PROVIDER'] = provider
+            messages = ns['_llm_payload']('', 'uk', 1, True, history, context)['messages']
+            self.assertIn({'role': 'system', 'content': context}, messages)
+        self.assertEqual(history, original)
+        self.assertNotIn('вимкнути плиту', voice_commands.reminder_model_context([], True))
+        self.assertIn('недоступний', voice_commands.reminder_model_context(None, False))
+
     def test_local_gpu_layer_limit_is_sent_with_chat_requests(self):
         ns = server_namespace()
         ns['OLLAMA_NUM_GPU'] = 36
@@ -253,6 +274,55 @@ class CharacterProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ns['CHAT_GROK_RESP_ID'], 'old-chain')
         self.assertIsNone(ns['DEVICE_CHARACTER'])
 
+    async def test_luna_preview_uses_selected_model_without_conversation_history(self):
+        ns = server_namespace()
+        calls = []
+        async def pieces(messages, limit):
+            calls.append((messages, limit))
+            yield 'Та я вже тут.'
+        ns.update(LLM_PROVIDER='openai', OPENAI_MODEL='gpt-6-luna',
+                  _openai_pieces=pieces, _clean_llm=lambda text: text,
+                  _pop_sentences=lambda text: ([text], ''),
+                  CHAT=[{'role': 'user', 'content': 'Earlier question'}])
+        answer = await ns['character_preview_text'](dict.fromkeys(KEYS, 80), DEFAULT_QUESTION)
+        self.assertEqual(answer, 'Та я вже тут.')
+        self.assertEqual(calls[0][0][1], {'role': 'user', 'content': DEFAULT_QUESTION})
+        self.assertIn('Теплота: 80/100', calls[0][0][0]['content'])
+        self.assertNotIn('Earlier question', str(calls[0][0]))
+
+    async def test_luna_stream_request_and_usage_chunk(self):
+        ns = server_namespace()
+        requests, logs = [], []
+        class Stream:
+            status_code = 200
+            async def __aenter__(self): return self
+            async def __aexit__(self, *args): pass
+        class Client(Stream):
+            def stream(self, method, url, headers, json):
+                requests.append((method, url, headers, json))
+                return Stream()
+        async def events(response):
+            yield {'choices': [{'delta': {'content': 'Привіт'}}]}
+            yield {'choices': [{'delta': {'content': ', друже.'}}]}
+            yield {'choices': [], 'usage': {'prompt_tokens': 90, 'completion_tokens': 12}}
+        ns.update(OPENAI_API_KEY='test-key', OPENAI_MODEL='gpt-6-luna',
+                  OPENAI_CHAT_URL='https://example.test/chat',
+                  ssl=SimpleNamespace(create_default_context=lambda: None),
+                  _httpx_async=lambda **kwargs: Client(), _iter_sse=events,
+                  log=logs.append)
+        chunks = [chunk async for chunk in ns['_openai_pieces']([
+            {'role': 'system', 'content': 'Be Bender'},
+            {'role': 'user', 'content': 'Як справи?'}], 180)]
+        self.assertEqual(chunks, ['Привіт', ', друже.'])
+        method, url, headers, body = requests[0]
+        self.assertEqual((method, url), ('POST', 'https://example.test/chat'))
+        self.assertEqual(body['model'], 'gpt-6-luna')
+        self.assertEqual(body['reasoning_effort'], 'none')
+        self.assertTrue(body['stream_options']['include_usage'])
+        self.assertEqual(body['messages'][-1]['content'], 'Як справи?')
+        self.assertEqual(headers['Authorization'], 'Bearer test-key')
+        self.assertIn('in=90 out=12', logs[0])
+
     async def test_preview_protocol_finishes_on_success_invalid_profile_and_tts_failure(self):
         for case in ('ok', 'invalid', 'empty_audio', 'model_error', 'invalid_question', 'custom_question'):
             with self.subTest(case=case):
@@ -279,6 +349,22 @@ class CharacterProtocolTests(unittest.IsolatedAsyncioTestCase):
                 if generated:
                     self.assertEqual(generated[0][1], 'Як справи?' if case == 'custom_question' else DEFAULT_QUESTION)
                 self.assertEqual(ns['CHAT_GROK_RESP_ID'], 'old-chain')
+
+    async def test_preview_uses_selected_model(self):
+        ns = server_namespace()
+        providers = []
+        async def generate(profile, question):
+            providers.append((ns['LLM_PROVIDER'], ns['ANTHROPIC_MODEL']))
+            return 'Гаразд.'
+        ns.update(character_preview_text=generate, synth=lambda text: b'pcm',
+                  send_pcm_deltas=lambda ws, pcm: asyncio.sleep(0))
+        sent = []
+        async def send(raw): sent.append(json.loads(raw))
+        await ns['run_character_preview'](SimpleNamespace(send=send), {
+            'character': dict.fromkeys(KEYS, 50), 'question': DEFAULT_QUESTION,
+            'llm_model': 'claude-haiku-5-5', 'request_id': 8})
+        self.assertEqual(providers, [('anthropic', 'claude-haiku-5-5')])
+        self.assertEqual(sent[-3]['ok'], True)
 
     async def test_grok_receives_new_style_with_history_then_reuses_chain(self):
         ns = server_namespace()
@@ -313,6 +399,14 @@ class CharacterProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(requests[1]['input']), 2)
         self.assertEqual(requests[1]['input'][0], {'role': 'system', 'content': ns['bender_prompt']()})
         self.assertEqual(requests[1]['input'][1]['role'], 'user')
+        # A fresh snapshot must reach both continuation and rebuilt chains.
+        for chain in ('fresh-chain', ''):
+            ns['CHAT_GROK_RESP_ID'] = chain
+            _ = [part async for part in ns['_grok_pieces'](history, 140, .68, 'timer: 43 seconds')]
+            request = requests[-1]
+            context = request['input'][0]['content'] if chain else request['instructions']
+            self.assertIn('timer: 43 seconds', context)
+            self.assertFalse('instructions' in request and 'previous_response_id' in request)
 
     async def test_grok_chain_recovery_preserves_history_and_reports_stream_errors(self):
         for case in ('expired', 'fallback_error', 'partial_error', 'new_legacy'):
@@ -379,10 +473,14 @@ class CharacterProtocolTests(unittest.IsolatedAsyncioTestCase):
             remote_address = 'test'
             async def send(self, raw): wire.append(json.loads(raw))
             async def __aiter__(self):
-                yield json.dumps({'type': 'session.update', 'session': {'character': profile}})
-                yield json.dumps({'type': 'session.update', 'session': {'character': {'warmth': 101}}})
+                yield json.dumps({'type': 'session.update', 'session': {
+                    'character': profile, 'llm_model': 'claude-haiku-5-5'}})
+                yield json.dumps({'type': 'session.update', 'session': {
+                    'character': {'warmth': 101}, 'llm_model': 'claude-haiku-5-5'}})
         await ns['handle'](Socket())
         self.assertEqual(ns['DEVICE_CHARACTER'], profile)
+        self.assertEqual((ns['LLM_PROVIDER'], ns['ANTHROPIC_MODEL']),
+                         ('anthropic', 'claude-haiku-5-5'))
         self.assertEqual(ns['CHAT_GROK_RESP_ID'], '')
         self.assertEqual(sum(m['type'] == 'session.updated' for m in wire), 2)
 

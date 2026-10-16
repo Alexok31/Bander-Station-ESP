@@ -8,12 +8,15 @@ import json
 from pathlib import Path
 import re
 import sys
+from time import perf_counter
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 SERVER_DIR = Path(__file__).resolve().parents[1] / "BendeRadio/examples/BenderRealtime/local_server"
 sys.path.insert(0, str(SERVER_DIR))
+import planner_intent
+import voice_commands
 from speech_pipeline import PcmPacer, TurnTiming, stream_speech
 
 
@@ -181,6 +184,9 @@ def load_server_functions():
     logs = []
     ns = {
         "asyncio": asyncio, "aclosing": aclosing, "base64": base64, "re": re,
+        "perf_counter": perf_counter, "_planner_draft": None, "_planner_draft_until": 0,
+        "planner_intent": planner_intent,
+        "_planner_model_intent": lambda *args: asyncio.sleep(0, result=None),
         "TurnTiming": TurnTiming, "stream_speech": stream_speech, "PcmPacer": PcmPacer,
         "OUT_RATE": 24000,
         "LLM_MAX_SENTS": 3, "LLM_STORY_SENTS": 5, "_LLM_RETRY_NUDGE": "try again",
@@ -194,7 +200,9 @@ def load_server_functions():
         "grok_break_chain": lambda reason: None,
         "transcribe": lambda pcm: ("Розкажи щось.", "uk", 1.0, True),
         "synth": lambda text: b"\x01\x00" * 300,
-        "voice_commands": SimpleNamespace(match=lambda *args: None),
+        "voice_commands": SimpleNamespace(match=lambda *args: None,
+            reminder_query_scope=voice_commands.reminder_query_scope,
+            reminder_model_context=voice_commands.reminder_model_context),
         "handle_personal_command": lambda *args: None, "favorite_voice_command": lambda text: None,
         "DEVICE_STATIONS": [], "_reply_lang": lambda text, lang: lang,
         "LLM_PROVIDER": "grok", "whisper_device": "fake", "whisper_name": "fake",
@@ -206,6 +214,32 @@ def load_server_functions():
 
 
 class ServerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_timer_command_then_followup_receives_live_device_state(self):
+        ns, logs = load_server_functions()
+        ns['voice_commands'] = voice_commands
+        resets, wire, contexts = [], [], []
+        ns['grok_break_chain'] = resets.append
+        ns['transcribe'] = lambda pcm: ('Нагадай через хвилину вимкнути плиту', 'uk', 1, True)
+        ns['_planner_model_intent'] = lambda *args: asyncio.sleep(0, result={
+            'kind': 'relative', 'seconds': 60, 'text': 'вимкнути плиту'})
+        async def send(raw): wire.append(json.loads(raw))
+        async def model(prompt, lang, prob, history, device_context):
+            contexts.append(device_context)
+            yield 'До нагадування залишилось сорок три секунди.'
+        ns['iter_llm_sentences'] = model
+        history = []
+        await ns['run_turn'](SimpleNamespace(send=send), b'input', '', history, reminders=[])
+        self.assertTrue(any(m.get('name') == 'reminder.add' for m in wire), logs)
+        self.assertIn('device command added to local history', resets)
+        ns['transcribe'] = lambda pcm: ('Ти пам’ятаєш, що зробив?', 'uk', 1, True)
+        await ns['run_turn'](SimpleNamespace(send=send), b'input', '', history,
+            reminders=[{'text': 'вимкнути плиту', 'daily': False, 'remaining_seconds': 43}])
+        self.assertEqual(len(contexts), 1, logs)
+        self.assertIn('"remaining_seconds": 43', contexts[0])
+        self.assertIn('вимкнути плиту', contexts[0])
+        self.assertEqual(len(history), 4)
+        self.assertFalse(any('remaining_seconds' in m['content'] for m in history))
+
     def setUp(self):
         self.ns, self.logs = load_server_functions()
         self.timing = TurnTiming(self.logs.append)
@@ -275,7 +309,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 ns['transcribe']=lambda pcm:(text,'uk',1,True)
                 ns['next_wake_ack']=lambda: self.fail('Question must not trigger the greeting')
                 prompts=[]
-                async def model(prompt,lang,prob,history):
+                async def model(prompt,lang,prob,history,device_context=''):
                     prompts.append(history[-1]['content'])
                     yield 'Мідний чайник кипить.'
                 ns['iter_llm_sentences']=model
@@ -304,17 +338,17 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         return [part async for part in self.ns["_iter_checked_reply"](
             "Розкажи щось.", "uk", 1.0, self.history, self.timing)]
 
-    async def test_rejected_opening_is_retried_before_speech(self):
+    async def test_rejected_opening_skips_to_next_sentence_without_second_request(self):
         attempts = []
 
         async def model(*args):
             attempts.append(args[-1])
-            yield "Дякую за перегляд." if len(attempts) == 1 else "Мідний чайник кипить."
+            yield "Дякую за перегляд."
+            yield "Мідний чайник кипить."
 
         self.ns["iter_llm_sentences"] = model
         self.assertEqual(await self.collect(), ["Мідний чайник кипить."])
-        self.assertEqual(len(attempts), 2)
-        self.assertIn("try again", attempts[1][-1]["content"])
+        self.assertEqual(len(attempts), 1)
 
     async def test_bad_tail_does_not_restart_accepted_speech(self):
         attempts = []
@@ -359,30 +393,32 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             user, 'uk', 1., [{'role': 'user', 'content': user}], self.timing)]
         self.assertEqual(result, [answer])
 
-    async def test_verbatim_old_reply_still_retries(self):
+    async def test_verbatim_old_reply_is_skipped_within_one_request(self):
         old = 'Я продав холодильник Фраю за сто доларів.'
         self.history = [{'role': 'assistant', 'content': old}, {'role': 'user', 'content': 'А далі?'}]
         calls = []
         async def model(*args):
             calls.append(1)
-            yield old.upper() if len(calls) == 1 else 'Фрай уже вимагає гарантію на сусідів.'
+            yield old.upper()
+            yield 'Фрай уже вимагає гарантію на сусідів.'
         self.ns['iter_llm_sentences'] = model
         self.assertEqual(await self.collect(), ['Фрай уже вимагає гарантію на сусідів.'])
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 1)
 
-    async def test_reused_long_ending_retries_even_with_new_opening(self):
+    async def test_reused_long_ending_skips_to_next_sentence(self):
         old = 'Пацани, спокійної ночі — спіть, поки я не вирішив, що ви мені заважаєте.'
         repeated = 'Заважаєте — то йдіть спати, поки я не вирішив, що ви мені заважаєте.'
         self.history = [{'role': 'assistant', 'content': old}, {'role': 'user', 'content': 'А ще?'}]
         calls = []
         async def model(*args):
             calls.append(1)
-            yield repeated if len(calls) == 1 else 'Нехай будильник завтра теж візьме вихідний.'
+            yield repeated
+            yield 'Нехай будильник завтра теж візьме вихідний.'
         self.ns['iter_llm_sentences'] = model
         self.assertEqual(await self.collect(), ['Нехай будильник завтра теж візьме вихідний.'])
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 1)
 
-    async def test_third_identical_swear_opening_retries_but_new_opening_is_allowed(self):
+    async def test_third_identical_swear_opening_skips_to_new_opening(self):
         self.history = [
             {'role': 'assistant', 'content': 'Блядь, це перша відповідь.'},
             {'role': 'user', 'content': 'Далі?'},
@@ -391,10 +427,11 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         calls = []
         async def model(*args):
             calls.append(1)
-            yield 'Блядь, вже ранок.' if len(calls) == 1 else 'Будильник знову охуїв: вимагає підвищення.'
+            yield 'Блядь, вже ранок.'
+            yield 'Будильник знову охуїв: вимагає підвищення.'
         self.ns['iter_llm_sentences'] = model
         self.assertEqual(await self.collect(), ['Будильник знову охуїв: вимагає підвищення.'])
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 1)
 
     def test_swapping_profane_adjective_does_not_hide_same_joke(self):
         old = 'Сані, Андрюсі та Боді — щоб сон був такий пиздатий, ніби ви виграли в лотерею, а на ранок прокинулися з повідомленням від шефа.'
@@ -420,20 +457,18 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             'Слухай, чув.', 'Я сховав пиво за капустою.')
         self.assertEqual(await self.collect(), ['Я сховав пиво за капустою.'])
 
-    async def test_ack_followed_by_rejected_tail_retries_instead_of_speaking_ack(self):
+    async def test_ack_and_rejected_tail_skip_within_same_response(self):
         calls = []
         async def model(*args):
             calls.append(1)
-            if len(calls) == 1:
-                yield 'Гаразд, чув.'
-                yield 'Дякую за перегляд.'
-            else:
-                yield 'Мідний чайник кипить.'
+            yield 'Гаразд, чув.'
+            yield 'Дякую за перегляд.'
+            yield 'Мідний чайник кипить.'
         self.ns['iter_llm_sentences'] = model
         self.assertEqual(await self.collect(), ['Мідний чайник кипить.'])
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 1)
 
-    async def test_only_filler_retries_once_without_claiming_asr_failed(self):
+    async def test_only_filler_uses_fallback_without_second_request(self):
         calls = []
         async def model(*args):
             calls.append(1)
@@ -441,7 +476,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             yield 'Кажи, що треба.'
         self.ns['iter_llm_sentences'] = model
         result = await self.collect()
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 1)
         self.assertEqual(len(result), 1)
         self.assertIn('Платівка', result[0])
 
@@ -476,7 +511,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.collect(), ["Мідний чайник кипить."])
         self.assertEqual(drained, [True])
 
-    async def test_two_rejected_attempts_produce_single_fallback(self):
+    async def test_rejected_response_produces_single_fallback(self):
         self.ns["iter_llm_sentences"] = lambda *args: sentences("Дякую за перегляд.")
         out = await self.collect()
         self.assertEqual(len(out), 1)
@@ -517,7 +552,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_voice_command_still_follows_its_confirmation_audio(self):
         wire = []
         self.ns["voice_commands"] = SimpleNamespace(match=lambda *args: SimpleNamespace(
-            args={"station": 1}, name="radio.station", reply=lambda n: "Вмикаю."))
+            args={"station": 1}, name="radio.station", reply=lambda n: "Вмикаю."),
+            reminder_query_scope=lambda text: None)
 
         async def send(raw):
             wire.append(json.loads(raw)["type"])

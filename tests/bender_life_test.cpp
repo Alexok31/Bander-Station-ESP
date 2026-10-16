@@ -1,5 +1,9 @@
 #include "../BendeRadio/BenderLife.h"
 using E = BenderEvent;
+static_assert(bender_event_has_local_voice(E::Shake));
+static_assert(bender_event_has_local_voice(E::Charging));
+static_assert(!bender_event_has_local_voice(E::BatteryLow));
+static_assert(!bender_event_has_local_voice(E::None));
 
 static_assert(bender_event_face(E::Shake) == BenderFaceState::Annoyed);
 static_assert(bender_event_face(E::Charging) == BenderFaceState::Pleased);

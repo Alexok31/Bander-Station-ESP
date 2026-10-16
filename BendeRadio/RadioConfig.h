@@ -200,6 +200,11 @@ class RadioConfig {
     static constexpr uint16_t matrixOverlayDigitsMs = 1000;
 
     static constexpr int analyzWidth = 3 * 8;
+    static constexpr uint8_t mouthModeCount = 7;
+    static constexpr uint8_t mouthLiquidMode = 6;
+    // Mounted MPU: Z points up; Y measures left/right tilt, X forward/backward.
+    static constexpr bool liquidTiltUseY = true;
+    static constexpr int8_t liquidTiltSign = -1;
     static constexpr int radioBuffer = 1600 * 28;  // RAM fallback
     // HTTPS-станції (Majestic) важчі за HTTP 128k — тримаємо запас у PSRAM.
     static constexpr int radioBufferPsram = 320000;

@@ -17,6 +17,9 @@
 #include "WakeRuntime.h"
 #include "WakeDecision.h"
 #include "WakeVoiceSettings.h"
+#include "Reminders.h"
+#include "AirPlay.h"
+#include "battery.h"
 
 static WebServer server(80);
 static DNSServer dnsServer;
@@ -161,6 +164,7 @@ static void sendPage() {
         {"STATIONS", htmlEscaped(stations)}, {"SSID", htmlEscaped(ssid)},
         {"AP_SSID", htmlEscaped(nvsEffectiveApSsid(w))}, {"AI_URL", htmlEscaped(aiUrl)},
         {"WAKE_CHECKED", nvsLoadWakeOnShake() ? "checked" : ""},
+        {"TILT_EYES_CHECKED", nvsLoadTiltEyes() ? "checked" : ""},
         {"SHAKE", String(nvsLoadShakeThreshold())}, {"SHAKE_MIN", String(BenderBehavior::shakeMin)},
         {"SHAKE_MAX", String(BenderBehavior::shakeMax)}, {"SHAKE_STEP", String(BenderBehavior::shakeStep)},
         {"SHAKE_DEFAULT", String(BenderBehavior::shakeDefault)},
@@ -168,7 +172,8 @@ static void sendPage() {
         {"SARCASM", String(character.values[0])}, {"SOCIABILITY", String(character.values[1])},
         {"CURIOSITY", String(character.values[2])}, {"STUBBORNNESS", String(character.values[3])},
         {"WARMTH", String(character.values[4])}, {"ROUGHNESS", String(character.values[5])},
-        {"PROFANITY", String(character.values[6])}
+        {"PROFANITY", String(character.values[6])},
+        {"LLM_MODEL", BenderLlmModel::id(nvsLoadLlmModel())}
     };
     web_send_close_connection();
     server.sendHeader("Cache-Control", "no-store");
@@ -289,7 +294,13 @@ static void handleSave() {
         if (server.hasArg("shake_delta")) nvsSaveShakeThreshold(shake);
         if (server.hasArg("calm_minutes")) nvsSaveCalmMinutes(uint8_t(calm));
     }
-    if (scope.display) matrix_set_brightness_trim(trim, RadioConfig::matrixModuleCount, true);
+    if (scope.display) {
+        if (server.hasArg("eye_motion_settings") && !nvsSaveTiltEyes(server.arg("tilt_eyes") == "1")) {
+            server.send(500, "text/plain; charset=utf-8", "Не удалось сохранить реакцию глаз. Попробуй ещё раз.");
+            return;
+        }
+        matrix_set_brightness_trim(trim, RadioConfig::matrixModuleCount, true);
+    }
     web_send_close_connection();
     String response = F("<!doctype html><html lang=ru><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Сохранено — Bender</title><body style='margin:0;background:#111a1b;color:#f1f4ed;font:16px system-ui;padding:10vh 24px'><main style='max-width:440px;margin:auto'><p style='color:#b6efd5;letter-spacing:2px'>BENDER STATION</p><h1>Запомнил.</h1><p>Настройки сохранены. Бендер перезапускается.</p><p>Если менял Wi-Fi, подключись к новой сети.</p><a style='color:#b6efd5' href='/#");
     response += scope.radio ? "radio" : (scope.character ? "character" : "settings");
@@ -327,6 +338,165 @@ static void handleCharacterPreview() {
         server.send(409, "text/plain; charset=utf-8", error); return;
     }
     server.send(202, "application/json", "{\"state\":1}");
+}
+
+static void handleDebugModel() {
+    wifi_touch_activity();
+    web_send_close_connection();
+    server.sendHeader("Cache-Control", "no-store");
+    if (server.method() == HTTP_POST) {
+        uint8_t model = BenderLlmModel::Auto;
+        if (!server.hasArg("model") || !BenderLlmModel::parse(server.arg("model").c_str(), model)) {
+            server.send(400, "text/plain; charset=utf-8", "Неизвестная модель.");
+            return;
+        }
+        if (!nvsSaveLlmModel(model)) {
+            server.send(500, "text/plain; charset=utf-8", "Не удалось сохранить модель.");
+            return;
+        }
+    } else if (server.method() != HTTP_GET) {
+        server.send(405, "text/plain", "Method Not Allowed");
+        return;
+    }
+    server.send(200, "application/json", String("{\"model\":\"") +
+                BenderLlmModel::id(nvsLoadLlmModel()) + "\"}");
+}
+
+static void sendJson(const JsonDocument& doc) {
+    String body;
+    serializeJson(doc, body);
+    web_send_close_connection();
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json; charset=utf-8", body);
+}
+
+static void handleLiveStatus() {
+    wifi_touch_activity();
+    BenderAiDiagnostic ai{};
+    bender_ai_diagnostic(ai);
+    const auto wake = WakeRuntime::status();
+    const bool wifi = WiFi.status() == WL_CONNECTED;
+    const bool airplay = play_mode_is_airplay();
+    JsonDocument doc;
+    doc["uptime_seconds"] = millis() / 1000u;
+    doc["heap"] = ESP.getFreeHeap();
+    doc["wifi"] = wifi;
+    doc["wifi_searching"] = wifiConnecting;
+    doc["ap"] = apModeActive();
+    doc["rssi"] = wifi ? WiFi.RSSI() : 0;
+    doc["ip"] = wifi ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+    doc["mode"] = airplay ? "AirPlay" : strcmp(g_audio_source, "bt") == 0 ? "Bluetooth" : "FM";
+    doc["music"] = airplay ? airplay_playing() : radioState.state;
+    doc["volume"] = radioState.vol;
+    doc["battery_ready"] = battery_gauge_ready();
+    doc["battery_percent"] = battery_percent();
+    doc["battery_mv"] = battery_millivolts();
+    doc["charging"] = battery_is_charging();
+    doc["eyes_awake"] = matrix_face_is_awake();
+    const auto face = bender_ai_face_state();
+    doc["face"] = face == BenderFaceState::Listening ? "listening" :
+                  face == BenderFaceState::Thinking ? "thinking" :
+                  face == BenderFaceState::Speaking ? "speaking" :
+                  face == BenderFaceState::Error ? "error" :
+                  face == BenderFaceState::Pleased ? "pleased" :
+                  face == BenderFaceState::Curious ? "curious" :
+                  face == BenderFaceState::Tired ? "tired" :
+                  face == BenderFaceState::Annoyed ? "annoyed" : "idle";
+    doc["ai_busy"] = bender_ai_busy();
+    doc["ai_socket"] = ai.socketConnected;
+    doc["ai_session"] = ai.sessionReady;
+    doc["ai_connecting"] = ai.connecting;
+    doc["ai_wait_seconds"] = ai.waitSeconds;
+    doc["mic"] = ai.microphoneOn;
+    doc["wake_enabled"] = wake.enabled && WakeRuntime::voiceEnabled();
+    doc["wake_ready"] = wake.ready;
+    doc["wake_listening"] = wake.listening;
+    doc["wake_error"] = wake.error;
+    doc["last_error"] = ai.lastError;
+    doc["last_error_ago_seconds"] = ai.lastErrorAgoSeconds;
+    sendJson(doc);
+}
+
+static void handleReminders() {
+    wifi_touch_activity();
+    if (server.method() == HTTP_POST) {
+        const String action = server.arg("action");
+        if (action == "add" || action == "add_daily") {
+            uint16_t minutes = 0;
+            String task = server.arg("text");
+            task.trim();
+            if (!task.length() ||
+                task.length() >= Reminders::textBytes || task.indexOf('\n') >= 0 || task.indexOf('\r') >= 0) {
+                saveError("Укажи текст до 160 байт."); return;
+            }
+            bool added = false;
+            if (action == "add") {
+                if (!BenderBehavior::parseUnsigned(server.arg("minutes").c_str(), minutes) ||
+                    !minutes || minutes > Reminders::maxMinutes) {
+                    saveError("Укажи время от 1 минуты до 24 часов."); return;
+                }
+                added = Reminders::add(minutes, task.c_str());
+            } else {
+                const String at = server.arg("time");
+                if (at.length() != 5 || at[2] != ':' ||
+                    !isDigit(at[0]) || !isDigit(at[1]) || !isDigit(at[3]) || !isDigit(at[4])) {
+                    saveError("Укажи время в формате ЧЧ:ММ."); return;
+                }
+                const int hour = (at[0] - '0') * 10 + at[1] - '0';
+                const int minute = (at[3] - '0') * 10 + at[4] - '0';
+                if (hour > 23 || minute > 59) {
+                    saveError("Некорректное время."); return;
+                }
+                added = Reminders::addDaily(uint8_t(hour), uint8_t(minute), task.c_str());
+            }
+            if (!added) {
+                web_send_close_connection();
+                server.send(409, "text/plain; charset=utf-8", "Не удалось сохранить. Проверь свободные места и память колонки."); return;
+            }
+        } else if (action == "cancel") {
+            uint32_t id = 0;
+            const String arg = server.arg("id");
+            char* end = nullptr;
+            errno = 0;
+            const unsigned long parsed = strtoul(arg.c_str(), &end, 10);
+            if (!arg.length() || arg.length() > 10 || errno || !end || *end || !parsed ||
+                !Reminders::cancel(uint32_t(parsed))) {
+                saveError("Напоминание не найдено."); return;
+            }
+        } else {
+            saveError("Неизвестное действие."); return;
+        }
+    }
+    Reminders::Item items[Reminders::capacity];
+    const size_t count = Reminders::list(items, Reminders::capacity);
+    JsonDocument doc;
+    doc["capacity"] = Reminders::capacity;
+    doc["clock_ready"] = Reminders::clockReady();
+    JsonArray list = doc["items"].to<JsonArray>();
+    for (size_t i = 0; i < count; ++i) {
+        JsonObject row = list.add<JsonObject>();
+        row["id"] = items[i].id;
+        row["text"] = items[i].text;
+        row["remaining_seconds"] = items[i].remainingSeconds;
+        row["due"] = items[i].due;
+        row["daily"] = items[i].daily;
+        row["today"] = items[i].today;
+        row["minute_of_day"] = items[i].minuteOfDay;
+    }
+    sendJson(doc);
+}
+
+static void handleLiquidCalibration() {
+    wifi_touch_activity();
+    web_send_close_connection();
+    const String action = server.arg("action");
+    if (action != "tare" && action != "reset") {
+        server.send(400, "text/plain; charset=utf-8", "Обнови страницу настроек"); return;
+    }
+    if (const char* error = liquid_calibrate(action == "reset")) {
+        server.send(409, "text/plain; charset=utf-8", error); return;
+    }
+    server.send(200, "application/json", "{\"ok\":true}");
 }
 
 static void handleCalib() {
@@ -508,8 +678,14 @@ void webUiBegin() {
         server.on("/ncsi.txt", HTTP_ANY, captiveProbeOk);              // Windows fallback
         server.on("/", HTTP_GET, sendPage);
         server.on("/calib", HTTP_POST, handleCalib);
+        server.on("/liquid/calibration", HTTP_POST, handleLiquidCalibration);
         server.on("/character/preview", HTTP_POST, handleCharacterPreview);
         server.on("/character/preview", HTTP_GET, handleCharacterPreview);
+        server.on("/debug/model", HTTP_GET, handleDebugModel);
+        server.on("/debug/model", HTTP_POST, handleDebugModel);
+        server.on("/live/status", HTTP_GET, handleLiveStatus);
+        server.on("/reminders", HTTP_GET, handleReminders);
+        server.on("/reminders", HTTP_POST, handleReminders);
         const char* recordHeaders[] = {"X-Bender-Record"};
         server.collectHeaders(recordHeaders, 1);
         server.on("/wakeword/sample", HTTP_GET, handleWakeSample);

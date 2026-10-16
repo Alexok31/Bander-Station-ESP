@@ -35,6 +35,14 @@ def main() -> int:
 
     from rvc.infer.infer import VoiceConverter
 
+    # Current Applio reloads the RMVPE network for every utterance. Keep its
+    # weights in this serial worker, just like the voice and content models.
+    pitch_cache = os.environ.get("RVC_CACHE_PITCH", "1") != "0"
+    if pitch_cache:
+        from rvc.lib.predictors import f0 as f0_module
+        from rvc_runtime import install_pitch_cache
+        install_pitch_cache(f0_module)
+
     vc = VoiceConverter()
     pitch = int(os.environ.get("RVC_PITCH", "-1"))
     index_rate = float(os.environ.get("RVC_INDEX_RATE", "0.55"))
@@ -44,7 +52,7 @@ def main() -> int:
     # Applio only blends unvoiced features with the source when protect < 0.5.
     # 0.5 disables that branch and can smear consonants in fast speech.
     protect = float(os.environ.get("RVC_PROTECT", "0.33"))
-    emit({"ok": True, "event": "ready"})
+    emit({"ok": True, "event": "ready", "pitch_cache": pitch_cache})
 
     for raw in sys.stdin:
         line = raw.strip()

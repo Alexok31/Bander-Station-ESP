@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include "CharacterSettings.h"
+#include "BenderLlmModel.h"
 
 struct WifiStored {
     String staSsid;
@@ -20,6 +21,10 @@ void nvsLoadCustomStations(String* outStations, uint8_t capacity, uint8_t& outCo
 void nvsSaveCustomStations(const String* stations, uint8_t count);
 void nvsLoadMatrixBrightnessTrim(int8_t* outTrim, uint8_t count);
 void nvsSaveMatrixBrightnessTrim(const int8_t* trim, uint8_t count);
+uint32_t nvsLoadLiquidReference();
+bool nvsSaveLiquidReference(uint32_t value);
+bool nvsLoadTiltEyes();
+bool nvsSaveTiltEyes(bool enabled);
 bool nvsTakePendingBrightnessOverride(uint8_t& outValue);
 void nvsSetPendingBrightnessOverride(uint8_t value);
 
@@ -39,6 +44,8 @@ uint8_t nvsLoadCalmMinutes();
 void nvsSaveCalmMinutes(uint8_t value);
 BenderCharacter::Settings nvsLoadCharacter();
 bool nvsSaveCharacter(const BenderCharacter::Settings& settings);
+uint8_t nvsLoadLlmModel();
+bool nvsSaveLlmModel(uint8_t model);
 uint8_t nvsLoadWakeFollowupSeconds();
 bool nvsLoadWakeVoiceEnabled();
 bool nvsSaveWakeVoiceEnabled(bool enabled);

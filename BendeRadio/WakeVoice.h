@@ -66,7 +66,7 @@ public:
             run_ = 0;
         }
         quiet_=heard_?elapsed_-lastActivity_:0;
-        if (heard_ && quiet_ >= 800) return Finish;
+        if (heard_ && quiet_ >= 400) return Finish;
         if (!heard_ && elapsed_ >= noSpeechMs_) return Cancel;
         if (heard_ && uint32_t(elapsed_-speechStarted_) >= 15000) return Finish;
         return Continue;

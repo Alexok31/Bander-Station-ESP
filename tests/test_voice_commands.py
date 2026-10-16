@@ -64,5 +64,54 @@ class FarewellTests(unittest.TestCase):
                 self.assertFalse(command and command.name == 'conversation.end')
 
 
+class ReminderTests(unittest.TestCase):
+    def test_daily_plan_and_spoken_today_list(self):
+        command = voice_commands.match('Напоминай мне каждый день в 09:00 принять лекарство')
+        self.assertEqual(command.name, 'reminder.daily.add')
+        self.assertEqual(command.args, {'hour': 9, 'minute': 0, 'text': 'принять лекарство'})
+        spoken = voice_commands.match('Нагадай мені щодня о дев\'ять ранку випити ліки')
+        self.assertEqual(spoken.args, {'hour': 9, 'minute': 0, 'text': 'випити ліки'})
+        evening = voice_commands.match('Напоминай каждый день в девять вечера выключить телевизор')
+        self.assertEqual(evening.args['hour'], 21)
+        hours = voice_commands.match('Напоминай каждый день в девять часов утра принять лекарство')
+        self.assertEqual(hours.args, {'hour': 9, 'minute': 0, 'text': 'принять лекарство'})
+        self.assertEqual(voice_commands.reminder_query_scope('Есть какие-то у меня планы на сегодня?'), 'today')
+        self.assertEqual(voice_commands.reminder_query_scope('Какие напоминания активны сегодня?'), 'today')
+        self.assertEqual(voice_commands.reminder_query_scope('Какие у меня активные напоминания?'), 'all')
+        entries = [
+            {'daily': True, 'today': True, 'minute_of_day': 540, 'remaining_seconds': 3600,
+             'text': 'принять лекарство'},
+            {'daily': False, 'today': False, 'remaining_seconds': 90000, 'text': 'снять чайник'},
+        ]
+        replies = voice_commands.reminder_reply_segments('today', entries, True)
+        self.assertEqual(replies[1], 'Щодня о 09:00: принять лекарство.')
+        self.assertEqual(len(replies), 2)
+        self.assertIn('Годинник', voice_commands.reminder_reply_segments('today', entries, False)[0])
+
+    def test_relative_reminders_in_both_languages(self):
+        cases = (
+            ('Напомни мне через 20 минут снять чайник', 20, 'снять чайник'),
+            ('Бендер, нагадай мені через 2 години вимкнути плиту', 120, 'вимкнути плиту'),
+            ('Напомни мне выключить телевизор через минуту', 1, 'выключить телевизор'),
+            ('Напомню через три минуты выключить телевизор', 3, 'выключить телевизор'),
+            ('Нагадай через одну хвилину вимкнути плиту', 1, 'вимкнути плиту'),
+        )
+        for phrase, minutes, task in cases:
+            with self.subTest(phrase=phrase):
+                command = voice_commands.match(phrase)
+                self.assertEqual(command.name, 'reminder.add')
+                self.assertEqual(command.args, {'minutes': minutes, 'text': task})
+
+    def test_invalid_or_quoted_reminder_does_not_schedule(self):
+        for phrase in ('Напомни через 0 минут снять чайник',
+                       'Напомни через 1500 минут снять чайник',
+                       'Напомни через 10 минут',
+                       'Напомни снять чайник через много минут',
+                       'Как сказать «напомни через 10 минут»?'):
+            with self.subTest(phrase=phrase):
+                command = voice_commands.match(phrase)
+                self.assertFalse(command and command.name == 'reminder.add')
+
+
 if __name__ == '__main__':
     unittest.main()

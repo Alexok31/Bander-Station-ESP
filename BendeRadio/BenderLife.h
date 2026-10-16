@@ -6,6 +6,10 @@ enum class BenderEvent : uint8_t {
     None, BatteryLow, Charging, NetworkLost, NetworkBack, FavoriteStation, Shake, Carried, SetDown
 };
 
+constexpr bool bender_event_has_local_voice(BenderEvent event) {
+    return event == BenderEvent::Shake || event == BenderEvent::Charging;
+}
+
 constexpr bool bender_event_radio_allows_voice(BenderEvent event, bool radioOn) {
     return radioOn || event == BenderEvent::Shake || event == BenderEvent::Charging;
 }
